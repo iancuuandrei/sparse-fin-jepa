@@ -185,6 +185,13 @@ def _build_fold_sequence_corpus_from_sessions(
         member_records: list[tuple[str, SequenceRecord]] = []
         member_exclusions: list[dict[str, str]] = []
         member_hashes: list[str] = []
+        member_actions = (
+            corporate_actions
+            if corporate_actions.empty
+            else corporate_actions.loc[
+                corporate_actions["instrument_id"].astype(str) == instrument_id
+            ]
+        )
         sessions = [
             item
             for item in load_sessions(instrument_id, fold_id, member_exclusions)
@@ -225,25 +232,31 @@ def _build_fold_sequence_corpus_from_sessions(
                 )
             record_cutoff = prior[-1][0]
             market_information_as_of = pd.Timestamp(session["timestamp"].iloc[0])
-            adjusted = _adjust_for_market_information(
-                session,
-                corporate_actions,
-                instrument_id=instrument_id,
-                market_information_as_of=market_information_as_of,
-            )
-            adjusted_previous = _adjust_for_market_information(
-                prior[-1][1],
-                corporate_actions,
-                instrument_id=instrument_id,
-                market_information_as_of=market_information_as_of,
-            )
+            if member_actions.empty:
+                adjusted = session
+                adjusted_previous = prior[-1][1]
+            else:
+                adjusted = _adjust_for_market_information(
+                    session,
+                    member_actions,
+                    instrument_id=instrument_id,
+                    market_information_as_of=market_information_as_of,
+                )
+                adjusted_previous = _adjust_for_market_information(
+                    prior[-1][1],
+                    member_actions,
+                    instrument_id=instrument_id,
+                    market_information_as_of=market_information_as_of,
+                )
             previous_close = float(adjusted_previous["close"].iloc[-1])
             stock_seasonal = _seasonal_frame_from_token_cache(
                 prior,
                 session_token_cache,
-                corporate_actions=corporate_actions,
-                instrument_id=instrument_id,
-                market_information_as_of=market_information_as_of,
+                corporate_actions=member_actions if not member_actions.empty else None,
+                instrument_id=instrument_id if not member_actions.empty else None,
+                market_information_as_of=(
+                    market_information_as_of if not member_actions.empty else None
+                ),
             )
             spy_seasonal = _seasonal_frame_from_token_cache(spy_prior, spy_token_cache)
             source_hash = _frame_hash(session)

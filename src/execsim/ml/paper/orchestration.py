@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pandas as pd
@@ -37,6 +37,9 @@ from execsim.ml.sequences.corpus import (
     build_fold_sequence_corpus_from_root,
     load_corpus_instrument,
 )
+
+if TYPE_CHECKING:
+    from execsim.ml.models.lightgbm_adapter import LightGBMExecutionOptions
 
 
 def build_universe_stage(config: PaperRunConfig) -> dict[str, object]:
@@ -964,6 +967,7 @@ def train_volume_models_stage(
     *,
     training_cli_enabled: bool,
     runtime_approval: PaperRuntimeApproval | None,
+    execution: LightGBMExecutionOptions | None = None,
 ) -> dict[str, object]:
     """Train the exact validation-only LightGBM grid for all locked feature rows."""
     config.authorize(
@@ -974,10 +978,34 @@ def train_volume_models_stage(
     from execsim.data.paper.manifests import write_json_atomic
     from execsim.ml.models.lightgbm_adapter import (
         LightGBMConfig,
+        LightGBMExecutionOptions,
         LightGBMVolumeModel,
         run_lightgbm_grid,
     )
     from execsim.ml.paper.lightgbm_data import build_lightgbm_frames
+
+    execution_options = execution or LightGBMExecutionOptions()
+    source_commit = _git_head()
+    execution_receipt_path = config.artifact_root / "lightgbm" / "execution-receipt.json"
+    execution_receipt = {
+        "schema_version": "paper-lightgbm-execution-v1",
+        "paper_config_hash": config.config_hash,
+        "git_commit": source_commit,
+        "lightgbm_execution": execution_options.identity(),
+        "cpu_deterministic_controls_applied": execution_options.device_type == "cpu",
+        "determinism_policy": (
+            "lightgbm-cpu-deterministic"
+            if execution_options.device_type == "cpu"
+            else "seeded-opencl-without-cpu-deterministic-guarantee"
+        ),
+        "scientific_grid_changed": False,
+        "locked_test_or_tca_used": False,
+    }
+    if execution_receipt_path.is_file():
+        if read_json(execution_receipt_path) != execution_receipt:
+            raise ValueError("Reusable LightGBM execution receipt is incompatible.")
+    else:
+        write_json_atomic(execution_receipt_path, execution_receipt)
 
     universe = read_json(Path(config.data["universe_manifest"]))
     liquidity = {
@@ -1014,13 +1042,17 @@ def train_volume_models_stage(
         for method, seed, embedding_root in variants:
             output = config.artifact_root / "lightgbm" / fold_id / method / str(seed or "shared")
             if (output / "manifest.json").is_file():
-                _, metadata = LightGBMVolumeModel.load_native(output)
+                _, metadata = LightGBMVolumeModel.load_native(
+                    output, expected_execution=execution_options
+                )
                 expected_metadata = {
                     "fold_id": fold_id,
                     "paper_config_hash": config.config_hash,
                     "sequence_manifest_hash": file_sha256(sequence),
                     "method": method,
                     "seed": seed,
+                    "git_commit": source_commit,
+                    "lightgbm_execution": execution_options.identity(),
                 }
                 mismatches = [
                     name for name, value in expected_metadata.items() if metadata.get(name) != value
@@ -1061,6 +1093,7 @@ def train_volume_models_stage(
                 validation,
                 categorical_features=tuple(config.lightgbm["categorical_features"]),
                 seed=int(seed or 13),
+                execution=execution_options,
                 candidate_configs=tuple(
                     LightGBMConfig(**{**asdict(item), "seed": int(seed or 13)})
                     for item in lightgbm_candidates
@@ -1076,6 +1109,7 @@ def train_volume_models_stage(
                 "sequence_manifest_hash": file_sha256(sequence),
                 "method": method,
                 "seed": seed,
+                "git_commit": source_commit,
             }
             model.save_native(output, metadata)
             write_json_atomic(
@@ -1090,6 +1124,7 @@ def train_volume_models_stage(
                     ],
                     "selected_scale_config": asdict(model.scale_config),
                     "selected_shape_config": asdict(model.shape_config),
+                    "lightgbm_execution": execution_options.identity(),
                     "selection_data": "validation_only",
                 },
             )
@@ -1140,6 +1175,8 @@ def train_volume_models_stage(
     return {
         "status": "SOFTWARE READY",
         "models": results,
+        "lightgbm_execution": execution_options.identity(),
+        "execution_receipt": str(execution_receipt_path),
         "parameter_freeze": str(freeze_path),
     }
 

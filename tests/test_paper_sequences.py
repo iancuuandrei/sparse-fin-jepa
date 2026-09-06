@@ -631,7 +631,7 @@ def _run_fixture_pipeline(
             training = append_untrained_neural_control_frames(training, fold_seed=13)
             validation = append_untrained_neural_control_frames(validation, fold_seed=13)
         fitted = LightGBMVolumeModel(
-            LightGBMConfig(n_estimators=8, min_child_samples=2, num_threads=1)
+            LightGBMConfig(n_estimators=8, min_child_samples=2)
         ).fit_frames(*training, categorical_features=("symbol",), validation=validation)
         frame_variants[method] = (validation, fitted)
 

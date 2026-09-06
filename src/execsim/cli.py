@@ -6,12 +6,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import date, time
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
 from execsim.config import ExecSimConfig, load_config, load_project_dotenv
 from execsim.orders import OrderSide, ParentOrder
+
+if TYPE_CHECKING:
+    from execsim.ml.models.lightgbm_adapter import LightGBMExecutionOptions
 
 STRATEGIES = ("twap", "vwap", "pov", "almgren-chriss", "optimal", "mpc")
 
@@ -123,6 +126,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--spy-input", type=Path, default=None)
         command.add_argument("--spy-seasonal-input", type=Path, default=None)
         command.add_argument("--previous-close", type=float, default=None)
+        if command_name == "train-volume-model":
+            command.add_argument("--lightgbm-device", choices=("cpu", "gpu"), default="cpu")
+            command.add_argument("--lightgbm-gpu-platform-id", type=int, default=None)
+            command.add_argument("--lightgbm-gpu-device-id", type=int, default=None)
+            command.add_argument("--lightgbm-gpu-use-dp", action="store_true")
+            command.add_argument("--lightgbm-num-threads", type=int, default=1)
     return parser
 
 
@@ -442,6 +451,19 @@ def _paper(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lightgbm_execution_options(args: argparse.Namespace) -> LightGBMExecutionOptions:
+    """Build the runtime-only LightGBM backend selection for the training command."""
+    from execsim.ml.models.lightgbm_adapter import LightGBMExecutionOptions
+
+    return LightGBMExecutionOptions(
+        device_type=args.lightgbm_device,
+        gpu_platform_id=args.lightgbm_gpu_platform_id,
+        gpu_device_id=args.lightgbm_gpu_device_id,
+        gpu_use_dp=args.lightgbm_gpu_use_dp,
+        num_threads=args.lightgbm_num_threads,
+    )
+
+
 def _execute_paper_command(
     args: argparse.Namespace, config: Any, runtime_approval: Any
 ) -> dict[str, object] | None:
@@ -504,19 +526,25 @@ def _execute_paper_command(
     if args.paper_command == "train-volume-model" and args.synthetic_fixture:
         import numpy as np
 
-        from execsim.ml.models.lightgbm_adapter import LightGBMConfig, LightGBMVolumeModel
+        from execsim.ml.models.lightgbm_adapter import (
+            LightGBMConfig,
+            LightGBMVolumeModel,
+        )
 
         rng = np.random.default_rng(13)
         features = rng.normal(size=(32, 12))
         total = np.exp(10 + features[:, 0])
         shape = np.exp(features[:, :4])
         shape /= shape.sum(axis=1, keepdims=True)
+        execution = _lightgbm_execution_options(args)
         model = LightGBMVolumeModel(
-            LightGBMConfig(n_estimators=8, min_child_samples=2, num_threads=1)
+            LightGBMConfig(n_estimators=8, min_child_samples=2),
+            execution=execution,
         ).fit(features, total, shape)
         predicted_total, predicted_shape = model.predict(features[:2])
         return {
             "data_classification": "synthetic_fixture",
+            "lightgbm_execution": execution.identity(),
             "remaining_volume": predicted_total.tolist(),
             "shape_row_sums": predicted_shape.sum(axis=1).tolist(),
         }
@@ -527,6 +555,7 @@ def _execute_paper_command(
             config,
             training_cli_enabled=args.enable_historical_training,
             runtime_approval=runtime_approval,
+            execution=_lightgbm_execution_options(args),
         )
     if args.paper_command == "export-embeddings" and args.synthetic_fixture:
         import hashlib

@@ -8,7 +8,7 @@ import json
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -42,7 +42,7 @@ def _lightgbm() -> Any:
 
 @dataclass(frozen=True, slots=True)
 class LightGBMConfig:
-    """Bound one deterministic candidate from the locked validation grid."""
+    """Bound one scientific candidate from the locked validation grid."""
 
     num_leaves: int = 15
     min_child_samples: int = 50
@@ -54,7 +54,44 @@ class LightGBMConfig:
     bagging_fraction: float = 0.8
     bagging_freq: int = 1
     seed: int = 13
+
+
+@dataclass(frozen=True, slots=True)
+class LightGBMExecutionOptions:
+    """Bind operational LightGBM resources without changing the scientific grid."""
+
+    device_type: Literal["cpu", "gpu"] = "cpu"
+    gpu_platform_id: int | None = None
+    gpu_device_id: int | None = None
+    gpu_use_dp: bool = False
     num_threads: int = 1
+
+    def __post_init__(self) -> None:
+        if self.device_type not in {"cpu", "gpu"}:
+            raise ValueError("LightGBM device_type must be 'cpu' or OpenCL 'gpu'.")
+        if self.num_threads < 1:
+            raise ValueError("LightGBM num_threads must be positive.")
+        for name, value in (
+            ("gpu_platform_id", self.gpu_platform_id),
+            ("gpu_device_id", self.gpu_device_id),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"LightGBM {name} must be non-negative when specified.")
+        if self.device_type == "cpu":
+            if (
+                self.gpu_platform_id is not None
+                or self.gpu_device_id is not None
+                or self.gpu_use_dp
+            ):
+                raise ValueError("CPU LightGBM execution cannot specify GPU-only options.")
+        elif self.gpu_platform_id is None or self.gpu_device_id is None:
+            raise ValueError(
+                "OpenCL GPU execution requires explicit gpu_platform_id and gpu_device_id."
+            )
+
+    def identity(self) -> dict[str, object]:
+        """Return the canonical execution identity stored in fitted artifacts."""
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,8 +108,14 @@ class LightGBMGridResult:
 class LightGBMVolumeModel:
     """Fit one scale model and one long-form, shrinking-horizon shape model."""
 
-    def __init__(self, config: LightGBMConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: LightGBMConfig | None = None,
+        *,
+        execution: LightGBMExecutionOptions | None = None,
+    ) -> None:
         self.config = config or LightGBMConfig()
+        self.execution = execution or LightGBMExecutionOptions()
         self.scale_config = self.config
         self.shape_config = self.config
         self.scale_model: Any | None = None
@@ -126,7 +169,7 @@ class LightGBMVolumeModel:
             callbacks = [lightgbm.early_stopping(self.config.early_stopping_rounds, verbose=False)]
             scale_eval = (valid_scale, _scale_residual(validation[0], valid_total))
             shape_eval = (valid_shape, np.log(valid_share + 1e-6))
-        parameters = _parameters(self.config)
+        parameters = _parameters(self.config, self.execution)
         self.scale_model = lightgbm.LGBMRegressor(**parameters)
         self.scale_model.fit(
             scale,
@@ -269,6 +312,7 @@ class LightGBMVolumeModel:
             **metadata,
             "model_family": "lightgbm-scale-long-shape",
             "lightgbm_version": importlib.metadata.version("lightgbm"),
+            "lightgbm_execution": self.execution.identity(),
             "config": asdict(self.config),
             "selected_scale_config": asdict(self.scale_config),
             "selected_shape_config": asdict(self.shape_config),
@@ -292,14 +336,22 @@ class LightGBMVolumeModel:
         return directory
 
     @classmethod
-    def load_native(cls, directory: Path) -> tuple[LightGBMVolumeModel, dict[str, object]]:
+    def load_native(
+        cls,
+        directory: Path,
+        *,
+        expected_execution: LightGBMExecutionOptions | None = None,
+    ) -> tuple[LightGBMVolumeModel, dict[str, object]]:
         """Load checksummed native Boosters and category compatibility state."""
-        lightgbm = _lightgbm()
         payload = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        execution = _execution_from_manifest(payload)
+        if expected_execution is not None and execution != expected_execution:
+            raise ValueError("LightGBM artifact execution identity mismatch.")
         records = payload.get("models")
         if not isinstance(records, list) or len(records) != 2:
             raise TypeError("LightGBM manifest must contain scale and shape models.")
-        instance = cls(LightGBMConfig(**payload["config"]))
+        lightgbm = _lightgbm()
+        instance = cls(LightGBMConfig(**payload["config"]), execution=execution)
         instance.scale_config = LightGBMConfig(
             **payload.get("selected_scale_config", payload["config"])
         )
@@ -335,18 +387,19 @@ def run_lightgbm_grid(
     *,
     categorical_features: tuple[str, ...] = ("symbol",),
     seed: int = 13,
-    num_threads: int = 1,
+    execution: LightGBMExecutionOptions | None = None,
     candidate_configs: tuple[LightGBMConfig, ...] | None = None,
 ) -> tuple[LightGBMVolumeModel, tuple[LightGBMGridResult, ...]]:
     """Run the exact eight-point validation grid and select without test/TCA data."""
     candidates: list[tuple[LightGBMVolumeModel, LightGBMGridResult]] = []
+    execution_options = execution or LightGBMExecutionOptions()
     configs = candidate_configs or tuple(
-        LightGBMConfig(leaves, child, l2, seed=seed, num_threads=num_threads)
+        LightGBMConfig(leaves, child, l2, seed=seed)
         for leaves, child, l2 in product((15, 31), (50, 200), (1.0, 10.0))
     )
     _validate_candidate_grid(configs)
     for config in configs:
-        model = LightGBMVolumeModel(config).fit_frames(
+        model = LightGBMVolumeModel(config, execution=execution_options).fit_frames(
             *training, categorical_features=categorical_features, validation=validation
         )
         case_columns = _case_columns(validation[2])
@@ -396,8 +449,8 @@ def _validate_candidate_grid(configs: tuple[LightGBMConfig, ...]) -> None:
         raise ValueError("LightGBM candidates do not form one matched locked eight-point grid.")
 
 
-def _parameters(config: LightGBMConfig) -> dict[str, object]:
-    return {
+def _parameters(config: LightGBMConfig, execution: LightGBMExecutionOptions) -> dict[str, object]:
+    parameters: dict[str, object] = {
         "num_leaves": config.num_leaves,
         "min_child_samples": config.min_child_samples,
         "reg_lambda": config.reg_lambda,
@@ -407,11 +460,31 @@ def _parameters(config: LightGBMConfig) -> dict[str, object]:
         "bagging_fraction": config.bagging_fraction,
         "bagging_freq": config.bagging_freq,
         "random_state": config.seed,
-        "deterministic": True,
-        "force_col_wise": True,
-        "n_jobs": config.num_threads,
+        "n_jobs": execution.num_threads,
         "verbosity": -1,
     }
+    if execution.device_type == "cpu":
+        parameters.update({"deterministic": True, "force_col_wise": True})
+    else:
+        parameters.update(
+            {
+                "device_type": "gpu",
+                "gpu_platform_id": execution.gpu_platform_id,
+                "gpu_device_id": execution.gpu_device_id,
+                "gpu_use_dp": execution.gpu_use_dp,
+            }
+        )
+    return parameters
+
+
+def _execution_from_manifest(payload: dict[str, object]) -> LightGBMExecutionOptions:
+    recorded = payload.get("lightgbm_execution")
+    if not isinstance(recorded, dict):
+        raise ValueError("LightGBM manifest is missing execution identity.")
+    try:
+        return LightGBMExecutionOptions(**recorded)
+    except TypeError as exc:
+        raise ValueError("LightGBM manifest execution identity is invalid.") from exc
 
 
 def _fit_categories(
@@ -545,9 +618,12 @@ def _long_curve_error(frame: pd.DataFrame, group_columns: tuple[str, ...]) -> fl
 
 
 def create_paper_volume_model(
-    family: str, *, config: LightGBMConfig | None = None
+    family: str,
+    *,
+    config: LightGBMConfig | None = None,
+    execution: LightGBMExecutionOptions | None = None,
 ) -> LightGBMVolumeModel:
     """Create the locked paper forecaster and reject model-family expansion."""
     if family != "lightgbm-scale-shape":
         raise ValueError(f"Unknown paper volume-model family: {family}")
-    return LightGBMVolumeModel(config)
+    return LightGBMVolumeModel(config, execution=execution)

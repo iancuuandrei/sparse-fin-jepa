@@ -12,10 +12,16 @@ import pandas as pd
 import pytest
 import yaml
 
-from execsim.cli import main
+import execsim.ml.models.lightgbm_adapter as lightgbm_adapter
+from execsim.cli import build_parser, main
 from execsim.data.paper.identity import resolve_provider_symbol
 from execsim.data.paper.manifests import file_sha256, write_json_atomic
-from execsim.ml.models.lightgbm_adapter import LightGBMConfig, LightGBMVolumeModel
+from execsim.ml.models.lightgbm_adapter import (
+    LightGBMConfig,
+    LightGBMExecutionOptions,
+    LightGBMVolumeModel,
+    _parameters,
+)
 from execsim.ml.models.random_projection import projection_hash, random_projection_matrix
 from execsim.ml.paper.benchmark import estimate_manifest_resources, predictor_capacity_smoke
 from execsim.ml.paper.configs import load_paper_config, load_runtime_approval
@@ -73,7 +79,7 @@ def test_lightgbm_raw_and_hybrid_fixture_and_random_placebo(tmp_path: Path) -> N
     remaining = np.exp(raw[:, 0] + 10)
     shape = np.exp(raw[:, :4])
     shape /= shape.sum(axis=1, keepdims=True)
-    config = LightGBMConfig(n_estimators=8, min_child_samples=2, num_threads=1)
+    config = LightGBMConfig(n_estimators=8, min_child_samples=2)
 
     for features in (raw, hybrid):
         model = LightGBMVolumeModel(config).fit(features[:30], remaining[:30], shape[:30])
@@ -93,9 +99,103 @@ def test_lightgbm_raw_and_hybrid_fixture_and_random_placebo(tmp_path: Path) -> N
     restored, metadata = LightGBMVolumeModel.load_native(artifact)
     restored_total, restored_shape = restored.predict(hybrid[30:])
     assert metadata["fold_id"] == "fold-1"
+    assert metadata["lightgbm_execution"] == LightGBMExecutionOptions().identity()
+    assert restored.execution == LightGBMExecutionOptions()
     assert np.allclose(restored_total, total)
     assert np.allclose(restored_shape, shares)
     assert projection_hash(projection) == projection_hash(random_projection_matrix(12, seed=13))
+
+    requested_gpu = LightGBMExecutionOptions(
+        device_type="gpu", gpu_platform_id=1, gpu_device_id=0, num_threads=8
+    )
+    with pytest.raises(ValueError, match="execution identity mismatch"):
+        LightGBMVolumeModel.load_native(artifact, expected_execution=requested_gpu)
+
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["lightgbm_execution"] = requested_gpu.identity()
+    write_json_atomic(manifest_path, manifest)
+    with pytest.raises(ValueError, match="execution identity mismatch"):
+        LightGBMVolumeModel.load_native(artifact, expected_execution=LightGBMExecutionOptions())
+    with pytest.raises(ValueError, match="execution identity mismatch"):
+        LightGBMVolumeModel.load_native(
+            artifact,
+            expected_execution=replace(requested_gpu, gpu_device_id=1),
+        )
+
+
+def test_lightgbm_execution_parameters_are_backend_specific() -> None:
+    config = LightGBMConfig()
+    cpu = _parameters(config, LightGBMExecutionOptions(num_threads=4))
+    gpu = _parameters(
+        config,
+        LightGBMExecutionOptions(
+            device_type="gpu",
+            gpu_platform_id=2,
+            gpu_device_id=1,
+            gpu_use_dp=True,
+            num_threads=8,
+        ),
+    )
+
+    assert "device_type" not in cpu
+    assert "gpu_platform_id" not in cpu
+    assert cpu["deterministic"] is True
+    assert cpu["force_col_wise"] is True
+    assert cpu["n_jobs"] == 4
+    assert gpu["device_type"] == "gpu"
+    assert gpu["gpu_platform_id"] == 2
+    assert gpu["gpu_device_id"] == 1
+    assert gpu["gpu_use_dp"] is True
+    assert gpu["n_jobs"] == 8
+    assert "deterministic" not in gpu
+    assert "force_col_wise" not in gpu
+
+
+def test_lightgbm_gpu_execution_requires_explicit_non_negative_device_ids() -> None:
+    with pytest.raises(ValueError, match="explicit gpu_platform_id"):
+        LightGBMExecutionOptions(device_type="gpu")
+    with pytest.raises(ValueError, match="non-negative"):
+        LightGBMExecutionOptions(device_type="gpu", gpu_platform_id=-1, gpu_device_id=0)
+    with pytest.raises(ValueError, match="GPU-only"):
+        LightGBMExecutionOptions(gpu_use_dp=True)
+
+
+def test_lightgbm_grid_propagates_one_execution_identity_to_all_candidates(monkeypatch) -> None:
+    observed: list[LightGBMExecutionOptions] = []
+
+    class FakeVolumeModel:
+        def __init__(self, config, *, execution) -> None:
+            self.config = config
+            self.scale_config = config
+            self.shape_config = config
+            self.execution = execution
+            self.scale_model = object()
+            self.shape_model = object()
+            observed.append(execution)
+
+        def fit_frames(self, *args, **kwargs):
+            return self
+
+        def predict_frames(self, scale, shape, *, group_columns):
+            predicted = shape.loc[:, [*group_columns, "target_bucket"]].copy()
+            predicted["conditional_share"] = 0.5
+            return np.ones(len(scale)), predicted
+
+    monkeypatch.setattr(lightgbm_adapter, "LightGBMVolumeModel", FakeVolumeModel)
+    scale = pd.DataFrame({"baseline_remaining_volume": [1.0], "x": [0.0]})
+    shape = pd.DataFrame({"case_id": [0, 0], "target_bucket": [0, 1], "x": [0.0, 0.0]})
+    frames = (scale, np.ones(1), shape, np.array([0.5, 0.5]))
+    execution = LightGBMExecutionOptions(
+        device_type="gpu", gpu_platform_id=1, gpu_device_id=0, num_threads=8
+    )
+
+    _, results = lightgbm_adapter.run_lightgbm_grid(
+        frames, frames, categorical_features=(), execution=execution
+    )
+
+    assert len(results) == 8
+    assert observed == [execution] * 8
 
 
 def test_lightgbm_uses_pandas_categories_and_long_shape_valid_horizons() -> None:
@@ -111,9 +211,9 @@ def test_lightgbm_uses_pandas_categories_and_long_shape_valid_horizons() -> None
     shape["case_id"] = np.repeat(np.arange(16), 3)
     shape["target_bucket"] = np.tile(np.arange(3), 16)
     shares = np.tile([0.2, 0.3, 0.5], 16)
-    model = LightGBMVolumeModel(
-        LightGBMConfig(n_estimators=8, min_child_samples=2, num_threads=1)
-    ).fit_frames(scale, total, shape, shares, categorical_features=("symbol",))
+    model = LightGBMVolumeModel(LightGBMConfig(n_estimators=8, min_child_samples=2)).fit_frames(
+        scale, total, shape, shares, categorical_features=("symbol",)
+    )
     prediction_shape = shape.iloc[:6].copy()
     prediction_shape["target_valid"] = [True, True, True, True, False, False]
     predicted_total, predicted = model.predict_frames(
@@ -707,6 +807,34 @@ def test_paper_cli_dry_run_does_not_enable_expensive_operations(capsys) -> None:
     assert main(["ml", "paper", "train-volume-model", "--synthetic-fixture"]) == 0
     volume_output = capsys.readouterr().out
     assert '"shape_row_sums"' in volume_output
+
+
+def test_train_volume_model_cli_scopes_opencl_execution_arguments() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "ml",
+            "paper",
+            "train-volume-model",
+            "--lightgbm-device",
+            "gpu",
+            "--lightgbm-gpu-platform-id",
+            "1",
+            "--lightgbm-gpu-device-id",
+            "0",
+            "--lightgbm-gpu-use-dp",
+            "--lightgbm-num-threads",
+            "8",
+        ]
+    )
+
+    assert args.lightgbm_device == "gpu"
+    assert args.lightgbm_gpu_platform_id == 1
+    assert args.lightgbm_gpu_device_id == 0
+    assert args.lightgbm_gpu_use_dp is True
+    assert args.lightgbm_num_threads == 8
+    with pytest.raises(SystemExit):
+        parser.parse_args(["ml", "paper", "plan", "--lightgbm-device", "gpu"])
 
 
 def test_all_paper_cli_commands_have_executable_synthetic_fixtures(tmp_path: Path, capsys) -> None:

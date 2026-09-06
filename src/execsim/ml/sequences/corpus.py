@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -176,14 +177,17 @@ def _build_fold_sequence_corpus_from_sessions(
     spy_dates = [item[0] for item in spy_sessions]
     spy_by_date = dict(spy_sessions)
     spy_token_cache = _token_cache(spy_sessions, quality_protocol=quality_protocol)
-    records: list[tuple[str, SequenceRecord]] = []
-    exclusions: list[dict[str, str]] = []
-    raw_hashes: list[str] = []
-    for member in universe_members:
+
+    def build_member(
+        member: dict[str, Any],
+    ) -> tuple[list[tuple[str, SequenceRecord]], list[dict[str, str]], list[str]]:
         instrument_id = str(member["instrument_id"])
+        member_records: list[tuple[str, SequenceRecord]] = []
+        member_exclusions: list[dict[str, str]] = []
+        member_hashes: list[str] = []
         sessions = [
             item
-            for item in load_sessions(instrument_id, fold_id, exclusions)
+            for item in load_sessions(instrument_id, fold_id, member_exclusions)
             if _belongs_to_fold(fold_id, item[0])
         ]
         session_token_cache = _token_cache(sessions, quality_protocol=quality_protocol)
@@ -195,7 +199,7 @@ def _build_fold_sequence_corpus_from_sessions(
             spy_prior = spy_sessions[max(0, spy_index - 20) : spy_index]
             prior_spy_session = spy_by_date.get(session_date)
             if not prior or not spy_prior or prior_spy_session is None:
-                exclusions.append(
+                member_exclusions.append(
                     {
                         "fold_id": fold_id,
                         "instrument_id": instrument_id,
@@ -257,9 +261,22 @@ def _build_fold_sequence_corpus_from_sessions(
                 training_cutoff=cutoff.isoformat(),
                 quality_protocol=quality_protocol,
             )
-            records.append((partition, record))
-            raw_hashes.append(source_hash)
+            member_records.append((partition, record))
+            member_hashes.append(source_hash)
             history.append((session_date, session))
+        return member_records, member_exclusions, member_hashes
+
+    records: list[tuple[str, SequenceRecord]] = []
+    exclusions: list[dict[str, str]] = []
+    raw_hashes: list[str] = []
+    worker_count = min(8, max(1, len(universe_members)))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="paper-sequence") as pool:
+        for member_records, member_exclusions, member_hashes in pool.map(
+            build_member, universe_members
+        ):
+            records.extend(member_records)
+            exclusions.extend(member_exclusions)
+            raw_hashes.extend(member_hashes)
     training = [record for partition, record in records if partition == "train"]
     if not training:
         raise ValueError(f"No valid training sequences were produced for {fold_id}.")
@@ -269,7 +286,9 @@ def _build_fold_sequence_corpus_from_sessions(
     sequence_files: list[str] = []
     index_files: list[str] = []
     counts = {"train": 0, "validation": 0, "test": 0}
-    for partition, record in records:
+
+    def write_record(item: tuple[str, SequenceRecord]) -> tuple[str, str, str]:
+        partition, record = item
         normalized = replace(
             record,
             features=normalizer.transform(record.features[None, ...], record.token_mask[None, ...])[
@@ -287,9 +306,15 @@ def _build_fold_sequence_corpus_from_sessions(
         )
         index_path = fold_root / "indexes" / partition / f"{record.session_id}.parquet"
         write_sample_index(samples, index_path)
-        sequence_files.append(relative_sequence)
-        index_files.append(str(index_path.relative_to(fold_root)).replace("\\", "/"))
-        counts[partition] += 1
+        relative_index = str(index_path.relative_to(fold_root)).replace("\\", "/")
+        return partition, relative_sequence, relative_index
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="paper-artifact") as pool:
+        written = pool.map(write_record, records)
+        for partition, relative_sequence, relative_index in written:
+            sequence_files.append(relative_sequence)
+            index_files.append(relative_index)
+            counts[partition] += 1
     return write_sequence_manifest(
         fold_root / "sequence-manifest.json",
         fold_id=fold_id,

@@ -35,6 +35,8 @@ def build_session_sequence(
     training_cutoff: str | None = None,
     data_classification: str = "historical",
     quality_protocol: str = "exact-minute-v1",
+    precomputed_tokens: pd.DataFrame | None = None,
+    precomputed_spy_tokens: pd.DataFrame | None = None,
 ) -> SequenceRecord:
     """Aggregate one quality-valid session into 26 causal feature tokens."""
     required = {"timestamp", "open", "high", "low", "close", "volume", "trade_count", "vwap"}
@@ -52,11 +54,21 @@ def build_session_sequence(
     timestamps = pd.to_datetime(ordered["timestamp"])
     if timestamps.dt.tz is None or timestamps.duplicated().any():
         raise ValueError("Sequence timestamps must be unique and timezone-aware.")
-    tokens = _tokenize_session(ordered, quality_protocol=quality_protocol, label="paper")
+    tokens = (
+        precomputed_tokens
+        if precomputed_tokens is not None
+        else _tokenize_session(ordered, quality_protocol=quality_protocol, label="paper")
+    )
     spy = None
     if spy_bars is not None:
         ordered_spy = spy_bars.sort_values("timestamp", kind="stable").reset_index(drop=True)
-        spy = _tokenize_session(ordered_spy, quality_protocol=quality_protocol, label="SPY paper")
+        spy = (
+            precomputed_spy_tokens
+            if precomputed_spy_tokens is not None
+            else _tokenize_session(
+                ordered_spy, quality_protocol=quality_protocol, label="SPY paper"
+            )
+        )
         if not pd.to_datetime(spy["timestamp"]).equals(pd.to_datetime(tokens["timestamp"])):
             raise ValueError("SPY and instrument token intervals must align exactly.")
     baseline = _baseline(seasonal, cutoff)

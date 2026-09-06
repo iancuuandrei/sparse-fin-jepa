@@ -18,7 +18,7 @@ from execsim.data.paper.corporate_actions import (
     point_in_time_split_factor,
 )
 from execsim.data.paper.manifests import file_sha256
-from execsim.data.paper.partitions import fold_training_cutoff, resolve_fold_partition
+from execsim.data.paper.partitions import fold_training_cutoff, paper_fold, resolve_fold_partition
 from execsim.data.paper.resolution_quality import (
     aggregate_observed_tokens,
     assess_session_resolution_quality,
@@ -33,6 +33,8 @@ from execsim.ml.sequences.manifests import (
 )
 from execsim.ml.sequences.normalization import RobustFoldNormalizer
 from execsim.ml.sequences.schemas import SequenceRecord
+
+_TOKEN_CACHE_ATTR = "_execsim_paper_tokens"
 
 
 def build_fold_sequence_corpus(
@@ -119,6 +121,12 @@ def build_fold_sequence_corpus_from_root(
         exclusions: list[dict[str, str]] | None,
     ) -> list[tuple[date, pd.DataFrame]]:
         bars = load_corpus_instrument(corpus_root, instrument_id)
+        if active_fold_id != "unresolved":
+            timestamps = pd.to_datetime(bars["timestamp"])
+            local_dates = timestamps.dt.tz_convert("America/New_York").dt.date
+            fold = paper_fold(active_fold_id)
+            keep = (local_dates >= fold.train_start) & (local_dates <= fold.test_end)
+            bars = bars.loc[keep]
         return _validated_sessions(
             bars,
             instrument_id,
@@ -169,7 +177,7 @@ def _build_fold_sequence_corpus_from_sessions(
         raise ValueError("SPY benchmark identity must not be an execution-universe member.")
     spy_sessions = [
         item
-        for item in load_sessions(spy_instrument_id, "unresolved", None)
+        for item in load_sessions(spy_instrument_id, fold_id, None)
         if _belongs_to_fold(fold_id, item[0])
     ]
     if not spy_sessions:
@@ -273,6 +281,10 @@ def _build_fold_sequence_corpus_from_sessions(
                 data_classification=data_classification,
                 training_cutoff=cutoff.isoformat(),
                 quality_protocol=quality_protocol,
+                precomputed_tokens=(
+                    session_token_cache[session_date] if member_actions.empty else None
+                ),
+                precomputed_spy_tokens=spy_token_cache[session_date],
             )
             member_records.append((partition, record))
             member_hashes.append(source_hash)
@@ -383,10 +395,11 @@ def _validated_sessions(
         session = session.sort_values("timestamp", kind="stable").reset_index(drop=True)
         errors: tuple[str, ...]
         if quality_protocol == "resolution-aware-v2":
-            quality = assess_session_resolution_quality(session)
+            quality, tokens = assess_session_resolution_quality(session, return_tokens=True)
             errors = () if quality.token_valid_full_session else (quality.invalid_token_reason,)
         elif quality_protocol == "exact-minute-v1":
             errors = validate_exact_xnys_session(session)
+            tokens = None if errors else _aggregate_tokens(session)
         else:
             raise ValueError(f"Unknown paper quality protocol: {quality_protocol}")
         if errors:
@@ -400,6 +413,9 @@ def _validated_sessions(
                     }
                 )
             continue
+        if tokens is None:
+            raise RuntimeError("Validated sequence session did not produce token data.")
+        session.attrs[_TOKEN_CACHE_ATTR] = tokens
         sessions.append((session_date, session))
     return sessions
 
@@ -426,7 +442,9 @@ def _token_cache(
     """Aggregate each causal session once instead of once per future case."""
     return {
         session_date: (
-            aggregate_observed_tokens(session)
+            session.attrs[_TOKEN_CACHE_ATTR]
+            if _TOKEN_CACHE_ATTR in session.attrs
+            else aggregate_observed_tokens(session)
             if quality_protocol == "resolution-aware-v2"
             else _aggregate_tokens(session)
         )

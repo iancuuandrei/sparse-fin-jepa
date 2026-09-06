@@ -896,9 +896,26 @@ def test_v2_run_uses_frozen_daily_formation_state_without_v1_key(
     assert result == {"build_universe": "reused", "download_data": "DATA NOT ACQUIRED"}
 
 
-def test_frozen_v2_universe_resolves_separately_sourced_spy_identity() -> None:
+def test_frozen_v2_universe_resolves_separately_sourced_spy_identity(
+    tmp_path: Path,
+) -> None:
     config = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
     universe = json.loads(Path(config.data["universe_manifest"]).read_text(encoding="utf-8"))
+    ticker_history = tmp_path / "ticker-history.parquet"
+    pd.DataFrame(
+        [
+            {
+                "instrument_id": config.data["spy_instrument_id"],
+                "symbol": "SPY",
+                "start": "1993-01-29",
+                "end": "9999-12-31",
+                "source": "test-fixture",
+            }
+        ]
+    ).to_parquet(ticker_history, index=False)
+    sections = {name: dict(values) for name, values in config.sections.items()}
+    sections["data"]["ticker_history"] = str(ticker_history)
+    config = replace(config, sections=sections)
 
     assert not any(
         row["instrument_id"] == config.data["spy_instrument_id"]

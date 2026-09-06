@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -57,21 +58,30 @@ def test_repository_context_check_and_selection_are_deterministic() -> None:
 
 
 def test_byte_exact_paper_artifacts_pin_lf_checkout_bytes() -> None:
-    """Keep frozen scientific hashes invariant under Windows Git settings."""
+    """Keep frozen scientific hashes invariant under platform Git settings."""
     attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
     assert "configs/paper/**/*.json text eol=lf" in attributes
-    assert "data/manifests/paper_universe_v2.json text eol=lf" in attributes
-    assert "CORPUS_QUALITY_REPORT.md text eol=lf" in attributes
-    assert "V2_FORMATION_QUALITY_REPORT.md text eol=lf" in attributes
+    assert "data/manifests/paper_universe_v2.json text eol=crlf" in attributes
+    assert "CORPUS_QUALITY_REPORT.md text eol=crlf" in attributes
+    assert "V2_FORMATION_QUALITY_REPORT.md text eol=crlf" in attributes
 
     byte_exact_paths = (
         "configs/paper/sparse_jepa/design-freeze-v1.json",
         "configs/paper/sparse_jepa/safe-default-receipt-v1.json",
         "configs/paper/sparse_jepa/v1-evidence-final.json",
         "configs/paper/sparse_jepa_v2/design-freeze-v2.json",
-        "data/manifests/paper_universe_v2.json",
-        "CORPUS_QUALITY_REPORT.md",
-        "V2_FORMATION_QUALITY_REPORT.md",
     )
     for relative_path in byte_exact_paths:
         assert b"\r" not in (ROOT / relative_path).read_bytes(), relative_path
+
+    freeze = yaml.safe_load(
+        (ROOT / "configs/paper/sparse_jepa_v2/design-freeze-v2.json").read_text(encoding="utf-8")
+    )
+    formation = freeze["formation_evidence"]
+    empirical_paths = {
+        "universe_manifest_sha256": "data/manifests/paper_universe_v2.json",
+        "formation_report_sha256": "V2_FORMATION_QUALITY_REPORT.md",
+    }
+    for field, relative_path in empirical_paths.items():
+        digest = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()
+        assert digest == formation[field], relative_path

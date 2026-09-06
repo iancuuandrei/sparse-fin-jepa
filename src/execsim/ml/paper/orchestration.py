@@ -285,18 +285,22 @@ def download_data_stage(
     if config.paper_run_id == "sparse-jepa-v2":
         from execsim.data.paper.daily_acquisition import acquire_formation_daily_bars
 
-        daily_receipt = acquire_formation_daily_bars(
-            snapshot,
-            formation_start=formation_start,
-            formation_end=formation_end,
-            spy_instrument_id=spy_id,
-            output_path=Path(config.data["formation_daily_corpus"]),
-            receipt_path=Path(config.data["formation_daily_receipt"]),
-            paper_config_hash=config.config_hash,
-            cli_enabled=True,
-            config_enabled=True,
-        )
-        formation_chunks: int | dict[str, object] = daily_receipt
+        if _has_frozen_v2_formation_evidence(config):
+            formation_chunks: int | dict[str, object] = {
+                "status": "reused_frozen_v2_formation_evidence"
+            }
+        else:
+            formation_chunks = acquire_formation_daily_bars(
+                snapshot,
+                formation_start=formation_start,
+                formation_end=formation_end,
+                spy_instrument_id=spy_id,
+                output_path=Path(config.data["formation_daily_corpus"]),
+                receipt_path=Path(config.data["formation_daily_receipt"]),
+                paper_config_hash=config.config_hash,
+                cli_enabled=True,
+                config_enabled=True,
+            )
         formation_output = str(config.data["formation_daily_corpus"])
     else:
         formation_ids = tuple(dict.fromkeys((*snapshot["instrument_id"].astype(str), spy_id)))
@@ -2017,6 +2021,25 @@ def _formation_artifacts_ready(config: PaperRunConfig) -> bool:
     if config.paper_run_id == "sparse-jepa-v2":
         return Path(config.data["formation_daily_corpus"]).is_file()
     return _has_parquet_corpus(Path(config.data["formation_corpus_root"]))
+
+
+def _has_frozen_v2_formation_evidence(config: PaperRunConfig) -> bool:
+    """Accept only the exact v2 formation artifacts named by the design freeze."""
+    if config.paper_run_id != "sparse-jepa-v2":
+        return False
+    evidence = config.design_freeze.get("formation_evidence")
+    if not isinstance(evidence, dict) or evidence.get("status") != "COMPLETE":
+        return False
+    paths = {
+        "daily_corpus_sha256": Path(config.data["formation_daily_corpus"]),
+        "daily_receipt_sha256": Path(config.data["formation_daily_receipt"]),
+        "universe_manifest_sha256": Path(config.data["universe_manifest"]),
+    }
+    return _is_frozen_universe(
+        paths["universe_manifest_sha256"], config_hash=config.config_hash
+    ) and all(
+        path.is_file() and file_sha256(path) == evidence.get(field) for field, path in paths.items()
+    )
 
 
 def _assert_representation_reuse(

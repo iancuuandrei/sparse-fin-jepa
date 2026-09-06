@@ -26,6 +26,7 @@ from execsim.ml.paper.features import (
 from execsim.ml.paper.forecast_provider import PaperLightGBMForecastProvider
 from execsim.ml.paper.orchestration import (
     _formation_artifacts_ready,
+    _has_frozen_v2_formation_evidence,
     _require_parameter_freeze,
     run_authorized_stages,
 )
@@ -888,3 +889,43 @@ def test_formation_readiness_dispatches_by_protocol(tmp_path: Path, monkeypatch)
     observed.clear()
     assert _formation_artifacts_ready(v2)
     assert observed == []
+
+
+def test_frozen_v2_formation_evidence_reuses_preapproval_receipts(tmp_path: Path) -> None:
+    loaded = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    daily = tmp_path / "daily.parquet"
+    receipt = tmp_path / "daily-receipt.json"
+    universe = tmp_path / "universe.json"
+    daily.write_bytes(b"frozen daily corpus")
+    receipt.write_bytes(b"frozen preapproval receipt")
+    write_json_atomic(
+        universe,
+        {
+            "status": "complete",
+            "paper_config_hash": loaded.config_hash,
+            "members": [{"instrument_id": f"asset-{index}"} for index in range(100)],
+        },
+    )
+    evidence = {
+        "status": "COMPLETE",
+        "daily_corpus_sha256": file_sha256(daily),
+        "daily_receipt_sha256": file_sha256(receipt),
+        "universe_manifest_sha256": file_sha256(universe),
+    }
+    config = replace(
+        loaded,
+        sections={
+            **loaded.sections,
+            "data": {
+                **loaded.data,
+                "formation_daily_corpus": str(daily),
+                "formation_daily_receipt": str(receipt),
+                "universe_manifest": str(universe),
+            },
+        },
+        design_freeze={**loaded.design_freeze, "formation_evidence": evidence},
+    )
+
+    assert _has_frozen_v2_formation_evidence(config)
+    receipt.write_bytes(b"changed receipt")
+    assert not _has_frozen_v2_formation_evidence(config)

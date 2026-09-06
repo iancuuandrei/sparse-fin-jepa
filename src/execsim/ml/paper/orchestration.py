@@ -679,7 +679,13 @@ def select_rdm_lambda_stage(
     selected = select_common_rdm_lambda(
         tuple(candidates), output=output, paper_config_hash=config.config_hash
     )
-    return {"status": "SOFTWARE READY", "selected_rdm_lambda": selected, "receipt": str(output)}
+    freeze = _freeze_representation_parameters(config)
+    return {
+        "status": "SOFTWARE READY",
+        "selected_rdm_lambda": selected,
+        "receipt": str(output),
+        "parameter_freeze": str(freeze["path"]),
+    }
 
 
 def train_representations_stage(
@@ -727,6 +733,12 @@ def train_representations_stage(
             runtime_approval=runtime_approval,
             trusted_local_resume=trusted_local_resume,
         )
+    representation_freeze = (
+        config.artifact_root / "selection" / "representation-parameter-freeze-v1.json"
+    )
+    if not representation_freeze.is_file():
+        _freeze_representation_parameters(config)
+    _require_representation_parameter_freeze(config)
     selection = _load_common_lambda_receipt(config)
     common_rdm_lambda = float(cast(Any, selection["selected_rdm_lambda"]))
     results = []
@@ -1993,6 +2005,35 @@ def run_authorized_stages(
     elif not _has_parquet_corpus(target_root):
         results["download_data"] = "DATA NOT ACQUIRED"
         return results
+    else:
+        from execsim.data.paper.acquisition import monthly_chunks
+
+        universe_payload = read_json(universe)
+        target_ids = tuple(
+            dict.fromkeys(
+                (
+                    *(str(member["instrument_id"]) for member in universe_payload["members"]),
+                    str(config.data["spy_instrument_id"]),
+                )
+            )
+        )
+        intervals = _symbol_intervals(pd.DataFrame(universe_payload["symbol_history"]))
+        try:
+            audit = _audit_acquisition_period(
+                target_ids,
+                intervals,
+                start=_as_date(config.data["target_period"][0]),
+                end=_as_date(config.data["target_period"][1]),
+                output=target_root,
+                monthly_chunks=monthly_chunks,
+                paper_config_hash=config.config_hash,
+            )
+        except RuntimeError as exc:
+            if "receipt set is incomplete" not in str(exc):
+                raise
+            results["download_data"] = "DATA ACQUISITION INCOMPLETE"
+            return results
+        results["download_data"] = {"status": "reused", "target_audit": audit}
     results["validate_data"] = validate_data_stage(config)
     sequence_root = config.artifact_root / "sequences"
     expected_manifests = [
@@ -2398,6 +2439,83 @@ def _git_head() -> str:
         ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     )
     return completed.stdout.strip()
+
+
+def _git_tree() -> str:
+    """Return the exact tracked source tree used by historical training."""
+    import subprocess
+
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], check=True, capture_output=True, text=True
+    )
+    return completed.stdout.strip()
+
+
+def _git_tracked_worktree_clean() -> bool:
+    """Return whether tracked files exactly match the current source commit."""
+    import subprocess
+
+    completed = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return not completed.stdout.strip()
+
+
+def _freeze_representation_parameters(config: PaperRunConfig) -> dict[str, object]:
+    """Freeze validation-only RDM selection before the final training matrix."""
+    if not _git_tracked_worktree_clean():
+        raise RuntimeError("BLOCKED: representation parameters require a clean source tree.")
+    selection_path = config.artifact_root / "selection" / "rdm-lambda.json"
+    selection = _load_common_lambda_receipt(config)
+    identity = {
+        "schema_version": "paper-representation-parameter-freeze-v1",
+        "status": "REPRESENTATION_PARAMETERS_FROZEN",
+        "git_commit": _git_head(),
+        "git_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "rdm_lambda_receipt_sha256": file_sha256(selection_path),
+        "selected_rdm_lambda": selection["selected_rdm_lambda"],
+        "selection_partition": "fold-1/validation",
+        "selection_seed": 13,
+        "test_or_tca_used": False,
+    }
+    path = config.artifact_root / "selection" / "representation-parameter-freeze-v1.json"
+    if path.is_file():
+        existing = read_json(path)
+        stable_existing = {key: existing.get(key) for key in identity}
+        if stable_existing != identity:
+            raise ValueError("Existing representation parameter freeze is incompatible.")
+        return {**existing, "path": str(path)}
+    payload = {**identity, "frozen_at_utc": datetime.now(UTC).isoformat()}
+    write_json_atomic(path, payload)
+    return {**payload, "path": str(path)}
+
+
+def _require_representation_parameter_freeze(config: PaperRunConfig) -> dict[str, object]:
+    """Reject final representation training before validation parameters are frozen."""
+    path = config.artifact_root / "selection" / "representation-parameter-freeze-v1.json"
+    if not path.is_file():
+        raise RuntimeError("BLOCKED: representation parameter freeze is missing.")
+    payload = read_json(path)
+    selection_path = config.artifact_root / "selection" / "rdm-lambda.json"
+    selection = _load_common_lambda_receipt(config)
+    if (
+        payload.get("schema_version") != "paper-representation-parameter-freeze-v1"
+        or payload.get("status") != "REPRESENTATION_PARAMETERS_FROZEN"
+        or payload.get("git_commit") != _git_head()
+        or payload.get("git_tree") != _git_tree()
+        or payload.get("paper_config_hash") != config.config_hash
+        or payload.get("rdm_lambda_receipt_sha256") != file_sha256(selection_path)
+        or payload.get("selected_rdm_lambda") != selection["selected_rdm_lambda"]
+        or payload.get("selection_partition") != "fold-1/validation"
+        or payload.get("selection_seed") != 13
+        or payload.get("test_or_tca_used") is not False
+    ):
+        raise ValueError("Representation parameter freeze is incompatible.")
+    return payload
 
 
 def _require_parameter_freeze(config: PaperRunConfig) -> dict[str, object]:

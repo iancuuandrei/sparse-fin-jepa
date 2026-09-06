@@ -26,8 +26,10 @@ from execsim.ml.paper.features import (
 from execsim.ml.paper.forecast_provider import PaperLightGBMForecastProvider
 from execsim.ml.paper.orchestration import (
     _formation_artifacts_ready,
+    _freeze_representation_parameters,
     _has_frozen_v2_formation_evidence,
     _require_parameter_freeze,
+    _require_representation_parameter_freeze,
     run_authorized_stages,
 )
 from execsim.ml.paper.provenance import build_run_provenance
@@ -529,6 +531,51 @@ def test_locked_test_parameter_freeze_requires_the_exact_model_matrix(
         _require_parameter_freeze(config)
 
 
+def test_representation_parameter_freeze_binds_source_and_rdm_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loaded = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    sections = {**loaded.sections, "data": {**loaded.data, "artifact_root": str(tmp_path)}}
+    config = replace(loaded, sections=sections)
+    selection = tmp_path / "selection" / "rdm-lambda.json"
+    write_json_atomic(
+        selection,
+        {
+            "schema_version": "paper-rdm-lambda-selection-v1",
+            "selection_partition": "fold-1/validation",
+            "seed": 13,
+            "paper_config_hash": config.config_hash,
+            "selected_rdm_lambda": 1.0,
+            "candidates": [
+                {
+                    "rdm_lambda": value,
+                    "geometry": geometry,
+                    "fold_id": "fold-1",
+                    "seed": 13,
+                    "observable_probe_error": {0.1: 0.5, 1.0: 0.2, 10.0: 0.8}[value],
+                    "collapse_gate_status": "PASS",
+                    "checkpoint_hash": f"{geometry}-{value}",
+                }
+                for value in (0.1, 1.0, 10.0)
+                for geometry in ("dense", "sparse")
+            ],
+            "test_or_tca_used": False,
+        },
+    )
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_head", lambda: "a" * 40)
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_tree", lambda: "b" * 40)
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_tracked_worktree_clean", lambda: True)
+
+    frozen = _freeze_representation_parameters(config)
+    assert frozen["status"] == "REPRESENTATION_PARAMETERS_FROZEN"
+    assert frozen["test_or_tca_used"] is False
+    assert _require_representation_parameter_freeze(config)["git_commit"] == "a" * 40
+
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_head", lambda: "c" * 40)
+    with pytest.raises(ValueError, match="incompatible"):
+        _require_representation_parameter_freeze(config)
+
+
 def test_manifest_resource_estimate_is_derived_and_fail_closed(tmp_path: Path) -> None:
     manifests = []
     for fold_id in ("fold-1", "fold-2", "fold-3"):
@@ -827,8 +874,11 @@ def test_runtime_approval_for_another_identity_is_denied(
         load_runtime_approval(approval_path, config)
 
 
-def test_v2_run_uses_frozen_daily_formation_state_without_v1_key() -> None:
+def test_v2_run_uses_frozen_daily_formation_state_without_v1_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    monkeypatch.setattr("execsim.ml.paper.orchestration._has_parquet_corpus", lambda _: False)
 
     result = run_authorized_stages(
         config,
@@ -844,7 +894,10 @@ def test_v2_run_uses_frozen_daily_formation_state_without_v1_key() -> None:
     assert result == {"build_universe": "reused", "download_data": "DATA NOT ACQUIRED"}
 
 
-def test_cli_v2_run_reaches_target_gate_without_authorization(capsys) -> None:
+def test_cli_v2_run_reaches_target_gate_without_authorization(
+    capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("execsim.ml.paper.orchestration._has_parquet_corpus", lambda _: False)
     assert (
         main(
             [
@@ -860,6 +913,31 @@ def test_cli_v2_run_reaches_target_gate_without_authorization(capsys) -> None:
 
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"build_universe": "reused", "download_data": "DATA NOT ACQUIRED"}
+
+
+def test_v2_run_does_not_validate_a_partially_acquired_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    monkeypatch.setattr("execsim.ml.paper.orchestration._has_parquet_corpus", lambda _: True)
+    monkeypatch.setattr(
+        "execsim.ml.paper.orchestration._audit_acquisition_period",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("BLOCKED: target acquisition receipt set is incomplete")
+        ),
+    )
+
+    result = run_authorized_stages(
+        config,
+        network_cli_enabled=False,
+        training_cli_enabled=False,
+        full_run_cli_enabled=False,
+    )
+
+    assert result == {
+        "build_universe": "reused",
+        "download_data": "DATA ACQUISITION INCOMPLETE",
+    }
 
 
 def test_formation_readiness_dispatches_by_protocol(tmp_path: Path, monkeypatch) -> None:

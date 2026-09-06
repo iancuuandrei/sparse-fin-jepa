@@ -12,7 +12,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from execsim.data.paper.corporate_actions import apply_point_in_time_split_adjustment
+from execsim.data.paper.corporate_actions import (
+    apply_point_in_time_split_adjustment,
+    point_in_time_split_factor,
+)
 from execsim.data.paper.manifests import file_sha256
 from execsim.data.paper.partitions import fold_training_cutoff, resolve_fold_partition
 from execsim.data.paper.resolution_quality import (
@@ -163,23 +166,30 @@ def _build_fold_sequence_corpus_from_sessions(
     instruments = tuple(str(member["instrument_id"]) for member in universe_members)
     if spy_instrument_id in instruments:
         raise ValueError("SPY benchmark identity must not be an execution-universe member.")
-    spy_sessions = load_sessions(spy_instrument_id, "unresolved", None)
+    spy_sessions = [
+        item
+        for item in load_sessions(spy_instrument_id, "unresolved", None)
+        if _belongs_to_fold(fold_id, item[0])
+    ]
     if not spy_sessions:
         raise ValueError("SPY corpus is required for every paper sequence build.")
     spy_dates = [item[0] for item in spy_sessions]
     spy_by_date = dict(spy_sessions)
+    spy_token_cache = _token_cache(spy_sessions, quality_protocol=quality_protocol)
     records: list[tuple[str, SequenceRecord]] = []
     exclusions: list[dict[str, str]] = []
     raw_hashes: list[str] = []
     for member in universe_members:
         instrument_id = str(member["instrument_id"])
-        sessions = load_sessions(instrument_id, fold_id, exclusions)
+        sessions = [
+            item
+            for item in load_sessions(instrument_id, fold_id, exclusions)
+            if _belongs_to_fold(fold_id, item[0])
+        ]
+        session_token_cache = _token_cache(sessions, quality_protocol=quality_protocol)
         history: list[tuple[date, pd.DataFrame]] = []
         for session_date, session in sessions:
-            try:
-                partition = resolve_fold_partition(fold_id, session_date)
-            except ValueError:
-                continue
+            partition = resolve_fold_partition(fold_id, session_date)
             prior = history[-20:]
             spy_index = bisect_left(spy_dates, session_date)
             spy_prior = spy_sessions[max(0, spy_index - 20) : spy_index]
@@ -217,21 +227,21 @@ def _build_fold_sequence_corpus_from_sessions(
                 instrument_id=instrument_id,
                 market_information_as_of=market_information_as_of,
             )
-            adjusted_prior = [
-                (
-                    prior_date,
-                    _adjust_for_market_information(
-                        prior_session,
-                        corporate_actions,
-                        instrument_id=instrument_id,
-                        market_information_as_of=market_information_as_of,
-                    ),
-                )
-                for prior_date, prior_session in prior
-            ]
-            previous_close = float(adjusted_prior[-1][1]["close"].iloc[-1])
-            stock_seasonal = _seasonal_frame(adjusted_prior, quality_protocol=quality_protocol)
-            spy_seasonal = _seasonal_frame(spy_prior, quality_protocol=quality_protocol)
+            adjusted_previous = _adjust_for_market_information(
+                prior[-1][1],
+                corporate_actions,
+                instrument_id=instrument_id,
+                market_information_as_of=market_information_as_of,
+            )
+            previous_close = float(adjusted_previous["close"].iloc[-1])
+            stock_seasonal = _seasonal_frame_from_token_cache(
+                prior,
+                session_token_cache,
+                corporate_actions=corporate_actions,
+                instrument_id=instrument_id,
+                market_information_as_of=market_information_as_of,
+            )
+            spy_seasonal = _seasonal_frame_from_token_cache(spy_prior, spy_token_cache)
             source_hash = _frame_hash(session)
             record = build_session_sequence(
                 adjusted,
@@ -359,19 +369,65 @@ def _validated_sessions(
 def _seasonal_frame(
     history: list[tuple[date, pd.DataFrame]], *, quality_protocol: str
 ) -> pd.DataFrame:
-    rows = []
-    for session_date, session in history[-20:]:
-        tokens = (
+    return _seasonal_frame_from_token_cache(
+        history, _token_cache(history, quality_protocol=quality_protocol)
+    )
+
+
+def _belongs_to_fold(fold_id: str, session_date: date) -> bool:
+    try:
+        resolve_fold_partition(fold_id, session_date)
+    except ValueError:
+        return False
+    return True
+
+
+def _token_cache(
+    sessions: list[tuple[date, pd.DataFrame]], *, quality_protocol: str
+) -> dict[date, pd.DataFrame]:
+    """Aggregate each causal session once instead of once per future case."""
+    return {
+        session_date: (
             aggregate_observed_tokens(session)
             if quality_protocol == "resolution-aware-v2"
             else _aggregate_tokens(session)
         )
+        for session_date, session in sessions
+    }
+
+
+def _seasonal_frame_from_token_cache(
+    history: list[tuple[date, pd.DataFrame]],
+    token_cache: dict[date, pd.DataFrame],
+    *,
+    corporate_actions: pd.DataFrame | None = None,
+    instrument_id: str | None = None,
+    market_information_as_of: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Build causal seasonal rows from cached tokens with point-in-time split scaling."""
+    if corporate_actions is not None and (
+        instrument_id is None or market_information_as_of is None
+    ):
+        raise ValueError(
+            "Corporate-action seasonal scaling requires identity and information time."
+        )
+    rows = []
+    for session_date, session in history[-20:]:
+        tokens = token_cache[session_date]
+        factor = 1.0
+        if corporate_actions is not None and not corporate_actions.empty:
+            factor = point_in_time_split_factor(
+                corporate_actions,
+                instrument_id=str(instrument_id),
+                observation_at=pd.Timestamp(session["timestamp"].iloc[-1]),
+                market_information_as_of=market_information_as_of,
+            )
         for bucket_index, token in enumerate(tokens.itertuples(index=False)):
             rows.append(
                 {
                     "session_date": session_date,
                     "bucket_index": bucket_index,
-                    "volume": float(token.volume),
+                    "volume": float(token.volume * factor),
                     "dollar_volume": float(token.vwap * token.volume),
                     "trade_count": float(token.trade_count),
                 }

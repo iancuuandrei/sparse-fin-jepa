@@ -110,11 +110,23 @@ def normalize_split_actions(
     rows: list[dict[str, object]] = []
     action_ids: set[str] = set()
     for payload in payloads:
-        unknown = set(payload).difference({*_RESPONSE_FIELDS, "next_page_token"})
+        if "corporate_actions" in payload:
+            unknown_top_level = set(payload).difference({"corporate_actions", "next_page_token"})
+            if unknown_top_level:
+                raise ValueError(
+                    "Alpaca corporate-action response has unknown top-level fields: "
+                    f"{unknown_top_level}"
+                )
+            action_payload = payload["corporate_actions"]
+            if not isinstance(action_payload, dict):
+                raise ValueError("Alpaca corporate_actions must be an object.")
+        else:
+            action_payload = payload
+        unknown = set(action_payload).difference({*_RESPONSE_FIELDS, "next_page_token"})
         if unknown:
             raise ValueError(f"Alpaca corporate-action response has unknown fields: {unknown}")
         for response_field, action_type in _RESPONSE_FIELDS.items():
-            actions = payload.get(response_field, [])
+            actions = action_payload.get(response_field, [])
             if not isinstance(actions, list):
                 raise ValueError(f"Alpaca {response_field} must be a list.")
             for item in actions:

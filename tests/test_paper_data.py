@@ -104,29 +104,33 @@ def test_alpaca_split_normalization_uses_causal_pre_split_share_basis() -> None:
     )
     payloads = (
         {
-            "forward_splits": [
-                {
-                    "id": "forward-1",
-                    "symbol": "AAPL",
-                    "old_rate": 1,
-                    "new_rate": 4,
-                    "process_date": "2022-06-01",
-                    "ex_date": "2022-06-03",
-                }
-            ],
+            "corporate_actions": {
+                "forward_splits": [
+                    {
+                        "id": "forward-1",
+                        "symbol": "AAPL",
+                        "old_rate": 1,
+                        "new_rate": 4,
+                        "process_date": "2022-06-01",
+                        "ex_date": "2022-06-03",
+                    }
+                ]
+            },
             "next_page_token": "page-2",
         },
         {
-            "reverse_splits": [
-                {
-                    "id": "reverse-1",
-                    "symbol": "XYZ",
-                    "old_rate": 10,
-                    "new_rate": 1,
-                    "process_date": "2023-08-10",
-                    "ex_date": "2023-08-14",
-                }
-            ],
+            "corporate_actions": {
+                "reverse_splits": [
+                    {
+                        "id": "reverse-1",
+                        "symbol": "XYZ",
+                        "old_rate": 10,
+                        "new_rate": 1,
+                        "process_date": "2023-08-10",
+                        "ex_date": "2023-08-14",
+                    }
+                ]
+            },
             "next_page_token": None,
         },
     )
@@ -168,19 +172,24 @@ def test_corporate_action_acquisition_is_paginated_idempotent_and_fail_closed(
     )
     pages = {
         None: {
-            "forward_splits": [
-                {
-                    "id": "forward-1",
-                    "symbol": "AAPL",
-                    "old_rate": 1,
-                    "new_rate": 4,
-                    "process_date": "2022-06-01",
-                    "ex_date": "2022-06-03",
-                }
-            ],
+            "corporate_actions": {
+                "forward_splits": [
+                    {
+                        "id": "forward-1",
+                        "symbol": "AAPL",
+                        "old_rate": 1,
+                        "new_rate": 4,
+                        "process_date": "2022-06-01",
+                        "ex_date": "2022-06-03",
+                    }
+                ]
+            },
             "next_page_token": "page-2",
         },
-        "page-2": {"reverse_splits": [], "next_page_token": None},
+        "page-2": {
+            "corporate_actions": {"reverse_splits": []},
+            "next_page_token": None,
+        },
     }
     calls: list[str | None] = []
 

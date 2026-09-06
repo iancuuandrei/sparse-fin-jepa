@@ -17,6 +17,7 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0009](0009-separate-data-quality-by-resolution.md) | Accepted | Separate formation, representation, and execution data quality by resolution |
 | [0010](0010-separate-runtime-approval-from-scientific-config.md) | Accepted | Separate runtime stage approval from scientifically frozen configuration |
 | [0011](0011-source-split-actions-with-conservative-availability.md) | Accepted | Source split actions with conservative provider-process-date availability |
+| [0012](0012-isolate-historical-sequence-members.md) | Accepted | Isolate historical sequence members in deterministic spawn-safe processes |
 
 ## Recording a decision
 

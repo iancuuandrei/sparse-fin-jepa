@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import multiprocessing
 from bisect import bisect_left
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,27 @@ from execsim.ml.sequences.normalization import RobustFoldNormalizer
 from execsim.ml.sequences.schemas import SequenceRecord
 
 _TOKEN_CACHE_ATTR = "_execsim_paper_tokens"
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalMemberWorkerState:
+    """Hold immutable fold state initialized once in each spawned worker."""
+
+    corpus_root: Path
+    corporate_actions: pd.DataFrame
+    fold_id: str
+    cutoff: date
+    spy_sessions: tuple[tuple[date, pd.DataFrame], ...]
+    spy_dates: tuple[date, ...]
+    spy_by_date: dict[date, pd.DataFrame]
+    spy_token_cache: dict[date, pd.DataFrame]
+    data_classification: str
+    quality_protocol: str
+    symbol_history: tuple[dict[str, Any], ...]
+    spy_instrument_id: str
+
+
+_HISTORICAL_MEMBER_WORKER_STATE: _HistoricalMemberWorkerState | None = None
 
 
 def build_fold_sequence_corpus(
@@ -148,6 +170,7 @@ def build_fold_sequence_corpus_from_root(
         data_classification=data_classification,
         quality_protocol=quality_protocol,
         symbol_history=symbol_history,
+        historical_corpus_root=corpus_root.resolve(),
     )
 
 
@@ -168,6 +191,7 @@ def _build_fold_sequence_corpus_from_sessions(
     data_classification: str,
     quality_protocol: str,
     symbol_history: tuple[dict[str, Any], ...],
+    historical_corpus_root: Path | None = None,
 ) -> SequenceManifest:
     """Build one fold from a bounded session-loader boundary."""
     cutoff = fold_training_cutoff(fold_id)
@@ -186,119 +210,66 @@ def _build_fold_sequence_corpus_from_sessions(
     spy_by_date = dict(spy_sessions)
     spy_token_cache = _token_cache(spy_sessions, quality_protocol=quality_protocol)
 
-    def build_member(
-        member: dict[str, Any],
-    ) -> tuple[list[tuple[str, SequenceRecord]], list[dict[str, str]], list[str]]:
-        instrument_id = str(member["instrument_id"])
-        member_records: list[tuple[str, SequenceRecord]] = []
-        member_exclusions: list[dict[str, str]] = []
-        member_hashes: list[str] = []
-        member_actions = (
-            corporate_actions
-            if corporate_actions.empty
-            else corporate_actions.loc[
-                corporate_actions["instrument_id"].astype(str) == instrument_id
-            ]
-        )
-        sessions = [
-            item
-            for item in load_sessions(instrument_id, fold_id, member_exclusions)
-            if _belongs_to_fold(fold_id, item[0])
-        ]
-        session_token_cache = _token_cache(sessions, quality_protocol=quality_protocol)
-        history: list[tuple[date, pd.DataFrame]] = []
-        for session_date, session in sessions:
-            partition = resolve_fold_partition(fold_id, session_date)
-            prior = history[-20:]
-            spy_index = bisect_left(spy_dates, session_date)
-            spy_prior = spy_sessions[max(0, spy_index - 20) : spy_index]
-            prior_spy_session = spy_by_date.get(session_date)
-            if not prior or not spy_prior or prior_spy_session is None:
-                member_exclusions.append(
-                    {
-                        "fold_id": fold_id,
-                        "instrument_id": instrument_id,
-                        "session_date": session_date.isoformat(),
-                        "reason": "insufficient causal stock or SPY history",
-                    }
-                )
-                history.append((session_date, session))
-                continue
-            symbol = _session_symbol(session)
-            if symbol_history:
-                _verify_sourced_symbol(
-                    symbol_history,
-                    instrument_id=instrument_id,
-                    session_date=session_date,
-                    observed_symbol=symbol,
-                )
-                _verify_sourced_symbol(
-                    symbol_history,
-                    instrument_id=spy_instrument_id,
-                    session_date=session_date,
-                    observed_symbol=_session_symbol(prior_spy_session),
-                )
-            record_cutoff = prior[-1][0]
-            market_information_as_of = pd.Timestamp(session["timestamp"].iloc[0])
-            if member_actions.empty:
-                adjusted = session
-                adjusted_previous = prior[-1][1]
-            else:
-                adjusted = _adjust_for_market_information(
-                    session,
-                    member_actions,
-                    instrument_id=instrument_id,
-                    market_information_as_of=market_information_as_of,
-                )
-                adjusted_previous = _adjust_for_market_information(
-                    prior[-1][1],
-                    member_actions,
-                    instrument_id=instrument_id,
-                    market_information_as_of=market_information_as_of,
-                )
-            previous_close = float(adjusted_previous["close"].iloc[-1])
-            stock_seasonal = _seasonal_frame_from_token_cache(
-                prior,
-                session_token_cache,
-                corporate_actions=member_actions if not member_actions.empty else None,
-                instrument_id=instrument_id if not member_actions.empty else None,
-                market_information_as_of=(
-                    market_information_as_of if not member_actions.empty else None
-                ),
-            )
-            spy_seasonal = _seasonal_frame_from_token_cache(spy_prior, spy_token_cache)
-            source_hash = _frame_hash(session)
-            record = build_session_sequence(
-                adjusted,
-                instrument_id=instrument_id,
-                symbol=symbol,
-                source_sha256=source_hash,
-                cutoff=record_cutoff.isoformat(),
-                seasonal=stock_seasonal,
-                spy_bars=prior_spy_session,
-                spy_seasonal=spy_seasonal,
-                previous_close=previous_close,
-                data_classification=data_classification,
-                training_cutoff=cutoff.isoformat(),
-                quality_protocol=quality_protocol,
-                precomputed_tokens=(
-                    session_token_cache[session_date] if member_actions.empty else None
-                ),
-                precomputed_spy_tokens=spy_token_cache[session_date],
-            )
-            member_records.append((partition, record))
-            member_hashes.append(source_hash)
-            history.append((session_date, session))
-        return member_records, member_exclusions, member_hashes
-
     records: list[tuple[str, SequenceRecord]] = []
     exclusions: list[dict[str, str]] = []
     raw_hashes: list[str] = []
     worker_count = min(8, max(1, len(universe_members)))
-    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="paper-sequence") as pool:
-        for member_records, member_exclusions, member_hashes in pool.map(
-            build_member, universe_members
-        ):
+    if historical_corpus_root is None:
+
+        def build_member(
+            member: dict[str, Any],
+        ) -> tuple[list[tuple[str, SequenceRecord]], list[dict[str, str]], list[str]]:
+            member_exclusions: list[dict[str, str]] = []
+            instrument_id = str(member["instrument_id"])
+            sessions = [
+                item
+                for item in load_sessions(instrument_id, fold_id, member_exclusions)
+                if _belongs_to_fold(fold_id, item[0])
+            ]
+            return _build_member_records(
+                member,
+                sessions,
+                member_exclusions=member_exclusions,
+                corporate_actions=corporate_actions,
+                fold_id=fold_id,
+                cutoff=cutoff,
+                spy_sessions=spy_sessions,
+                spy_dates=spy_dates,
+                spy_by_date=spy_by_date,
+                spy_token_cache=spy_token_cache,
+                data_classification=data_classification,
+                quality_protocol=quality_protocol,
+                symbol_history=symbol_history,
+                spy_instrument_id=spy_instrument_id,
+            )
+
+        executor: ThreadPoolExecutor | ProcessPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="paper-sequence")
+        member_results = executor.map(build_member, universe_members)
+    else:
+        state = _HistoricalMemberWorkerState(
+            corpus_root=historical_corpus_root,
+            corporate_actions=corporate_actions,
+            fold_id=fold_id,
+            cutoff=cutoff,
+            spy_sessions=tuple(spy_sessions),
+            spy_dates=tuple(spy_dates),
+            spy_by_date=spy_by_date,
+            spy_token_cache=spy_token_cache,
+            data_classification=data_classification,
+            quality_protocol=quality_protocol,
+            symbol_history=symbol_history,
+            spy_instrument_id=spy_instrument_id,
+        )
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_initialize_historical_member_worker,
+            initargs=(state,),
+        )
+        member_results = executor.map(_build_historical_member_worker, universe_members)
+    with executor:
+        for member_records, member_exclusions, member_hashes in member_results:
             records.extend(member_records)
             exclusions.extend(member_exclusions)
             raw_hashes.extend(member_hashes)
@@ -355,6 +326,168 @@ def _build_fold_sequence_corpus_from_sessions(
         exclusions=tuple(exclusions),
         quality_protocol=quality_protocol,
     )
+
+
+def _initialize_historical_member_worker(state: _HistoricalMemberWorkerState) -> None:
+    """Install immutable fold state once per spawn-safe historical worker."""
+    global _HISTORICAL_MEMBER_WORKER_STATE
+    _HISTORICAL_MEMBER_WORKER_STATE = state
+
+
+def _build_historical_member_worker(
+    member: dict[str, Any],
+) -> tuple[list[tuple[str, SequenceRecord]], list[dict[str, str]], list[str]]:
+    """Build one historical instrument using bounded worker-local corpus reads."""
+    state = _HISTORICAL_MEMBER_WORKER_STATE
+    if state is None:
+        raise RuntimeError("Historical sequence worker was not initialized.")
+    member_exclusions: list[dict[str, str]] = []
+    instrument_id = str(member["instrument_id"])
+    bars = load_corpus_instrument(state.corpus_root, instrument_id)
+    timestamps = pd.to_datetime(bars["timestamp"])
+    local_dates = timestamps.dt.tz_convert("America/New_York").dt.date
+    fold = paper_fold(state.fold_id)
+    keep = (local_dates >= fold.train_start) & (local_dates <= fold.test_end)
+    sessions = [
+        item
+        for item in _validated_sessions(
+            bars.loc[keep],
+            instrument_id,
+            fold_id=state.fold_id,
+            exclusions=member_exclusions,
+            quality_protocol=state.quality_protocol,
+        )
+        if _belongs_to_fold(state.fold_id, item[0])
+    ]
+    return _build_member_records(
+        member,
+        sessions,
+        member_exclusions=member_exclusions,
+        corporate_actions=state.corporate_actions,
+        fold_id=state.fold_id,
+        cutoff=state.cutoff,
+        spy_sessions=list(state.spy_sessions),
+        spy_dates=list(state.spy_dates),
+        spy_by_date=state.spy_by_date,
+        spy_token_cache=state.spy_token_cache,
+        data_classification=state.data_classification,
+        quality_protocol=state.quality_protocol,
+        symbol_history=state.symbol_history,
+        spy_instrument_id=state.spy_instrument_id,
+    )
+
+
+def _build_member_records(
+    member: dict[str, Any],
+    sessions: list[tuple[date, pd.DataFrame]],
+    *,
+    member_exclusions: list[dict[str, str]],
+    corporate_actions: pd.DataFrame,
+    fold_id: str,
+    cutoff: date,
+    spy_sessions: list[tuple[date, pd.DataFrame]],
+    spy_dates: list[date],
+    spy_by_date: dict[date, pd.DataFrame],
+    spy_token_cache: dict[date, pd.DataFrame],
+    data_classification: str,
+    quality_protocol: str,
+    symbol_history: tuple[dict[str, Any], ...],
+    spy_instrument_id: str,
+) -> tuple[list[tuple[str, SequenceRecord]], list[dict[str, str]], list[str]]:
+    """Construct one member's ordered records under one immutable fold state."""
+    instrument_id = str(member["instrument_id"])
+    member_records: list[tuple[str, SequenceRecord]] = []
+    member_hashes: list[str] = []
+    member_actions = (
+        corporate_actions
+        if corporate_actions.empty
+        else corporate_actions.loc[corporate_actions["instrument_id"].astype(str) == instrument_id]
+    )
+    session_token_cache = _token_cache(sessions, quality_protocol=quality_protocol)
+    history: list[tuple[date, pd.DataFrame]] = []
+    for session_date, session in sessions:
+        partition = resolve_fold_partition(fold_id, session_date)
+        prior = history[-20:]
+        spy_index = bisect_left(spy_dates, session_date)
+        spy_prior = spy_sessions[max(0, spy_index - 20) : spy_index]
+        prior_spy_session = spy_by_date.get(session_date)
+        if not prior or not spy_prior or prior_spy_session is None:
+            member_exclusions.append(
+                {
+                    "fold_id": fold_id,
+                    "instrument_id": instrument_id,
+                    "session_date": session_date.isoformat(),
+                    "reason": "insufficient causal stock or SPY history",
+                }
+            )
+            history.append((session_date, session))
+            continue
+        symbol = _session_symbol(session)
+        if symbol_history:
+            _verify_sourced_symbol(
+                symbol_history,
+                instrument_id=instrument_id,
+                session_date=session_date,
+                observed_symbol=symbol,
+            )
+            _verify_sourced_symbol(
+                symbol_history,
+                instrument_id=spy_instrument_id,
+                session_date=session_date,
+                observed_symbol=_session_symbol(prior_spy_session),
+            )
+        record_cutoff = prior[-1][0]
+        market_information_as_of = pd.Timestamp(session["timestamp"].iloc[0])
+        if member_actions.empty:
+            adjusted = session
+            adjusted_previous = prior[-1][1]
+        else:
+            adjusted = _adjust_for_market_information(
+                session,
+                member_actions,
+                instrument_id=instrument_id,
+                market_information_as_of=market_information_as_of,
+            )
+            adjusted_previous = _adjust_for_market_information(
+                prior[-1][1],
+                member_actions,
+                instrument_id=instrument_id,
+                market_information_as_of=market_information_as_of,
+            )
+        previous_close = float(adjusted_previous["close"].iloc[-1])
+        stock_seasonal = _seasonal_frame_from_token_cache(
+            prior,
+            session_token_cache,
+            corporate_actions=member_actions if not member_actions.empty else None,
+            instrument_id=instrument_id if not member_actions.empty else None,
+            market_information_as_of=(
+                market_information_as_of if not member_actions.empty else None
+            ),
+        )
+        spy_seasonal = _seasonal_frame_from_token_cache(spy_prior, spy_token_cache)
+        source_hash = _frame_hash(session)
+        record = build_session_sequence(
+            adjusted,
+            instrument_id=instrument_id,
+            symbol=symbol,
+            source_sha256=source_hash,
+            cutoff=record_cutoff.isoformat(),
+            seasonal=stock_seasonal,
+            spy_bars=prior_spy_session,
+            spy_seasonal=spy_seasonal,
+            previous_close=previous_close,
+            data_classification=data_classification,
+            training_cutoff=cutoff.isoformat(),
+            quality_protocol=quality_protocol,
+            precomputed_tokens=(
+                session_token_cache[session_date] if member_actions.empty else None
+            ),
+            precomputed_spy_tokens=spy_token_cache[session_date],
+        )
+        member_records.append((partition, record))
+        member_hashes.append(source_hash)
+        history.append((session_date, session))
+    return member_records, member_exclusions, member_hashes
 
 
 def load_corpus_instrument(root: Path, instrument_id: str) -> pd.DataFrame:

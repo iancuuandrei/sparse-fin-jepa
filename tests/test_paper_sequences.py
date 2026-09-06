@@ -13,7 +13,7 @@ from execsim.data.paper.manifests import read_json
 from execsim.data.paper.validation import expected_xnys_minutes
 from execsim.data.scenarios import ScenarioConfig, generate_scenario
 from execsim.ml.sequences.builder import build_session_sequence
-from execsim.ml.sequences.corpus import build_fold_sequence_corpus
+from execsim.ml.sequences.corpus import build_fold_sequence_corpus_from_root
 from execsim.ml.sequences.dataset import extract_window
 from execsim.ml.sequences.index import (
     build_sample_index,
@@ -193,11 +193,15 @@ def test_multisession_multifold_corpus_builder_includes_spy_and_records_corrupti
             "end": "2025-12-31",
         },
     )
+    corpus_root = tmp_path / "raw"
+    corpus_root.mkdir()
+    for instrument_id, frame in bars.groupby("instrument_id", sort=True):
+        frame.to_parquet(corpus_root / f"{instrument_id}-fixture.response", index=False)
     manifests = []
     for fold_id in ("fold-1", "fold-2"):
         manifests.append(
-            build_fold_sequence_corpus(
-                bars,
+            build_fold_sequence_corpus_from_root(
+                corpus_root,
                 universe_members=members,
                 corporate_actions=actions,
                 fold_id=fold_id,

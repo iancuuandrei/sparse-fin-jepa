@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -45,8 +47,6 @@ def build_fold_sequence_corpus(
     symbol_history: tuple[dict[str, Any], ...] = (),
 ) -> SequenceManifest:
     """Build, normalize, index, and manifest every valid session in one fold."""
-    cutoff = fold_training_cutoff(fold_id)
-    fold_root = output_root / fold_id
     instruments = tuple(str(member["instrument_id"]) for member in universe_members)
     if spy_instrument_id in instruments:
         raise ValueError("SPY benchmark identity must not be an execution-universe member.")
@@ -58,30 +58,132 @@ def build_fold_sequence_corpus(
         raise ValueError(f"Universe instruments missing from raw corpus: {sorted(missing)}")
     if data_classification != "synthetic_fixture" and not symbol_history:
         raise ValueError("Historical sequence builds require sourced symbol history.")
-    spy_sessions = _validated_sessions(bars, spy_instrument_id, quality_protocol=quality_protocol)
+
+    def load_sessions(
+        instrument_id: str,
+        active_fold_id: str,
+        exclusions: list[dict[str, str]] | None,
+    ) -> list[tuple[date, pd.DataFrame]]:
+        return _validated_sessions(
+            bars,
+            instrument_id,
+            fold_id=active_fold_id,
+            exclusions=exclusions,
+            quality_protocol=quality_protocol,
+        )
+
+    return _build_fold_sequence_corpus_from_sessions(
+        load_sessions,
+        universe_members=universe_members,
+        corporate_actions=corporate_actions,
+        fold_id=fold_id,
+        output_root=output_root,
+        universe_manifest_hash=universe_manifest_hash,
+        corporate_action_manifest_hash=corporate_action_manifest_hash,
+        config_hash=config_hash,
+        spy_instrument_id=spy_instrument_id,
+        data_classification=data_classification,
+        quality_protocol=quality_protocol,
+        symbol_history=symbol_history,
+    )
+
+
+def build_fold_sequence_corpus_from_root(
+    corpus_root: Path,
+    *,
+    universe_members: tuple[dict[str, Any], ...],
+    corporate_actions: pd.DataFrame,
+    fold_id: str,
+    output_root: Path,
+    universe_manifest_hash: str,
+    corporate_action_manifest_hash: str,
+    config_hash: str,
+    spy_instrument_id: str,
+    data_classification: str,
+    quality_protocol: str = "exact-minute-v1",
+    symbol_history: tuple[dict[str, Any], ...] = (),
+) -> SequenceManifest:
+    """Build one fold while holding only one instrument corpus in memory."""
+    if not corpus_root.is_dir():
+        raise FileNotFoundError(f"Paper corpus root does not exist: {corpus_root}")
+    if data_classification != "synthetic_fixture" and not symbol_history:
+        raise ValueError("Historical sequence builds require sourced symbol history.")
+
+    def load_sessions(
+        instrument_id: str,
+        active_fold_id: str,
+        exclusions: list[dict[str, str]] | None,
+    ) -> list[tuple[date, pd.DataFrame]]:
+        bars = load_corpus_instrument(corpus_root, instrument_id)
+        return _validated_sessions(
+            bars,
+            instrument_id,
+            fold_id=active_fold_id,
+            exclusions=exclusions,
+            quality_protocol=quality_protocol,
+        )
+
+    return _build_fold_sequence_corpus_from_sessions(
+        load_sessions,
+        universe_members=universe_members,
+        corporate_actions=corporate_actions,
+        fold_id=fold_id,
+        output_root=output_root,
+        universe_manifest_hash=universe_manifest_hash,
+        corporate_action_manifest_hash=corporate_action_manifest_hash,
+        config_hash=config_hash,
+        spy_instrument_id=spy_instrument_id,
+        data_classification=data_classification,
+        quality_protocol=quality_protocol,
+        symbol_history=symbol_history,
+    )
+
+
+SessionLoader = Callable[[str, str, list[dict[str, str]] | None], list[tuple[date, pd.DataFrame]]]
+
+
+def _build_fold_sequence_corpus_from_sessions(
+    load_sessions: SessionLoader,
+    *,
+    universe_members: tuple[dict[str, Any], ...],
+    corporate_actions: pd.DataFrame,
+    fold_id: str,
+    output_root: Path,
+    universe_manifest_hash: str,
+    corporate_action_manifest_hash: str,
+    config_hash: str,
+    spy_instrument_id: str,
+    data_classification: str,
+    quality_protocol: str,
+    symbol_history: tuple[dict[str, Any], ...],
+) -> SequenceManifest:
+    """Build one fold from a bounded session-loader boundary."""
+    cutoff = fold_training_cutoff(fold_id)
+    fold_root = output_root / fold_id
+    instruments = tuple(str(member["instrument_id"]) for member in universe_members)
+    if spy_instrument_id in instruments:
+        raise ValueError("SPY benchmark identity must not be an execution-universe member.")
+    spy_sessions = load_sessions(spy_instrument_id, "unresolved", None)
+    if not spy_sessions:
+        raise ValueError("SPY corpus is required for every paper sequence build.")
+    spy_dates = [item[0] for item in spy_sessions]
+    spy_by_date = dict(spy_sessions)
     records: list[tuple[str, SequenceRecord]] = []
     exclusions: list[dict[str, str]] = []
     raw_hashes: list[str] = []
     for member in universe_members:
         instrument_id = str(member["instrument_id"])
-        sessions = _validated_sessions(
-            bars,
-            instrument_id,
-            fold_id=fold_id,
-            exclusions=exclusions,
-            quality_protocol=quality_protocol,
-        )
+        sessions = load_sessions(instrument_id, fold_id, exclusions)
         history: list[tuple[date, pd.DataFrame]] = []
         for session_date, session in sessions:
             try:
                 partition = resolve_fold_partition(fold_id, session_date)
             except ValueError:
                 continue
-            prior = [item for item in history if item[0] < session_date][-20:]
-            spy_prior = [item for item in spy_sessions if item[0] < session_date][-20:]
-            prior_spy_session = next(
-                (item[1] for item in spy_sessions if item[0] == session_date), None
-            )
+            prior = history[-20:]
+            spy_index = bisect_left(spy_dates, session_date)
+            spy_prior = spy_sessions[max(0, spy_index - 20) : spy_index]
+            prior_spy_session = spy_by_date.get(session_date)
             if not prior or not spy_prior or prior_spy_session is None:
                 exclusions.append(
                     {
@@ -196,10 +298,22 @@ def build_fold_sequence_corpus(
 
 def load_corpus_instrument(root: Path, instrument_id: str) -> pd.DataFrame:
     """Load only one instrument's bounded Parquet partitions from a large corpus."""
-    files = sorted(root.glob(f"**/instrument_id={instrument_id}/**/*.parquet"))
+    files = sorted(
+        {
+            *root.glob(f"{instrument_id}-*.response"),
+            *root.glob(f"{instrument_id}-*.parquet"),
+            *root.glob(f"**/instrument_id={instrument_id}/**/*.parquet"),
+        }
+    )
     if not files:
         raise FileNotFoundError(f"No corpus partitions for instrument {instrument_id}.")
-    return pd.concat((pd.read_parquet(path) for path in files), ignore_index=True)
+    frame = pd.concat((pd.read_parquet(path) for path in files), ignore_index=True)
+    observed = set(frame["instrument_id"].astype(str).unique())
+    if observed != {instrument_id}:
+        raise ValueError(
+            f"Corpus partitions for {instrument_id} contain incompatible identities: {observed}"
+        )
+    return frame
 
 
 def _validated_sessions(

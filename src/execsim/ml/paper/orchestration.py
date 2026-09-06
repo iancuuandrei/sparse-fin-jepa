@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -31,7 +32,11 @@ from execsim.data.paper.schemas import InstrumentSymbolInterval
 from execsim.data.paper.universe import select_frozen_universe, write_universe_manifest
 from execsim.data.paper.validation import validate_exact_xnys_session
 from execsim.ml.paper.configs import PaperRunConfig, PaperRuntimeApproval
-from execsim.ml.sequences.corpus import build_fold_sequence_corpus
+from execsim.ml.sequences.corpus import (
+    build_fold_sequence_corpus,
+    build_fold_sequence_corpus_from_root,
+    load_corpus_instrument,
+)
 
 
 def build_universe_stage(config: PaperRunConfig) -> dict[str, object]:
@@ -374,7 +379,6 @@ def _expected_primary_session_count(calendar: Any, start: object, end: object) -
 def validate_data_stage(config: PaperRunConfig, source: Path | None = None) -> dict[str, object]:
     """Validate target sessions under the configured representation-quality protocol."""
     root = source or Path(config.data["target_corpus_root"])
-    frame = _load_parquet_corpus(root)
     universe = read_json(Path(config.data["universe_manifest"]))
     symbol_intervals = _symbol_intervals(pd.DataFrame(universe.get("symbol_history", ())))
     validate_symbol_history(symbol_intervals)
@@ -382,56 +386,71 @@ def validate_data_stage(config: PaperRunConfig, source: Path | None = None) -> d
         *(str(member["instrument_id"]) for member in universe.get("members", ())),
         str(config.data["spy_instrument_id"]),
     }
-    timestamps = pd.to_datetime(frame["timestamp"])
-    dates = timestamps.dt.tz_convert("America/New_York").dt.date
     protocol = str(config.sequences.get("quality_protocol", "exact-minute-v1"))
     errors = []
     quality_rows = []
     valid = 0
-    for (instrument, session_date), session in frame.groupby(
-        [frame["instrument_id"].astype(str), dates], sort=True
-    ):
-        identity_errors: list[str] = []
-        if instrument not in allowed_instruments:
-            identity_errors.append("instrument is not in the frozen universe or SPY")
-        observed_symbols = tuple(session["symbol"].astype(str).str.upper().drop_duplicates())
-        if len(observed_symbols) != 1:
-            identity_errors.append("session must contain one observed symbol")
-        else:
-            try:
-                expected_symbol = resolve_provider_symbol(
-                    symbol_intervals, instrument, session_date
-                )
-            except RuntimeError as exc:
-                identity_errors.append(str(exc))
+    if root.is_dir():
+
+        def iter_frames() -> Iterator[pd.DataFrame]:
+            for instrument_id in sorted(allowed_instruments):
+                try:
+                    yield load_corpus_instrument(root, instrument_id)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"BLOCKED: target corpus is missing instrument {instrument_id}."
+                    ) from exc
+
+        frames = iter_frames()
+    else:
+        frames = iter((_load_parquet_corpus(root),))
+    for frame in frames:
+        timestamps = pd.to_datetime(frame["timestamp"])
+        dates = timestamps.dt.tz_convert("America/New_York").dt.date
+        for (instrument, session_date), session in frame.groupby(
+            [frame["instrument_id"].astype(str), dates], sort=True
+        ):
+            identity_errors: list[str] = []
+            if instrument not in allowed_instruments:
+                identity_errors.append("instrument is not in the frozen universe or SPY")
+            observed_symbols = tuple(session["symbol"].astype(str).str.upper().drop_duplicates())
+            if len(observed_symbols) != 1:
+                identity_errors.append("session must contain one observed symbol")
             else:
-                if observed_symbols[0] != expected_symbol:
-                    identity_errors.append(
-                        f"observed symbol {observed_symbols[0]} does not match "
-                        f"sourced symbol {expected_symbol}"
+                try:
+                    expected_symbol = resolve_provider_symbol(
+                        symbol_intervals, instrument, session_date
                     )
-        session_errors: tuple[str, ...]
-        if protocol == "resolution-aware-v2":
-            quality = assess_session_resolution_quality(session)
-            quality_rows.append(quality.to_dict())
-            session_errors = (
-                () if quality.token_valid_full_session else (quality.invalid_token_reason,)
-            )
-        elif protocol == "exact-minute-v1":
-            session_errors = validate_exact_xnys_session(session)
-        else:
-            raise ValueError(f"Unknown paper quality protocol: {protocol}")
-        session_errors = (*identity_errors, *session_errors)
-        if session_errors:
-            errors.append(
-                {
-                    "instrument_id": instrument,
-                    "session_date": session_date.isoformat(),
-                    "errors": session_errors,
-                }
-            )
-        else:
-            valid += 1
+                except RuntimeError as exc:
+                    identity_errors.append(str(exc))
+                else:
+                    if observed_symbols[0] != expected_symbol:
+                        identity_errors.append(
+                            f"observed symbol {observed_symbols[0]} does not match "
+                            f"sourced symbol {expected_symbol}"
+                        )
+            session_errors: tuple[str, ...]
+            if protocol == "resolution-aware-v2":
+                quality = assess_session_resolution_quality(session)
+                quality_rows.append(quality.to_dict())
+                session_errors = (
+                    () if quality.token_valid_full_session else (quality.invalid_token_reason,)
+                )
+            elif protocol == "exact-minute-v1":
+                session_errors = validate_exact_xnys_session(session)
+            else:
+                raise ValueError(f"Unknown paper quality protocol: {protocol}")
+            session_errors = (*identity_errors, *session_errors)
+            if session_errors:
+                errors.append(
+                    {
+                        "instrument_id": instrument,
+                        "session_date": session_date.isoformat(),
+                        "errors": session_errors,
+                    }
+                )
+            else:
+                valid += 1
     return {
         "valid": not errors,
         "quality_protocol": protocol,
@@ -456,22 +475,27 @@ def build_sequences_stage(config: PaperRunConfig, source: Path | None = None) ->
     write_corporate_action_manifest(
         action_source, actions, action_manifest_path, paper_config_hash=config.config_hash
     )
-    bars = _load_parquet_corpus(source or Path(config.data["target_corpus_root"]))
+    corpus_source = source or Path(config.data["target_corpus_root"])
+    bars = None if corpus_source.is_dir() else _load_parquet_corpus(corpus_source)
     manifests = []
     for fold in config.evaluation["folds"]:
-        built = build_fold_sequence_corpus(
-            bars,
-            universe_members=tuple(universe["members"]),
-            corporate_actions=actions,
-            fold_id=str(fold["id"]),
-            output_root=config.artifact_root / "sequences",
-            universe_manifest_hash=file_sha256(universe_path),
-            corporate_action_manifest_hash=file_sha256(action_manifest_path),
-            config_hash=config.config_hash,
-            spy_instrument_id=str(config.data["spy_instrument_id"]),
-            data_classification="historical",
-            quality_protocol=str(config.sequences["quality_protocol"]),
-            symbol_history=tuple(universe.get("symbol_history", ())),
+        kwargs = {
+            "universe_members": tuple(universe["members"]),
+            "corporate_actions": actions,
+            "fold_id": str(fold["id"]),
+            "output_root": config.artifact_root / "sequences",
+            "universe_manifest_hash": file_sha256(universe_path),
+            "corporate_action_manifest_hash": file_sha256(action_manifest_path),
+            "config_hash": config.config_hash,
+            "spy_instrument_id": str(config.data["spy_instrument_id"]),
+            "data_classification": "historical",
+            "quality_protocol": str(config.sequences["quality_protocol"]),
+            "symbol_history": tuple(universe.get("symbol_history", ())),
+        }
+        built = (
+            build_fold_sequence_corpus_from_root(corpus_source, **kwargs)
+            if bars is None
+            else build_fold_sequence_corpus(bars, **kwargs)
         )
         manifests.append(asdict(built))
     return {"status": "SOFTWARE READY", "folds": manifests}

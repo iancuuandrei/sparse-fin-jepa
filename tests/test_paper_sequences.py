@@ -362,9 +362,17 @@ def test_multisession_multifold_corpus_builder_includes_spy_and_records_corrupti
         partition="train",
         seed=13,
     )
+    index_cache = next((tmp_path / "sequences" / "fold-1" / ".index-cache").glob("train-*.parquet"))
+    cached_train = PaperSequenceDataset(
+        tmp_path / "sequences" / "fold-1" / "sequence-manifest.json",
+        partition="train",
+        seed=13,
+    )
 
     assert len(dates) == 40
     assert len(manifests) == 2
+    assert index_cache.with_suffix(".json").is_file()
+    assert len(cached_train) == len(train)
     assert first_payload["quality_protocol"] == "resolution-aware-v2"
     assert len(train) == 2 * first_payload["partition_counts"]["train"]
     assert any(item["instrument_id"] == "asset-3" for item in first_payload["exclusions"])

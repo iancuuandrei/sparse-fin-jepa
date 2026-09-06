@@ -9,10 +9,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from execsim.data.paper.manifests import read_json
+from execsim.data.paper.manifests import file_sha256, read_json, write_json_atomic
 from execsim.data.paper.partitions import resolve_fold_partition
 from execsim.ml.sequences.dataset import extract_window
 from execsim.ml.sequences.index import sample_training_positions
@@ -55,10 +57,13 @@ class PaperSequenceDataset(Dataset[dict[str, Any]]):
         ]
         if not self._sessions or not index_paths:
             raise ValueError(f"Sequence manifest has no {partition} sessions or indexes.")
+        index_frame = _load_cached_index_frame(
+            manifest_path,
+            partition=partition,
+            index_paths=tuple(sorted(index_paths)),
+        )
         self._all_samples = tuple(
-            _sample_from_row(row)
-            for path in sorted(index_paths)
-            for row in pd.read_parquet(path).itertuples(index=False)
+            _sample_from_row(row) for row in index_frame.itertuples(index=False)
         )
         for sample in self._all_samples:
             if sample.fold_id != self.fold_id or sample.partition != partition:
@@ -205,3 +210,65 @@ def _sample_from_row(row: Any) -> SequenceSample:
         market_information_as_of=str(row.market_information_as_of),
         feature_history_end=str(row.feature_history_end),
     )
+
+
+def _load_cached_index_frame(
+    manifest_path: Path,
+    *,
+    partition: str,
+    index_paths: tuple[Path, ...],
+) -> pd.DataFrame:
+    """Load one validated manifest-keyed cache instead of many tiny index files."""
+    manifest_hash = file_sha256(manifest_path)
+    cache_root = manifest_path.parent / ".index-cache"
+    cache_path = cache_root / f"{partition}-{manifest_hash}.parquet"
+    receipt_path = cache_path.with_suffix(".json")
+    receipt_identity = {
+        "schema_version": "paper-sequence-index-cache-v1",
+        "manifest_sha256": manifest_hash,
+        "partition": partition,
+        "source_index_count": len(index_paths),
+    }
+    if cache_path.is_file() and receipt_path.is_file():
+        receipt = read_json(receipt_path)
+        if any(receipt.get(key) != value for key, value in receipt_identity.items()):
+            raise ValueError("Sequence index cache receipt is incompatible with its manifest.")
+        if receipt.get("cache_sha256") != file_sha256(cache_path):
+            raise ValueError("Sequence index cache checksum does not match its receipt.")
+        frame = pd.read_parquet(cache_path)
+        if int(receipt.get("row_count", -1)) != len(frame):
+            raise ValueError("Sequence index cache row count does not match its receipt.")
+        return frame
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_suffix(".parquet.partial")
+    if temporary.exists():
+        temporary.unlink()
+    writer: pq.ParquetWriter | None = None
+    row_count = 0
+    try:
+        for start in range(0, len(index_paths), 512):
+            frame = pd.concat(
+                (pd.read_parquet(path) for path in index_paths[start : start + 512]),
+                ignore_index=True,
+            )
+            table = pa.Table.from_pandas(frame, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(temporary, table.schema, compression="zstd")
+            writer.write_table(table)
+            row_count += len(frame)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None or row_count <= 0:
+        raise ValueError(f"Sequence manifest has no {partition} index rows.")
+    temporary.replace(cache_path)
+    write_json_atomic(
+        receipt_path,
+        {
+            **receipt_identity,
+            "row_count": row_count,
+            "cache_sha256": file_sha256(cache_path),
+        },
+    )
+    return pd.read_parquet(cache_path)

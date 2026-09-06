@@ -15,6 +15,10 @@ from execsim.data.paper.acquisition import (
     authorize_acquisition,
     monthly_chunks,
 )
+from execsim.data.paper.corporate_action_acquisition import (
+    acquire_split_actions,
+    normalize_split_actions,
+)
 from execsim.data.paper.corporate_actions import (
     apply_point_in_time_split_adjustment,
     point_in_time_split_factor,
@@ -24,7 +28,7 @@ from execsim.data.paper.formation import (
     build_formation_candidates_from_corpus,
 )
 from execsim.data.paper.identity import resolve_provider_symbol, validate_symbol_history
-from execsim.data.paper.manifests import stable_hash, write_json_atomic
+from execsim.data.paper.manifests import file_sha256, stable_hash, write_json_atomic
 from execsim.data.paper.partitions import (
     PAPER_FOLDS,
     resolve_fold_partition,
@@ -89,6 +93,149 @@ def test_corporate_action_requires_both_effective_and_known_times() -> None:
         observation_at=after_all_known,
         market_information_as_of=after_all_known,
     ) == pytest.approx(2.0 * 3.0 * 5.0 * 7.0)
+
+
+def test_alpaca_split_normalization_uses_causal_pre_split_share_basis() -> None:
+    intervals = (
+        InstrumentSymbolInterval(
+            "asset-a", "AAPL", date(2021, 1, 4), date(2025, 12, 31), "fixture"
+        ),
+        InstrumentSymbolInterval("asset-b", "XYZ", date(2021, 1, 4), date(2025, 12, 31), "fixture"),
+    )
+    payloads = (
+        {
+            "forward_splits": [
+                {
+                    "id": "forward-1",
+                    "symbol": "AAPL",
+                    "old_rate": 1,
+                    "new_rate": 4,
+                    "process_date": "2022-06-01",
+                    "ex_date": "2022-06-03",
+                }
+            ],
+            "next_page_token": "page-2",
+        },
+        {
+            "reverse_splits": [
+                {
+                    "id": "reverse-1",
+                    "symbol": "XYZ",
+                    "old_rate": 10,
+                    "new_rate": 1,
+                    "process_date": "2023-08-10",
+                    "ex_date": "2023-08-14",
+                }
+            ],
+            "next_page_token": None,
+        },
+    )
+
+    actions = normalize_split_actions(
+        payloads,
+        symbol_history=intervals,
+        instrument_ids=("asset-a", "asset-b"),
+        effective_end=date(2025, 12, 31),
+    )
+
+    assert actions["factor"].tolist() == pytest.approx([0.25, 10.0])
+    assert actions["available_at"].tolist() == [
+        pd.Timestamp("2022-06-02T00:00:00Z"),
+        pd.Timestamp("2023-08-11T00:00:00Z"),
+    ]
+    bars = pd.DataFrame(
+        {
+            "open": [25.0],
+            "high": [25.0],
+            "low": [25.0],
+            "close": [25.0],
+            "vwap": [25.0],
+            "volume": [400.0],
+        }
+    )
+    restated = apply_point_in_time_split_adjustment(bars, pd.Series([0.25]))
+    assert restated.loc[0, "close"] == pytest.approx(100.0)
+    assert restated.loc[0, "volume"] == pytest.approx(100.0)
+
+
+def test_corporate_action_acquisition_is_paginated_idempotent_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    intervals = (
+        InstrumentSymbolInterval(
+            "asset-a", "AAPL", date(2021, 1, 4), date(2025, 12, 31), "fixture"
+        ),
+    )
+    pages = {
+        None: {
+            "forward_splits": [
+                {
+                    "id": "forward-1",
+                    "symbol": "AAPL",
+                    "old_rate": 1,
+                    "new_rate": 4,
+                    "process_date": "2022-06-01",
+                    "ex_date": "2022-06-03",
+                }
+            ],
+            "next_page_token": "page-2",
+        },
+        "page-2": {"reverse_splits": [], "next_page_token": None},
+    }
+    calls: list[str | None] = []
+
+    def fetch(params):
+        token = params.get("page_token")
+        calls.append(token)
+        return pages[token], {"X-RateLimit-Remaining": "199"}
+
+    output = tmp_path / "actions.parquet"
+    raw = tmp_path / "actions.raw.json"
+    receipt = tmp_path / "acquisition-receipt.json"
+    kwargs = {
+        "start": date(2021, 1, 4),
+        "end": date(2025, 12, 31),
+        "output_path": output,
+        "raw_output_path": raw,
+        "receipt_path": receipt,
+        "paper_config_hash": "a" * 64,
+        "config": PaperDataConfig(allow_network=True, paper_config_hash="a" * 64),
+        "cli_enabled": True,
+    }
+    result = acquire_split_actions(intervals, ("asset-a",), fetch_page=fetch, **kwargs)
+    reused = acquire_split_actions(
+        intervals,
+        ("asset-a",),
+        fetch_page=lambda _: (_ for _ in ()).throw(AssertionError("network reused")),
+        **kwargs,
+    )
+
+    assert calls == [None, "page-2"]
+    assert result == reused
+    assert result["row_count"] == 1
+    assert result["available_at_policy"] == "provider_process_date_plus_one_utc_day"
+    assert file_sha256(output) == result["source_sha256"]
+
+    with pytest.raises(RuntimeError, match="BLOCKED: corporate-action symbol"):
+        normalize_split_actions(
+            (
+                {
+                    "forward_splits": [
+                        {
+                            "id": "unknown-1",
+                            "symbol": "UNKNOWN",
+                            "old_rate": 1,
+                            "new_rate": 2,
+                            "process_date": "2022-01-01",
+                            "ex_date": "2022-01-03",
+                        }
+                    ]
+                },
+            ),
+            symbol_history=intervals,
+            instrument_ids=("asset-a",),
+            effective_end=date(2025, 12, 31),
+        )
 
 
 def test_authorized_chunk_is_atomic_idempotent_and_checksummed(tmp_path) -> None:

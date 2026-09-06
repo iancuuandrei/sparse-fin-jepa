@@ -324,6 +324,21 @@ def download_data_stage(
     target_ids = tuple(
         dict.fromkeys((*[str(member["instrument_id"]) for member in universe["members"]], spy_id))
     )
+    from execsim.data.paper.corporate_action_acquisition import acquire_split_actions
+
+    action_source = Path(config.data["corporate_action_source"])
+    corporate_actions = acquire_split_actions(
+        intervals,
+        target_ids,
+        start=formation_start,
+        end=target_end,
+        output_path=action_source,
+        raw_output_path=action_source.with_suffix(".raw.json"),
+        receipt_path=action_source.with_name("acquisition-receipt.json"),
+        paper_config_hash=config.config_hash,
+        config=data,
+        cli_enabled=True,
+    )
     target_chunks = _acquire_period(
         target_ids,
         intervals,
@@ -341,6 +356,7 @@ def download_data_stage(
         "target_chunks": target_chunks,
         "acquisition_plan": plan,
         "provider_probe": probe,
+        "corporate_actions": corporate_actions,
         "universe": universe_result,
         "formation_output": formation_output,
         "target_output": str(config.data["target_corpus_root"]),

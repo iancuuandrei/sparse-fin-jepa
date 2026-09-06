@@ -81,9 +81,13 @@ def _normalize_alpaca_frame(frame: pd.DataFrame, chunk: AcquisitionChunk) -> pd.
         timestamps = pd.to_datetime(frame["timestamp"], errors="raise", utc=True).dt.tz_convert(
             "America/New_York"
         )
-        regular = (timestamps.dt.time >= datetime.strptime("09:30", "%H:%M").time()) & (
-            timestamps.dt.time <= datetime.strptime("15:59", "%H:%M").time()
-        )
+        regular = pd.Series(False, index=frame.index)
+        for session_date in sorted(set(timestamps.dt.date)):
+            try:
+                expected = expected_xnys_minutes(session_date)
+            except ValueError:
+                continue
+            regular |= timestamps.isin(expected)
         normalized = frame.loc[regular].copy()
         normalized["timestamp"] = timestamps.loc[regular]
     normalized["instrument_id"] = chunk.instrument_id

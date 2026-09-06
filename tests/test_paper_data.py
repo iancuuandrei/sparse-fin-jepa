@@ -474,6 +474,35 @@ def test_empty_delisted_symbol_response_normalizes_to_explicit_zero_row_schema()
     )
 
 
+def test_alpaca_normalization_uses_the_exact_early_close_grid() -> None:
+    chunk = monthly_chunks("asset-1", "AAPL", date(2022, 11, 25), date(2022, 11, 25))[0]
+    timestamps = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2022-11-25 12:59", tz="America/New_York"),
+            pd.Timestamp("2022-11-25 13:00", tz="America/New_York"),
+            pd.Timestamp("2022-11-25 13:01", tz="America/New_York"),
+        ]
+    ).tz_convert("UTC")
+    frame = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1_000,
+            "trade_count": 10,
+            "vwap": 100.0,
+        }
+    )
+
+    normalized = _normalize_alpaca_frame(frame, chunk)
+
+    assert normalized["timestamp"].tolist() == [
+        pd.Timestamp("2022-11-25 12:59", tz="America/New_York")
+    ]
+
+
 def test_acquisition_period_uses_sourced_partial_aliases_and_blocks_trading_day_gaps(
     tmp_path,
 ) -> None:

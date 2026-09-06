@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from execsim.cli import main
+from execsim.data.paper.identity import resolve_provider_symbol
 from execsim.data.paper.manifests import file_sha256, write_json_atomic
 from execsim.ml.models.lightgbm_adapter import LightGBMConfig, LightGBMVolumeModel
 from execsim.ml.models.random_projection import projection_hash, random_projection_matrix
@@ -28,6 +29,7 @@ from execsim.ml.paper.orchestration import (
     _formation_artifacts_ready,
     _freeze_representation_parameters,
     _has_frozen_v2_formation_evidence,
+    _paper_symbol_intervals,
     _require_parameter_freeze,
     _require_representation_parameter_freeze,
     run_authorized_stages,
@@ -892,6 +894,22 @@ def test_v2_run_uses_frozen_daily_formation_state_without_v1_key(
     )
     assert "formation_corpus_root" not in config.data
     assert result == {"build_universe": "reused", "download_data": "DATA NOT ACQUIRED"}
+
+
+def test_frozen_v2_universe_resolves_separately_sourced_spy_identity() -> None:
+    config = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    universe = json.loads(Path(config.data["universe_manifest"]).read_text(encoding="utf-8"))
+
+    assert not any(
+        row["instrument_id"] == config.data["spy_instrument_id"]
+        for row in universe["symbol_history"]
+    )
+    intervals = _paper_symbol_intervals(config, universe)
+
+    assert (
+        resolve_provider_symbol(intervals, str(config.data["spy_instrument_id"]), date(2024, 1, 2))
+        == "SPY"
+    )
 
 
 def test_cli_v2_run_reaches_target_gate_without_authorization(

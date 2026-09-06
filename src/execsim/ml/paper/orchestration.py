@@ -390,8 +390,7 @@ def validate_data_stage(config: PaperRunConfig, source: Path | None = None) -> d
     """Validate target sessions under the configured representation-quality protocol."""
     root = source or Path(config.data["target_corpus_root"])
     universe = read_json(Path(config.data["universe_manifest"]))
-    symbol_intervals = _symbol_intervals(pd.DataFrame(universe.get("symbol_history", ())))
-    validate_symbol_history(symbol_intervals)
+    symbol_intervals = _paper_symbol_intervals(config, universe)
     allowed_instruments = {
         *(str(member["instrument_id"]) for member in universe.get("members", ())),
         str(config.data["spy_instrument_id"]),
@@ -500,7 +499,16 @@ def build_sequences_stage(config: PaperRunConfig, source: Path | None = None) ->
             "spy_instrument_id": str(config.data["spy_instrument_id"]),
             "data_classification": "historical",
             "quality_protocol": str(config.sequences["quality_protocol"]),
-            "symbol_history": tuple(universe.get("symbol_history", ())),
+            "symbol_history": tuple(
+                {
+                    "instrument_id": item.instrument_id,
+                    "symbol": item.symbol,
+                    "start": item.start.isoformat(),
+                    "end": item.end.isoformat(),
+                    "source": item.source,
+                }
+                for item in _paper_symbol_intervals(config, universe)
+            ),
         }
         built = (
             build_fold_sequence_corpus_from_root(corpus_source, **kwargs)
@@ -2430,6 +2438,25 @@ def _symbol_intervals(frame: pd.DataFrame) -> tuple[InstrumentSymbolInterval, ..
         )
         for row in frame.itertuples(index=False)
     )
+
+
+def _paper_symbol_intervals(
+    config: PaperRunConfig, universe: dict[str, Any]
+) -> tuple[InstrumentSymbolInterval, ...]:
+    """Resolve stock history plus the separately configured SPY benchmark identity."""
+    intervals = _symbol_intervals(pd.DataFrame(universe.get("symbol_history", ())))
+    spy_id = str(config.data["spy_instrument_id"])
+    if not any(item.instrument_id == spy_id for item in intervals):
+        source_path = Path(config.data["ticker_history"])
+        if not source_path.is_file():
+            raise RuntimeError("BLOCKED: sourced SPY ticker history is unavailable.")
+        source = _symbol_intervals(pd.read_parquet(source_path))
+        spy_intervals = tuple(item for item in source if item.instrument_id == spy_id)
+        if not spy_intervals:
+            raise RuntimeError("BLOCKED: sourced SPY ticker history is missing.")
+        intervals = (*intervals, *spy_intervals)
+    validate_symbol_history(intervals)
+    return intervals
 
 
 def _git_head() -> str:

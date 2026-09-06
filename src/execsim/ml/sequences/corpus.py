@@ -411,8 +411,16 @@ def _seasonal_frame_from_token_cache(
         raise ValueError(
             "Corporate-action seasonal scaling requires identity and information time."
         )
-    rows = []
-    for session_date, session in history[-20:]:
+    selected = history[-20:]
+    if not selected:
+        return pd.DataFrame(
+            columns=("session_date", "bucket_index", "volume", "dollar_volume", "trade_count")
+        )
+    session_dates: list[date] = []
+    volumes: list[np.ndarray] = []
+    dollar_volumes: list[np.ndarray] = []
+    trade_counts: list[np.ndarray] = []
+    for session_date, session in selected:
         tokens = token_cache[session_date]
         factor = 1.0
         if corporate_actions is not None and not corporate_actions.empty:
@@ -422,17 +430,24 @@ def _seasonal_frame_from_token_cache(
                 observation_at=pd.Timestamp(session["timestamp"].iloc[-1]),
                 market_information_as_of=market_information_as_of,
             )
-        for bucket_index, token in enumerate(tokens.itertuples(index=False)):
-            rows.append(
-                {
-                    "session_date": session_date,
-                    "bucket_index": bucket_index,
-                    "volume": float(token.volume * factor),
-                    "dollar_volume": float(token.vwap * token.volume),
-                    "trade_count": float(token.trade_count),
-                }
-            )
-    return pd.DataFrame(rows)
+        volume = pd.to_numeric(tokens["volume"]).to_numpy(dtype=float)
+        vwap = pd.to_numeric(tokens["vwap"]).to_numpy(dtype=float)
+        if len(volume) != 26:
+            raise ValueError("Seasonal token cache must contain all 26 buckets.")
+        session_dates.append(session_date)
+        volumes.append(volume * factor)
+        dollar_volumes.append(vwap * volume)
+        trade_counts.append(pd.to_numeric(tokens["trade_count"]).to_numpy(dtype=float))
+    count = len(session_dates)
+    return pd.DataFrame(
+        {
+            "session_date": np.repeat(np.asarray(session_dates, dtype=object), 26),
+            "bucket_index": np.tile(np.arange(26, dtype=np.int16), count),
+            "volume": np.concatenate(volumes),
+            "dollar_volume": np.concatenate(dollar_volumes),
+            "trade_count": np.concatenate(trade_counts),
+        }
+    )
 
 
 def _session_symbol(session: pd.DataFrame) -> str:

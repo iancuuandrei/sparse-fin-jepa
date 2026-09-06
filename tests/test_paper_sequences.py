@@ -12,7 +12,7 @@ import torch
 from execsim.data.paper.manifests import read_json
 from execsim.data.paper.validation import expected_xnys_minutes
 from execsim.data.scenarios import ScenarioConfig, generate_scenario
-from execsim.ml.sequences.builder import build_session_sequence
+from execsim.ml.sequences.builder import _baseline, build_session_sequence
 from execsim.ml.sequences.corpus import (
     _adjust_for_market_information,
     _seasonal_frame,
@@ -153,6 +153,41 @@ def test_cached_seasonal_tokens_preserve_point_in_time_split_restatement() -> No
     )
 
     pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_vectorized_seasonal_baseline_matches_pandas_adjusted_ewma() -> None:
+    dates = pd.date_range("2024-01-02", periods=7, freq="B").date
+    rows = [
+        {
+            "session_date": session_date,
+            "bucket_index": bucket,
+            "volume": 100.0 + day * 10 + bucket,
+            "dollar_volume": 1_000.0 + day * 20 + 2 * bucket,
+            "trade_count": 10.0 + day + bucket / 10,
+        }
+        for day, session_date in enumerate(dates)
+        for bucket in range(26)
+    ]
+    seasonal = pd.DataFrame(rows)
+
+    result = _baseline(seasonal, cutoff=str(dates[-1]))
+
+    for column, actual in (
+        ("volume", result.volume_profile),
+        ("dollar_volume", result.dollar_profile),
+        ("trade_count", result.trade_profile),
+    ):
+        expected = np.asarray(
+            [
+                seasonal.loc[seasonal["bucket_index"] == bucket, column]
+                .ewm(span=20, adjust=True)
+                .mean()
+                .iloc[-1]
+                for bucket in range(26)
+            ]
+        )
+        assert np.allclose(actual, expected, rtol=1e-13, atol=1e-13)
+    assert result.adv20 == pytest.approx(seasonal.groupby("session_date")["volume"].sum().mean())
 
 
 def test_normalizer_uses_persisted_training_statistics_and_zero_padding(tmp_path) -> None:

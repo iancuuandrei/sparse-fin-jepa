@@ -13,7 +13,10 @@ from execsim.data.paper.manifests import read_json
 from execsim.data.paper.validation import expected_xnys_minutes
 from execsim.data.scenarios import ScenarioConfig, generate_scenario
 from execsim.ml.sequences.builder import build_session_sequence
-from execsim.ml.sequences.corpus import build_fold_sequence_corpus_from_root
+from execsim.ml.sequences.corpus import (
+    _adjust_for_market_information,
+    build_fold_sequence_corpus_from_root,
+)
 from execsim.ml.sequences.dataset import extract_window
 from execsim.ml.sequences.index import (
     build_sample_index,
@@ -88,6 +91,34 @@ def test_sequence_is_one_fixed_session_with_causal_complete_grid(tmp_path) -> No
             source_sha256="a" * 64,
             cutoff="2024-01-02",
         )
+
+
+def test_prior_session_restatement_uses_current_causal_action_knowledge() -> None:
+    session = _bars()
+    actions = pd.DataFrame(
+        {
+            "instrument_id": ["asset-1"],
+            "effective_date": [date(2024, 1, 2)],
+            "factor": [0.5],
+            "available_at": [pd.Timestamp("2024-01-04T00:00:00Z")],
+        }
+    )
+    before_known = _adjust_for_market_information(
+        session,
+        actions,
+        instrument_id="asset-1",
+        market_information_as_of=pd.Timestamp("2024-01-03T14:30:00Z"),
+    )
+    after_known = _adjust_for_market_information(
+        session,
+        actions,
+        instrument_id="asset-1",
+        market_information_as_of=pd.Timestamp("2024-01-05T14:30:00Z"),
+    )
+
+    assert np.allclose(before_known["close"], session["close"])
+    assert np.allclose(after_known["close"], session["close"] / 0.5)
+    assert np.allclose(after_known["volume"], session["volume"] * 0.5)
 
 
 def test_normalizer_uses_persisted_training_statistics_and_zero_padding(tmp_path) -> None:

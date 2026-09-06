@@ -210,20 +210,21 @@ def _build_fold_sequence_corpus_from_sessions(
                     observed_symbol=_session_symbol(prior_spy_session),
                 )
             record_cutoff = prior[-1][0]
-            adjusted = _adjust_for_cutoff(
+            market_information_as_of = pd.Timestamp(session["timestamp"].iloc[0])
+            adjusted = _adjust_for_market_information(
                 session,
                 corporate_actions,
                 instrument_id=instrument_id,
-                cutoff=record_cutoff,
+                market_information_as_of=market_information_as_of,
             )
             adjusted_prior = [
                 (
                     prior_date,
-                    _adjust_for_cutoff(
+                    _adjust_for_market_information(
                         prior_session,
                         corporate_actions,
                         instrument_id=instrument_id,
-                        cutoff=record_cutoff,
+                        market_information_as_of=market_information_as_of,
                     ),
                 )
                 for prior_date, prior_session in prior
@@ -411,14 +412,14 @@ def _verify_sourced_symbol(
         )
 
 
-def _adjust_for_cutoff(
+def _adjust_for_market_information(
     session: pd.DataFrame,
     actions: pd.DataFrame,
     *,
     instrument_id: str,
-    cutoff: date,
+    market_information_as_of: pd.Timestamp,
 ) -> pd.DataFrame:
-    del cutoff  # model-training cutoff is distinct from market-information as-of
+    """Restate a session using only actions known by the current case."""
     if actions.empty:
         return session.copy()
     from execsim.data.paper.corporate_actions import point_in_time_split_factor
@@ -428,7 +429,7 @@ def _adjust_for_cutoff(
         actions,
         instrument_id=instrument_id,
         observation_at=observation_at,
-        market_information_as_of=observation_at,
+        market_information_as_of=market_information_as_of,
     )
     return apply_point_in_time_split_adjustment(
         session, pd.Series(np.full(len(session), factor), index=session.index)

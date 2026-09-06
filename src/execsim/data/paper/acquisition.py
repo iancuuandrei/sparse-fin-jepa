@@ -25,7 +25,11 @@ from execsim.data.paper.schemas import (
     PaperDataConfig,
     ProviderResponse,
 )
-from execsim.data.paper.validation import expected_xnys_minutes, validate_exact_xnys_session
+from execsim.data.paper.validation import (
+    expected_xnys_minutes,
+    validate_exact_xnys_session,
+    validate_paper_bars,
+)
 
 
 class ChunkFetcher(Protocol):
@@ -358,12 +362,23 @@ def _validate_provider_response(
     timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
     if timestamps.isna().any() or timestamps.dt.tz is None:
         raise ValueError("Provider response timestamps must be timezone-aware.")
+    if str(timestamps.dt.tz) != "America/New_York":
+        raise ValueError("Provider response timezone must be exactly America/New_York.")
     local_dates = timestamps.dt.tz_convert("America/New_York").dt.date
     if local_dates.min() < chunk.start or local_dates.max() > chunk.end:
         raise ValueError("Provider response contains rows outside the exact request interval.")
     observed = 0
-    for _, session in frame.groupby(local_dates, sort=True):
-        expected = expected_xnys_minutes(pd.to_datetime(session["timestamp"]).iloc[0].date())
+    for session_date, session in frame.groupby(local_dates, sort=True):
+        structural_errors = validate_paper_bars(session, expected_minutes=len(session))
+        if structural_errors:
+            raise ValueError(
+                "Provider response contains structurally invalid bars: "
+                f"{session_date}: {structural_errors}"
+            )
+        expected = expected_xnys_minutes(session_date)
+        actual = pd.DatetimeIndex(pd.to_datetime(session["timestamp"]))
+        if len(actual.difference(expected)):
+            raise ValueError("Provider response contains off-grid regular-session timestamps.")
         if len(expected) == 390 and not validate_exact_xnys_session(session):
             observed += 1
     calendar = __import__("exchange_calendars").get_calendar("XNYS")

@@ -301,6 +301,43 @@ def test_authorized_chunk_is_atomic_idempotent_and_checksummed(tmp_path) -> None
     assert not list(tmp_path.glob("*.part"))
 
 
+def test_nonempty_provider_chunk_with_invalid_bar_values_fails_closed(tmp_path: Path) -> None:
+    chunk = monthly_chunks("asset-1", "AAPL", date(2024, 1, 1), date(2024, 1, 31))[0]
+    timestamps = pd.date_range("2024-01-03 09:30", periods=390, freq="min", tz="America/New_York")
+    frame = pd.DataFrame(
+        {
+            "instrument_id": "asset-1",
+            "symbol": "AAPL",
+            "timestamp": timestamps,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1_000,
+            "trade_count": 10,
+            "vwap": 100.0,
+        }
+    )
+    frame.loc[0, "high"] = 98.0
+    buffer = BytesIO()
+    frame.to_parquet(buffer, index=False)
+
+    with pytest.raises(RuntimeError, match="Acquisition failed") as raised:
+        acquire_chunk(
+            chunk,
+            output_directory=tmp_path,
+            fetch=lambda _: ProviderResponse(buffer.getvalue(), len(frame)),
+            config=PaperDataConfig(allow_network=True),
+            cli_enabled=True,
+            max_attempts=1,
+        )
+
+    assert "structurally invalid bars" in str(raised.value.__cause__)
+    receipt = read_json(tmp_path / f"{chunk.identity}.json")
+    assert receipt["status"] == "failed"
+    assert not (tmp_path / f"{chunk.identity}.response").exists()
+
+
 def test_target_acquisition_audit_requires_every_compatible_terminal_receipt(
     tmp_path: Path,
 ) -> None:

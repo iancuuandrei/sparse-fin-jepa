@@ -18,6 +18,7 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0010](0010-separate-runtime-approval-from-scientific-config.md) | Accepted | Separate runtime stage approval from scientifically frozen configuration |
 | [0011](0011-source-split-actions-with-conservative-availability.md) | Accepted | Source split actions with conservative provider-process-date availability |
 | [0012](0012-isolate-historical-sequence-members.md) | Accepted | Isolate historical sequence members in deterministic spawn-safe processes |
+| [0013](0013-use-latest-causal-input-cutoff.md) | Accepted | Record the latest date used by any causal seasonal input |
 
 ## Recording a decision
 

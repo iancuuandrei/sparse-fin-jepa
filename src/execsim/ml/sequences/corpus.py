@@ -436,7 +436,9 @@ def _build_member_records(
                 session_date=session_date,
                 observed_symbol=_session_symbol(prior_spy_session),
             )
-        record_cutoff = prior[-1][0]
+        # SPY can have newer causal history when the stock has a provider gap.
+        # The record cutoff is the latest date used by any seasonal input.
+        record_cutoff = spy_prior[-1][0]
         market_information_as_of = pd.Timestamp(session["timestamp"].iloc[0])
         if member_actions.empty:
             adjusted = session

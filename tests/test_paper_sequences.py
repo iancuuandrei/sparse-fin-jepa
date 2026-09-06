@@ -15,6 +15,7 @@ from execsim.data.scenarios import ScenarioConfig, generate_scenario
 from execsim.ml.sequences.builder import _baseline, build_session_sequence
 from execsim.ml.sequences.corpus import (
     _adjust_for_market_information,
+    _build_member_records,
     _seasonal_frame,
     _seasonal_frame_from_token_cache,
     _token_cache,
@@ -188,6 +189,46 @@ def test_vectorized_seasonal_baseline_matches_pandas_adjusted_ewma() -> None:
         )
         assert np.allclose(actual, expected, rtol=1e-13, atol=1e-13)
     assert result.adv20 == pytest.approx(seasonal.groupby("session_date")["volume"].sum().mean())
+
+
+def test_record_cutoff_uses_latest_causal_spy_date_across_long_stock_gap() -> None:
+    import exchange_calendars as xcals
+
+    calendar = xcals.get_calendar("XNYS")
+    dates = [
+        pd.Timestamp(value).date()
+        for value in calendar.sessions_in_range("2023-10-02", "2023-11-15")[:22]
+    ]
+    spy_sessions = [
+        (session_date, _paper_session("benchmark-spy", "SPY", session_date, 0))
+        for session_date in dates
+    ]
+    stock_sessions = [
+        (dates[0], _paper_session("asset-gap", "GAP", dates[0], 1)),
+        (dates[-1], _paper_session("asset-gap", "GAP", dates[-1], 1)),
+    ]
+    exclusions: list[dict[str, str]] = []
+
+    records, exclusions, _ = _build_member_records(
+        {"instrument_id": "asset-gap", "formation_symbol": "GAP"},
+        stock_sessions,
+        member_exclusions=exclusions,
+        corporate_actions=pd.DataFrame(),
+        fold_id="fold-1",
+        cutoff=date(2023, 12, 29),
+        spy_sessions=spy_sessions,
+        spy_dates=dates,
+        spy_by_date=dict(spy_sessions),
+        spy_token_cache=_token_cache(spy_sessions, quality_protocol="exact-minute-v1"),
+        data_classification="synthetic_fixture",
+        quality_protocol="exact-minute-v1",
+        symbol_history=(),
+        spy_instrument_id="benchmark-spy",
+    )
+
+    assert len(records) == 1
+    assert records[0][1].cutoff == dates[-2].isoformat()
+    assert exclusions[0]["session_date"] == dates[0].isoformat()
 
 
 def test_normalizer_uses_persisted_training_statistics_and_zero_padding(tmp_path) -> None:

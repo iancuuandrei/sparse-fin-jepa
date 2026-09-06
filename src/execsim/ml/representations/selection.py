@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ class CommonLambdaCandidate:
     observable_probe_error: float
     collapse_gate_status: str
     checkpoint_hash: str
+    failure_reason: str = ""
 
 
 def select_common_rdm_lambda(
@@ -38,10 +40,19 @@ def select_common_rdm_lambda(
         raise ValueError("Common-lambda receipt requires the complete six-run candidate matrix.")
     if any(item.fold_id != "fold-1" or item.seed != 13 for item in candidates):
         raise ValueError("Common-lambda selection is locked to Fold 1 and seed 13.")
+    if any(item.collapse_gate_status not in {"PASS", "FAIL"} for item in candidates):
+        raise ValueError("Common-lambda candidates require explicit PASS or FAIL gate status.")
     eligible = []
     for value in sorted(expected_values):
         pair = [item for item in candidates if item.rdm_lambda == value]
         if all(item.collapse_gate_status == "PASS" for item in pair):
+            if any(
+                not math.isfinite(item.observable_probe_error)
+                or item.observable_probe_error < 0
+                or not item.checkpoint_hash
+                for item in pair
+            ):
+                raise ValueError("Gate-passing candidates require finite errors and checkpoints.")
             eligible.append((sum(item.observable_probe_error for item in pair) / 2.0, value))
     if not eligible:
         raise RuntimeError("No common RDM coefficient passed both geometry collapse gates.")

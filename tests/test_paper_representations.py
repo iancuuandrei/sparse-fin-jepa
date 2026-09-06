@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch.nn import functional
 
+from execsim.data.paper.manifests import read_json
 from execsim.ml.representations.checkpoints import (
     load_checkpoint,
     load_trusted_resume_state,
@@ -457,6 +458,27 @@ def test_common_rdm_lambda_uses_both_gate_passing_geometries(tmp_path) -> None:
         for item in candidates
     )
     assert select_common_rdm_lambda(blocked) == 0.1
+    rejected_sparse = tuple(
+        replace(
+            item,
+            observable_probe_error=0.0,
+            collapse_gate_status="FAIL",
+            checkpoint_hash="",
+            failure_reason="no sparse checkpoint passed the collapse gate",
+        )
+        if item.rdm_lambda == 0.1 and item.geometry == "sparse"
+        else item
+        for item in candidates
+    )
+    rejected_output = tmp_path / "selection-with-rejection.json"
+    assert select_common_rdm_lambda(rejected_sparse, output=rejected_output) == 1.0
+    rejected_payload = read_json(rejected_output)
+    rejected_row = next(
+        row
+        for row in rejected_payload["candidates"]
+        if row["rdm_lambda"] == 0.1 and row["geometry"] == "sparse"
+    )
+    assert rejected_row["failure_reason"] == "no sparse checkpoint passed the collapse gate"
 
 
 def test_safetensors_checkpoint_is_compatible_and_historical_fit_is_guarded(tmp_path) -> None:

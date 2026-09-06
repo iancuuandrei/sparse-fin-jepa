@@ -556,6 +556,7 @@ def select_rdm_lambda_stage(
     from execsim.ml.representations.historical_trainer import (
         HistoricalTrainerOptions,
         HistoricalTrainingIdentity,
+        HistoricalTrainingRejected,
         train_historical_representation,
     )
     from execsim.ml.representations.jepa import PredictiveRepresentationModel
@@ -612,24 +613,70 @@ def select_rdm_lambda_stage(
                 seed=13,
             )
             root = config.artifact_root / "selection" / f"lambda={rdm_lambda}" / geometry
-            if not (root / "final" / "manifest.json").is_file():
+            final_manifest = root / "final" / "manifest.json"
+            failure_path = root / "training-failure.json"
+            if not final_manifest.is_file() and not failure_path.is_file():
                 resume_from = _latest_periodic_checkpoint(root)
                 if resume_from is not None and not trusted_local_resume:
                     raise RuntimeError(
                         "BLOCKED: a checksummed local periodic resume exists; pass "
                         "--trust-local-resume to load its pickle state."
                     )
-                train_historical_representation(
-                    sequence_path,
-                    representation=representation,
-                    identity=identity,
-                    output_root=root,
-                    allow_historical_training=True,
-                    options=options,
-                    rdm_lambda=float(rdm_lambda),
-                    resume_from=resume_from,
-                    trusted_resume=trusted_local_resume,
+                try:
+                    train_historical_representation(
+                        sequence_path,
+                        representation=representation,
+                        identity=identity,
+                        output_root=root,
+                        allow_historical_training=True,
+                        options=options,
+                        rdm_lambda=float(rdm_lambda),
+                        resume_from=resume_from,
+                        trusted_resume=trusted_local_resume,
+                    )
+                except HistoricalTrainingRejected:
+                    if not failure_path.is_file():
+                        raise RuntimeError(
+                            "Rejected historical candidate did not write its failure receipt."
+                        ) from None
+            if not final_manifest.is_file():
+                failure = read_json(failure_path)
+                expected_failure = {
+                    "schema_version": "historical-training-rejection-v1",
+                    "status": "REJECTED_BY_COLLAPSE_GATE",
+                    "fold_id": "fold-1",
+                    "geometry": geometry,
+                    "seed": 13,
+                    "rdm_lambda": float(rdm_lambda),
+                    "paper_config_hash": config.config_hash,
+                    "sequence_manifest_hash": file_sha256(sequence_path),
+                    "training_config_hash": stable_hash(
+                        {
+                            "representation": asdict(representation),
+                            "trainer": asdict(options),
+                            "common_rdm_lambda": float(rdm_lambda),
+                        }
+                    ),
+                    "code_commit": _git_head(),
+                }
+                if any(failure.get(key) != value for key, value in expected_failure.items()):
+                    raise ValueError("Rejected RDM candidate receipt is incompatible.")
+                reasons = tuple(str(value) for value in failure.get("collapse_gate_failures", ()))
+                if not reasons:
+                    raise ValueError("Rejected RDM candidate receipt has no collapse-gate reason.")
+                candidates.append(
+                    CommonLambdaCandidate(
+                        float(rdm_lambda),
+                        geometry,
+                        "fold-1",
+                        13,
+                        0.0,
+                        "FAIL",
+                        "",
+                        "; ".join(reasons),
+                    )
                 )
+                continue
             expected = CheckpointCompatibility(**read_json(root / "compatibility.json"))
             _assert_representation_reuse(
                 expected,

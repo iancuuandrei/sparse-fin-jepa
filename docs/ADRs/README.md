@@ -20,6 +20,7 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0012](0012-isolate-historical-sequence-members.md) | Accepted | Isolate historical sequence members in deterministic spawn-safe processes |
 | [0013](0013-use-latest-causal-input-cutoff.md) | Accepted | Record the latest date used by any causal seasonal input |
 | [0014](0014-cache-manifest-keyed-sequence-indexes.md) | Accepted | Cache sequence indexes by exact manifest identity |
+| [0015](0015-complete-rdm-sweep-after-candidate-rejection.md) | Accepted | Complete the frozen RDM sweep after a candidate-level gate rejection |
 
 ## Recording a decision
 

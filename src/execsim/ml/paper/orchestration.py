@@ -355,10 +355,20 @@ def download_data_stage(
         acquire_chunk=acquire_chunk,
         monthly_chunks=monthly_chunks,
     )
+    target_audit = _audit_acquisition_period(
+        target_ids,
+        intervals,
+        start=data.target_start,
+        end=data.target_end,
+        output=Path(config.data["target_corpus_root"]),
+        monthly_chunks=monthly_chunks,
+        paper_config_hash=config.config_hash,
+    )
     return {
         "status": "SOFTWARE READY",
         "formation_chunks": formation_chunks,
         "target_chunks": target_chunks,
+        "target_audit": target_audit,
         "acquisition_plan": plan,
         "provider_probe": probe,
         "corporate_actions": corporate_actions,
@@ -2235,6 +2245,89 @@ def _acquire_period(
                     if not any("row count is zero" in message for message in causes):
                         raise
     return completed
+
+
+def _audit_acquisition_period(
+    instrument_ids: tuple[str, ...],
+    intervals: tuple[InstrumentSymbolInterval, ...],
+    *,
+    start: date,
+    end: date,
+    output: Path,
+    monthly_chunks: Any,
+    paper_config_hash: str,
+) -> dict[str, object]:
+    """Require one compatible terminal receipt for every planned monthly chunk."""
+    expected = {
+        chunk.identity: chunk
+        for instrument_id in instrument_ids
+        for interval in sorted(
+            (item for item in intervals if item.instrument_id == instrument_id),
+            key=lambda item: (item.start, item.end, item.symbol),
+        )
+        if max(interval.start, start) <= min(interval.end, end)
+        for chunk in monthly_chunks(
+            instrument_id,
+            interval.symbol,
+            max(interval.start, start),
+            min(interval.end, end),
+        )
+    }
+    receipt_paths = {path.stem: path for path in output.glob("*.json")}
+    missing = sorted(set(expected).difference(receipt_paths))
+    unexpected = sorted(set(receipt_paths).difference(expected))
+    if missing or unexpected:
+        raise RuntimeError(
+            "BLOCKED: target acquisition receipt set is incomplete or unexpected: "
+            f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
+    complete = 0
+    zero_row_exclusions = 0
+    for identity, chunk in expected.items():
+        receipt = read_json(receipt_paths[identity])
+        mismatches = []
+        expected_fields = {
+            "chunk_identity": identity,
+            "instrument_id": chunk.instrument_id,
+            "symbol": chunk.symbol,
+            "requested_start": chunk.start.isoformat(),
+            "requested_end": chunk.end.isoformat(),
+            "feed": chunk.feed,
+            "adjustment": chunk.adjustment,
+            "paper_config_hash": paper_config_hash,
+        }
+        for field, value in expected_fields.items():
+            if receipt.get(field) != value:
+                mismatches.append(field)
+        status = receipt.get("status")
+        response_path = output / f"{identity}.response"
+        if status == "complete":
+            if (
+                not response_path.is_file()
+                or receipt.get("response_sha256") != file_sha256(response_path)
+                or int(receipt.get("row_count", 0)) <= 0
+            ):
+                mismatches.append("complete_response")
+            complete += 1
+        elif status == "failed" and "row count is zero" in str(receipt.get("error", "")):
+            if response_path.exists():
+                mismatches.append("failed_response_present")
+            zero_row_exclusions += 1
+        else:
+            mismatches.append("terminal_status")
+        if mismatches:
+            raise ValueError(
+                f"Target acquisition receipt {identity} is incompatible: {sorted(mismatches)}"
+            )
+    return {
+        "status": ("complete" if zero_row_exclusions == 0 else "complete_with_zero_row_exclusions"),
+        "expected_chunks": len(expected),
+        "complete_chunks": complete,
+        "zero_row_exclusion_chunks": zero_row_exclusions,
+        "missing_chunks": 0,
+        "unexpected_chunks": 0,
+        "paper_config_hash": paper_config_hash,
+    }
 
 
 def _load_parquet_corpus(path: Path) -> pd.DataFrame:

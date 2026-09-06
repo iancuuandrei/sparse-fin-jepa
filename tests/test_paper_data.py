@@ -28,7 +28,7 @@ from execsim.data.paper.formation import (
     build_formation_candidates_from_corpus,
 )
 from execsim.data.paper.identity import resolve_provider_symbol, validate_symbol_history
-from execsim.data.paper.manifests import file_sha256, stable_hash, write_json_atomic
+from execsim.data.paper.manifests import file_sha256, read_json, stable_hash, write_json_atomic
 from execsim.data.paper.partitions import (
     PAPER_FOLDS,
     resolve_fold_partition,
@@ -47,7 +47,11 @@ from execsim.data.paper.validation import (
     validate_exact_xnys_session,
     validate_paper_bars,
 )
-from execsim.ml.paper.orchestration import _acquire_period, _expected_primary_session_count
+from execsim.ml.paper.orchestration import (
+    _acquire_period,
+    _audit_acquisition_period,
+    _expected_primary_session_count,
+)
 
 
 def test_paper_acquisition_is_monthly_sip_and_disabled_by_default() -> None:
@@ -295,6 +299,75 @@ def test_authorized_chunk_is_atomic_idempotent_and_checksummed(tmp_path) -> None
     assert first.row_count == 390
     assert calls == 1
     assert not list(tmp_path.glob("*.part"))
+
+
+def test_target_acquisition_audit_requires_every_compatible_terminal_receipt(
+    tmp_path: Path,
+) -> None:
+    interval = InstrumentSymbolInterval(
+        "asset-1", "AAPL", date(2024, 1, 1), date(2024, 1, 31), "fixture"
+    )
+    with pytest.raises(RuntimeError, match="receipt set is incomplete"):
+        _audit_acquisition_period(
+            ("asset-1",),
+            (interval,),
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 31),
+            output=tmp_path,
+            monthly_chunks=monthly_chunks,
+            paper_config_hash="a" * 64,
+        )
+
+    chunk = monthly_chunks("asset-1", "AAPL", date(2024, 1, 1), date(2024, 1, 31))[0]
+    timestamps = pd.date_range("2024-01-03 09:30", periods=390, freq="min", tz="America/New_York")
+    frame = pd.DataFrame(
+        {
+            "instrument_id": "asset-1",
+            "symbol": "AAPL",
+            "timestamp": timestamps,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1_000,
+            "trade_count": 10,
+            "vwap": 100.0,
+        }
+    )
+    buffer = BytesIO()
+    frame.to_parquet(buffer, index=False)
+    acquire_chunk(
+        chunk,
+        output_directory=tmp_path,
+        fetch=lambda _: ProviderResponse(buffer.getvalue(), len(frame)),
+        config=PaperDataConfig(allow_network=True, paper_config_hash="a" * 64),
+        cli_enabled=True,
+    )
+    audit = _audit_acquisition_period(
+        ("asset-1",),
+        (interval,),
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 31),
+        output=tmp_path,
+        monthly_chunks=monthly_chunks,
+        paper_config_hash="a" * 64,
+    )
+    assert audit["status"] == "complete"
+    assert audit["complete_chunks"] == 1
+
+    receipt_path = tmp_path / f"{chunk.identity}.json"
+    receipt = read_json(receipt_path)
+    write_json_atomic(receipt_path, {**receipt, "symbol": "MSFT"})
+    with pytest.raises(ValueError, match="symbol"):
+        _audit_acquisition_period(
+            ("asset-1",),
+            (interval,),
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 31),
+            output=tmp_path,
+            monthly_chunks=monthly_chunks,
+            paper_config_hash="a" * 64,
+        )
 
 
 def test_zero_row_acquisition_fails_and_sourced_ticker_history_resolves_identity(tmp_path) -> None:

@@ -557,7 +557,7 @@ def _run_fixture_pipeline(
                 device="cpu",
             )
 
-        capacity, observable = evaluate_frozen_capacity_streaming(
+        capacity, observable, dated = evaluate_frozen_capacity_streaming(
             frozen,
             fixture_loader("train"),
             fixture_loader("validation"),
@@ -566,14 +566,33 @@ def _run_fixture_pipeline(
             seed=13,
             options=FrozenProbeOptions(ridge_alphas=(1.0,), mlp_epochs=1),
         )
-        observable_by_horizon = {int(item["horizon"]): item for item in observable}
+        assert len(observable) == 12
+        assert dated
+        assert all(len(str(item["sample_identity_sha256"])) == 64 for item in dated)
+        assert all(int(item["row_count"]) > 0 for item in dated)
+        assert {str(item["probe_capacity"]) for item in observable} == {
+            "affine_ridge",
+            "mlp_64",
+            "mlp_256",
+        }
+        assert all(float(item["observable_volume_probe_mae"]) >= 0 for item in observable)
+        assert all(float(item["observable_volume_probe_rmse"]) >= 0 for item in observable)
+        assert all(int(item["observable_parameter_count"]) > 0 for item in observable)
+        assert all(int(item["observable_approximate_macs"]) > 0 for item in observable)
+        assert all(float(item["observable_inference_seconds"]) >= 0 for item in observable)
+        assert all(int(item["observable_test_rows"]) > 0 for item in observable)
+        observable_by_capacity_horizon = {
+            (str(item["probe_capacity"]), int(item["horizon"])): item for item in observable
+        }
         for row in capacity:
             accessibility_rows.append(
                 {
                     "geometry": geometry,
                     "seed": 13,
                     **row,
-                    **observable_by_horizon[int(row["horizon"])],
+                    **observable_by_capacity_horizon[
+                        (str(row["probe_capacity"]), int(row["horizon"]))
+                    ],
                     "zero_fraction": 0.75 if geometry == "sparse" else 0.0,
                     "mean_active_dimensions": 32.0 if geometry == "sparse" else 128.0,
                 }
@@ -781,8 +800,41 @@ def _run_fixture_pipeline(
             ]
         ),
         "representation_accessibility": pd.DataFrame(accessibility_rows),
-        "forecasting": pd.DataFrame(forecast_rows),
-        "execution": pd.DataFrame(
+        "jepa_representation_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
+                "zero_fraction": [0.75],
+                "mean_active_dimensions": [32.0],
+            }
+        ),
+        "observable_financial_accessibility": pd.DataFrame(accessibility_rows).assign(
+            observable_volume_probe_mae=0.1,
+            observable_volume_probe_rmse=0.2,
+            observable_parameter_count=1,
+            observable_approximate_macs=1,
+            observable_inference_seconds=0.01,
+            observable_test_rows=1,
+        ),
+        "forecast_performance": pd.DataFrame(forecast_rows).assign(seed=13, matched_cases=1),
+        "forecast_by_asof": pd.DataFrame(forecast_rows).assign(seed=13, matched_cases=1),
+        "lightgbm_selected_parameters": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "method": ["sparse"],
+                "seed": [13],
+                "scale_num_leaves": [15],
+                "scale_min_child_samples": [50],
+                "scale_reg_lambda": [1.0],
+                "scale_best_iteration": [1],
+                "shape_num_leaves": [15],
+                "shape_min_child_samples": [50],
+                "shape_reg_lambda": [1.0],
+                "shape_best_iteration": [1],
+            }
+        ),
+        "tca_execution": pd.DataFrame(
             {
                 "method": ["sparse"],
                 "comparison_baseline": ["raw"],
@@ -795,6 +847,36 @@ def _run_fixture_pipeline(
                 "ci_lower": [inference.confidence_interval[0]],
                 "ci_upper": [inference.confidence_interval[1]],
             }
+        ),
+        "confirmatory_statistics": pd.DataFrame(
+            {
+                "contrast_id": [1],
+                "stage": ["representation"],
+                "candidate": ["sparse"],
+                "baseline": ["dense"],
+                "endpoint": ["affine_normalized_latent_error"],
+                "mean_difference": [-1.0],
+                "median_difference": [-1.0],
+                "ci_lower": [-1.0],
+                "ci_upper": [-1.0],
+                "paired_dates": [6],
+                "date_win_rate": [1.0],
+                "standardized_effect": [-1.0],
+                "raw_p_value": [0.01],
+                "holm_adjusted_p_value": [0.05],
+            }
+        ),
+        "support_regime_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
+                "zero_fraction": [0.75],
+                "mean_active_dimensions": [32.0],
+            }
+        ),
+        "appendix_sensitivities": pd.DataFrame(
+            {"analysis": ["block_length"], "block_length_dates": [5]}
         ),
     }
     bundle = write_historical_paper_bundle(

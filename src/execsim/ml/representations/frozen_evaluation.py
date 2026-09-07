@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -31,7 +32,11 @@ def evaluate_frozen_capacity_streaming(
     device: str,
     seed: int,
     options: FrozenProbeOptions | None = None,
-) -> tuple[list[dict[str, float | int | str]], list[dict[str, float | int]]]:
+) -> tuple[
+    list[dict[str, float | int | str]],
+    list[dict[str, float | int | str]],
+    list[dict[str, float | int | str]],
+]:
     """Fit horizon-specific probes without loading the historical corpus into RAM."""
     import torch
     from torch import nn
@@ -55,9 +60,16 @@ def evaluate_frozen_capacity_streaming(
         options.ridge_alphas,
         train_stats,
     )
-    observable_models = _fit_observable_ridge(ridge_stats, alpha=1.0)
+    observable_models = _select_observable_ridge_models(
+        ridge_stats,
+        model,
+        validation_loader,
+        device,
+        options.ridge_alphas,
+    )
 
     probes: dict[str, Any] = {"affine_ridge": ridge_models}
+    observable_probes: dict[str, Any] = {"affine_ridge": observable_models}
     for hidden in (64, 256):
         with torch.random.fork_rng():
             torch.manual_seed(seed + hidden)
@@ -71,44 +83,131 @@ def evaluate_frozen_capacity_streaming(
                     for _ in HORIZONS
                 ]
             ).to(device)
+            torch.manual_seed(seed + hidden + 1_000)
+            observable_networks = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(feature_dim, hidden),
+                        nn.GELU(),
+                        nn.Linear(hidden, 1),
+                    )
+                    for _ in HORIZONS
+                ]
+            ).to(device)
         optimizer = torch.optim.AdamW(networks.parameters(), lr=options.learning_rate)
+        observable_optimizer = torch.optim.AdamW(
+            observable_networks.parameters(), lr=options.learning_rate
+        )
         for _ in range(options.mlp_epochs):
             networks.train()
+            observable_networks.train()
             for batch in training_loader:
-                features, targets, _, complete = _encoded_batch(model, batch, device)
+                features, targets, observable, complete = _encoded_batch(model, batch, device)
                 if not bool(complete.any()):
                     continue
                 optimizer.zero_grad(set_to_none=True)
+                observable_optimizer.zero_grad(set_to_none=True)
                 selected_x = features[complete]
                 selected_y = targets[complete]
+                selected_observable = observable[complete]
                 losses = [
                     torch.mean((networks[index](selected_x) - selected_y[:, index]) ** 2)
                     for index in range(len(HORIZONS))
                 ]
+                observable_losses = [
+                    torch.mean(
+                        (
+                            observable_networks[index](selected_x).squeeze(-1)
+                            - selected_observable[:, index]
+                        )
+                        ** 2
+                    )
+                    for index in range(len(HORIZONS))
+                ]
                 loss = torch.stack(losses).mean()
-                if not bool(torch.isfinite(loss)):
+                observable_loss = torch.stack(observable_losses).mean()
+                if not bool(torch.isfinite(loss)) or not bool(torch.isfinite(observable_loss)):
                     raise FloatingPointError("Frozen MLP probe produced non-finite loss.")
                 loss.backward()
+                observable_loss.backward()
                 optimizer.step()
+                observable_optimizer.step()
         probes[f"mlp_{hidden}"] = networks
+        observable_probes[f"mlp_{hidden}"] = observable_networks
 
     rows: list[dict[str, float | int | str]] = []
-    observable_rows: list[dict[str, float | int]] = []
+    observable_rows: list[dict[str, float | int | str]] = []
+    date_rows: dict[tuple[str, str, int], dict[str, float | int | str]] = {}
+    date_identities = _date_identity_statistics(test_loader)
     for capacity, probe in probes.items():
-        rows.extend(
-            _score_probe(
-                model,
-                probe,
-                test_loader,
-                device=device,
-                capacity=capacity,
-                train_stats=train_stats,
-                feature_dim=feature_dim,
-                target_dim=target_dim,
-            )
+        summary, dated = _score_probe(
+            model,
+            probe,
+            test_loader,
+            device=device,
+            capacity=capacity,
+            train_stats=train_stats,
+            feature_dim=feature_dim,
+            target_dim=target_dim,
         )
-    observable_rows.extend(_score_observable(model, observable_models, test_loader, device=device))
-    return rows, observable_rows
+        rows.extend(summary)
+        for item in dated:
+            key = (capacity, str(item["date"]), int(item["horizon"]))
+            date_rows[key] = item
+    for capacity, probe in observable_probes.items():
+        summary, dated = _score_observable(
+            model,
+            probe,
+            test_loader,
+            device=device,
+            capacity=capacity,
+            feature_dim=feature_dim,
+        )
+        observable_rows.extend(summary)
+        for item in dated:
+            key = (capacity, str(item["date"]), int(item["horizon"]))
+            existing = date_rows.get(key)
+            if existing is None or int(existing["row_count"]) != int(item["row_count"]):
+                raise ValueError("Latent and observable date metrics do not share exact rows.")
+            existing.update(item)
+    for item in date_rows.values():
+        identity = date_identities.get(str(item["date"]))
+        if identity is None or int(identity["row_count"]) != int(item["row_count"]):
+            raise ValueError("Date metric rows contradict the TEST sample identity ledger.")
+        item.update(identity)
+    return rows, observable_rows, list(date_rows.values())
+
+
+def _date_identity_statistics(
+    loader: Iterable[dict[str, Any]],
+) -> dict[str, dict[str, int | str]]:
+    """Hash exact complete-origin TEST sample identities within each date."""
+    digests: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    seen: set[str] = set()
+    for batch in loader:
+        as_of = np.asarray(batch["as_of_token"], dtype=int)
+        complete = complete_horizon_origin_mask(as_of)
+        dates = np.asarray(batch["session_date"], dtype=str)[complete]
+        sample_ids = np.asarray(batch["sample_id"], dtype=str)[complete]
+        for date_value, sample_id in zip(dates, sample_ids, strict=True):
+            if sample_id in seen:
+                raise ValueError("Frozen TEST probe loader contains a duplicate sample ID.")
+            seen.add(sample_id)
+            digest = digests.setdefault(date_value, hashlib.sha256())
+            encoded = sample_id.encode("utf-8")
+            digest.update(len(encoded).to_bytes(4, "big"))
+            digest.update(encoded)
+            counts[date_value] = counts.get(date_value, 0) + 1
+    if not counts:
+        raise ValueError("Frozen TEST probe loader has no complete origins.")
+    return {
+        date_value: {
+            "sample_identity_sha256": digests[date_value].hexdigest(),
+            "row_count": count,
+        }
+        for date_value, count in sorted(counts.items())
+    }
 
 
 def _encoded_batch(model: Any, batch: dict[str, Any], device: str) -> tuple[Any, Any, Any, Any]:
@@ -303,6 +402,47 @@ def _fit_observable_ridge(stats: dict[str, Any], *, alpha: float) -> np.ndarray:
     return np.stack(coefficients)
 
 
+def _select_observable_ridge_models(
+    stats: dict[str, Any],
+    model: Any,
+    validation_loader: Iterable[dict[str, Any]],
+    device: str,
+    alphas: tuple[float, ...],
+) -> np.ndarray:
+    candidates = [(alpha, _fit_observable_ridge(stats, alpha=alpha)) for alpha in alphas]
+    scored = [
+        (
+            _score_observable_ridge_mae(model, coefficients, validation_loader, device),
+            alpha,
+            coefficients,
+        )
+        for alpha, coefficients in candidates
+    ]
+    return min(scored, key=lambda value: (value[0], value[1]))[2]
+
+
+def _score_observable_ridge_mae(
+    model: Any,
+    coefficients: np.ndarray,
+    loader: Iterable[dict[str, Any]],
+    device: str,
+) -> float:
+    absolute = np.zeros(4, dtype=np.float64)
+    count = 0
+    for batch in loader:
+        features, _, observable, complete = _encoded_batch(model, batch, device)
+        if not bool(complete.any()):
+            continue
+        x = np.column_stack((features[complete].cpu().numpy(), np.ones(int(complete.sum()))))
+        actual = observable[complete].cpu().numpy()
+        for index in range(4):
+            absolute[index] += np.abs(x @ coefficients[index] - actual[:, index]).sum()
+        count += len(x)
+    if count == 0:
+        raise ValueError("Observable ridge validation has no complete origins.")
+    return float(np.mean(absolute / count))
+
+
 def _score_probe(
     model: Any,
     probe: Any,
@@ -313,13 +453,18 @@ def _score_probe(
     train_stats: dict[str, Any],
     feature_dim: int,
     target_dim: int,
-) -> list[dict[str, float | int | str]]:
+) -> tuple[
+    list[dict[str, float | int | str]],
+    list[dict[str, float | int | str]],
+]:
     import torch
 
     squared = np.zeros(4, dtype=np.float64)
     zero = np.zeros(4, dtype=np.float64)
     mean = np.zeros(4, dtype=np.float64)
     persistence = np.zeros(4, dtype=np.float64)
+    dated_squared: dict[str, np.ndarray] = {}
+    dated_counts: dict[str, int] = {}
     count = 0
     start = time.perf_counter()
     for batch in loader:
@@ -338,11 +483,16 @@ def _score_probe(
                 predicted = torch.stack([network(x) for network in probe], dim=1).cpu().numpy()
         actual_np = actual.cpu().numpy()
         current_np = current.cpu().numpy()
+        row_squared = np.square(predicted - actual_np).sum(axis=2)
         for index in range(4):
-            squared[index] += np.square(predicted[:, index] - actual_np[:, index]).sum()
+            squared[index] += row_squared[:, index].sum()
             zero[index] += np.square(actual_np[:, index]).sum()
             mean[index] += np.square(actual_np[:, index] - train_stats["means"][index]).sum()
             persistence[index] += np.square(actual_np[:, index] - current_np).sum()
+        selected_dates = np.asarray(batch["session_date"], dtype=str)[
+            complete.detach().cpu().numpy()
+        ]
+        _accumulate_date_vectors(row_squared, selected_dates, dated_squared, dated_counts)
         count += len(x)
     elapsed = time.perf_counter() - start
     if count == 0:
@@ -354,7 +504,7 @@ def _score_probe(
         parameters = sum(parameter.numel() for parameter in probe.parameters())
         hidden = 64 if capacity == "mlp_64" else 256
         macs = 4 * (feature_dim * hidden + hidden * target_dim)
-    return [
+    summary: list[dict[str, float | int | str]] = [
         {
             "horizon": int(horizon),
             "probe_capacity": capacity,
@@ -371,37 +521,125 @@ def _score_probe(
         }
         for index, horizon in enumerate(HORIZONS)
     ]
+    dated: list[dict[str, float | int | str]] = [
+        {
+            "date": date_value,
+            "horizon": int(horizon),
+            "probe_capacity": capacity,
+            "normalized_latent_error": float(
+                values[index] / dated_counts[date_value] / train_stats["traces"][index]
+            ),
+            "row_count": int(dated_counts[date_value]),
+        }
+        for date_value, values in sorted(dated_squared.items())
+        for index, horizon in enumerate(HORIZONS)
+    ]
+    return summary, dated
 
 
 def _score_observable(
     model: Any,
-    coefficients: np.ndarray,
+    probe: Any,
     loader: Iterable[dict[str, Any]],
     *,
     device: str,
-) -> list[dict[str, float | int]]:
+    capacity: str,
+    feature_dim: int,
+) -> tuple[
+    list[dict[str, float | int | str]],
+    list[dict[str, float | int | str]],
+]:
+    import torch
+
     absolute = np.zeros(4, dtype=np.float64)
     squared = np.zeros(4, dtype=np.float64)
+    dated_absolute: dict[str, np.ndarray] = {}
+    dated_squared: dict[str, np.ndarray] = {}
+    dated_counts: dict[str, int] = {}
     count = 0
+    start = time.perf_counter()
     for batch in loader:
         features, _, observable, complete = _encoded_batch(model, batch, device)
         if not bool(complete.any()):
             continue
-        x = np.column_stack((features[complete].cpu().numpy(), np.ones(int(complete.sum()))))
+        selected_x = features[complete]
         actual = observable[complete].cpu().numpy()
-        for index in range(4):
-            residual = x @ coefficients[index] - actual[:, index]
-            absolute[index] += np.abs(residual).sum()
-            squared[index] += np.square(residual).sum()
-        count += len(x)
+        if capacity == "affine_ridge":
+            design = np.column_stack((selected_x.cpu().numpy(), np.ones(int(complete.sum()))))
+            predicted = np.stack([design @ probe[index] for index in range(4)], axis=1)
+        else:
+            probe.eval()
+            with torch.no_grad():
+                predicted = (
+                    torch.stack([network(selected_x).squeeze(-1) for network in probe], dim=1)
+                    .cpu()
+                    .numpy()
+                )
+        residual = predicted - actual
+        row_absolute = np.abs(residual)
+        row_squared = np.square(residual)
+        absolute += row_absolute.sum(axis=0)
+        squared += row_squared.sum(axis=0)
+        selected_dates = np.asarray(batch["session_date"], dtype=str)[
+            complete.detach().cpu().numpy()
+        ]
+        _accumulate_date_vectors(row_absolute, selected_dates, dated_absolute, dated_counts)
+        squared_counts: dict[str, int] = {}
+        _accumulate_date_vectors(row_squared, selected_dates, dated_squared, squared_counts)
+        count += len(selected_x)
+    elapsed = time.perf_counter() - start
     if count == 0:
         raise ValueError("Observable probe test grid has no complete origins.")
-    return [
+    if capacity == "affine_ridge":
+        parameters = 4 * (feature_dim + 1)
+        macs = 4 * feature_dim
+    else:
+        parameters = sum(parameter.numel() for parameter in probe.parameters())
+        hidden = 64 if capacity == "mlp_64" else 256
+        macs = 4 * (feature_dim * hidden + hidden)
+    summary: list[dict[str, float | int | str]] = [
         {
             "horizon": int(horizon),
+            "probe_capacity": capacity,
             "observable_volume_probe_mae": float(absolute[index] / count),
             "observable_volume_probe_rmse": float(np.sqrt(squared[index] / count)),
-            "test_rows": int(count),
+            "observable_parameter_count": int(parameters),
+            "observable_approximate_macs": int(macs),
+            "observable_inference_seconds": float(elapsed),
+            "observable_test_rows": int(count),
         }
         for index, horizon in enumerate(HORIZONS)
     ]
+    dated: list[dict[str, float | int | str]] = [
+        {
+            "date": date_value,
+            "horizon": int(horizon),
+            "probe_capacity": capacity,
+            "observable_volume_probe_mae": float(values[index] / dated_counts[date_value]),
+            "observable_volume_probe_rmse": float(
+                np.sqrt(dated_squared[date_value][index] / dated_counts[date_value])
+            ),
+            "row_count": int(dated_counts[date_value]),
+        }
+        for date_value, values in sorted(dated_absolute.items())
+        for index, horizon in enumerate(HORIZONS)
+    ]
+    return summary, dated
+
+
+def _accumulate_date_vectors(
+    values: np.ndarray,
+    dates: np.ndarray,
+    totals: dict[str, np.ndarray],
+    counts: dict[str, int],
+) -> None:
+    """Accumulate one finite metric vector per row into deterministic date groups."""
+    if values.ndim != 2 or len(values) != len(dates) or not np.isfinite(values).all():
+        raise ValueError("Date-level probe metrics must be finite aligned vectors.")
+    for date_value in np.unique(dates):
+        selected = values[dates == date_value]
+        if date_value in totals:
+            totals[date_value] += selected.sum(axis=0)
+        else:
+            totals[date_value] = selected.sum(axis=0)
+        counts[date_value] = counts.get(date_value, 0) + len(selected)

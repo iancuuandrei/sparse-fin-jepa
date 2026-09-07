@@ -1141,12 +1141,26 @@ def train_volume_models_stage(
             "BLOCKED: parameter freeze requires the complete validation-selected LightGBM matrix."
         )
     freeze_path = config.artifact_root / "selection" / "parameter-freeze-v1.json"
+    execution_receipt_file = config.artifact_root / "lightgbm" / "execution-receipt.json"
+    if not execution_receipt_file.is_file():
+        raise RuntimeError("BLOCKED: LightGBM execution receipt is missing from parameter freeze.")
+    representation_manifests = sorted(
+        (config.artifact_root / "representations").glob("*/*/*/final/manifest.json")
+    )
+    representation_commits = {
+        str(read_json(path).get("code_commit")) for path in representation_manifests
+    }
+    if len(representation_manifests) != 18 or len(representation_commits) != 1:
+        raise RuntimeError("BLOCKED: immutable representation source identity is incomplete.")
     freeze_payload = {
         "schema_version": "paper-parameter-selection-freeze-v1",
         "status": "PARAMETERS_FROZEN",
         "frozen_at_utc": datetime.now(UTC).isoformat(),
         "git_commit": _git_head(),
+        "git_tree": _git_tree(),
+        "representation_source_commit": representation_commits.pop(),
         "paper_config_hash": config.config_hash,
+        "lightgbm_execution_receipt_sha256": file_sha256(execution_receipt_file),
         "rdm_lambda_receipt_sha256": file_sha256(selection_receipt),
         "selected_rdm_lambda": read_json(selection_receipt)["selected_rdm_lambda"],
         "lightgbm_manifests": [
@@ -1194,6 +1208,7 @@ def evaluate_forecasts_stage(
         cli_enabled=full_run_cli_enabled,
     )
     _require_parameter_freeze(config)
+    _require_locked_test_opened(config)
     from execsim.forecasting import HistoricalProfileForecaster
     from execsim.ml.models.lightgbm_adapter import LightGBMVolumeModel
     from execsim.ml.paper.lightgbm_data import build_lightgbm_frames
@@ -1368,6 +1383,7 @@ def evaluate_representations_stage(
         cli_enabled=full_run_cli_enabled,
     )
     _require_parameter_freeze(config)
+    _require_locked_test_opened(config)
     import json
 
     import torch
@@ -1378,7 +1394,6 @@ def evaluate_representations_stage(
         label_unusual_sessions,
     )
     from execsim.ml.representations.checkpoints import load_checkpoint
-    from execsim.ml.representations.diagnostics import representation_diagnostics
     from execsim.ml.representations.frozen_evaluation import (
         FrozenProbeOptions,
         evaluate_frozen_capacity_streaming,
@@ -1389,6 +1404,7 @@ def evaluate_representations_stage(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     accessibility_rows: list[dict[str, object]] = []
+    date_metric_rows: list[dict[str, object]] = []
     support_rows: list[dict[str, object]] = []
     for fold in config.evaluation["folds"]:
         fold_id = str(fold["id"])
@@ -1442,7 +1458,7 @@ def evaluate_representations_stage(
                         prefetch_factor=int(config.sequences["prefetch_factor"]),
                     )
 
-                capacity, observable = evaluate_frozen_capacity_streaming(
+                capacity, observable, dated = evaluate_frozen_capacity_streaming(
                     model,
                     loader("train"),
                     loader("validation"),
@@ -1456,18 +1472,23 @@ def evaluate_representations_stage(
                         mlp_epochs=int(config.representation["probe_mlp_epochs"]),
                     ),
                 )
-                observable_by_horizon = {int(row["horizon"]): row for row in observable}
-                embedding_root = config.artifact_root / "embeddings" / fold_id / method / str(seed)
-                test_embeddings = pd.read_parquet(
-                    embedding_root / "partition=test" / "embeddings.parquet"
+                observable_by_capacity_horizon = {
+                    (str(row["probe_capacity"]), int(row["horizon"])): row for row in observable
+                }
+                date_metric_rows.extend(
+                    {
+                        "fold_id": fold_id,
+                        "geometry": method,
+                        "seed": int(seed),
+                        **row,
+                    }
+                    for row in dated
                 )
-                test_join = test_states.merge(
-                    test_embeddings[["sample_id", "session_id", "embedding"]],
-                    on="sample_id",
-                    validate="one_to_one",
-                ).sort_values(["instrument_id", "session_date", "as_of_token"], kind="stable")
-                test_latent = np.stack(test_join["embedding"].map(np.asarray))[:, :128]
-                diagnostics = representation_diagnostics(test_latent)
+                embedding_root = config.artifact_root / "embeddings" / fold_id / method / str(seed)
+                diagnostics, transitions, regime_counts = _stream_embedding_diagnostics(
+                    embedding_root / "partition=test" / "embeddings.parquet",
+                    test_states,
+                )
                 for row in capacity:
                     horizon = int(row["horizon"])
                     accessibility_rows.append(
@@ -1476,17 +1497,12 @@ def evaluate_representations_stage(
                             "geometry": method,
                             "seed": int(seed),
                             **row,
-                            **observable_by_horizon[horizon],
+                            **observable_by_capacity_horizon[(str(row["probe_capacity"]), horizon)],
                             "zero_fraction": diagnostics["zero_fraction"],
                             "mean_active_dimensions": diagnostics["mean_active_dimensions"],
                         }
                     )
                 if method == "sparse":
-                    transitions = _grouped_support_transitions(
-                        test_join["session_id"].to_numpy(),
-                        test_latent,
-                        test_join["regime"].to_numpy(),
-                    )
                     support_rows.append(
                         {
                             "fold_id": fold_id,
@@ -1499,15 +1515,17 @@ def evaluate_representations_stage(
                                 else value
                                 for name, value in transitions.items()
                             },
-                            "ordinary_rows": int((test_join["regime"] == "ordinary").sum()),
-                            "unusual_rows": int((test_join["regime"] == "unusual").sum()),
+                            "ordinary_rows": regime_counts.get("ordinary", 0),
+                            "unusual_rows": regime_counts.get("unusual", 0),
                         }
                     )
     output_root = config.artifact_root / "evaluation"
     output_root.mkdir(parents=True, exist_ok=True)
     accessibility_path = output_root / "representation-accessibility.parquet"
+    date_metrics_path = output_root / "representation-date-metrics.parquet"
     support_path = output_root / "support-regimes.parquet"
     pd.DataFrame(accessibility_rows).to_parquet(accessibility_path, index=False)
+    pd.DataFrame(date_metric_rows).to_parquet(date_metrics_path, index=False)
     pd.DataFrame(support_rows).to_parquet(support_path, index=False)
     from execsim.data.paper.manifests import write_json_atomic
 
@@ -1517,12 +1535,14 @@ def evaluate_representations_stage(
             "schema_version": "paper-representation-evaluation-v2",
             "paper_config_hash": config.config_hash,
             "accessibility_sha256": file_sha256(accessibility_path),
+            "date_metrics_sha256": file_sha256(date_metrics_path),
             "support_regimes_sha256": file_sha256(support_path),
         },
     )
     return {
         "status": "SOFTWARE READY",
         "accessibility": str(accessibility_path),
+        "date_metrics": str(date_metrics_path),
         "support_regimes": str(support_path),
     }
 
@@ -1541,6 +1561,7 @@ def run_tca_stage(
         cli_enabled=full_run_cli_enabled,
     )
     _require_parameter_freeze(config)
+    _require_locked_test_opened(config)
     from execsim.forecasting import HistoricalProfileForecaster
     from execsim.ml.models.lightgbm_adapter import LightGBMVolumeModel
     from execsim.ml.paper.forecast_provider import PaperLightGBMForecastProvider
@@ -1715,12 +1736,14 @@ def report_stage(
         cli_enabled=full_run_cli_enabled,
     )
     _require_parameter_freeze(config)
+    _require_locked_test_opened(config)
     from execsim.ml.paper.reports import (
-        FIGURE_NAMES,
-        TABLE_NAMES,
+        HISTORICAL_FIGURE_NAMES,
+        HISTORICAL_TABLE_NAMES,
         write_historical_paper_bundle,
     )
     from execsim.ml.paper.statistics import (
+        build_confirmatory_inference,
         construct_complete_case_differences,
         moving_block_bootstrap,
     )
@@ -1730,8 +1753,8 @@ def report_stage(
         if not (existing / "provenance.json").is_file():
             raise RuntimeError("BLOCKED: existing historical report has no provenance receipt.")
         provenance = read_json(existing / "provenance.json")
-        required = [existing / "tables" / f"{name}.parquet" for name in TABLE_NAMES]
-        required.extend(existing / "figures" / f"{name}.png" for name in FIGURE_NAMES)
+        required = [existing / "tables" / f"{name}.parquet" for name in HISTORICAL_TABLE_NAMES]
+        required.extend(existing / "figures" / f"{name}.png" for name in HISTORICAL_FIGURE_NAMES)
         required.extend(
             (
                 existing / "appendix" / "bootstrap-block-sensitivity.parquet",
@@ -1751,13 +1774,20 @@ def report_stage(
         "accessibility": config.artifact_root
         / "evaluation"
         / "representation-accessibility.parquet",
+        "representation_dates": config.artifact_root
+        / "evaluation"
+        / "representation-date-metrics.parquet",
         "support": config.artifact_root / "evaluation" / "support-regimes.parquet",
+        "tca_sensitivity": config.artifact_root / "tca" / "sensitivity.parquet",
     }
     if missing := [name for name, path in report_inputs.items() if not path.is_file()]:
         raise RuntimeError(f"BLOCKED: historical report inputs are missing: {missing}")
     forecast = pd.read_parquet(report_inputs["forecast"])
     tca = pd.read_parquet(report_inputs["tca"])
     accessibility = pd.read_parquet(report_inputs["accessibility"])
+    representation_dates = pd.read_parquet(report_inputs["representation_dates"])
+    support = pd.read_parquet(report_inputs["support"])
+    tca_sensitivity = pd.read_parquet(report_inputs["tca_sensitivity"])
     identity = (
         "fold_id",
         "date",
@@ -1810,6 +1840,7 @@ def report_stage(
                     "ci_lower": block_result.confidence_interval[0],
                     "ci_upper": block_result.confidence_interval[1],
                     "paired_dates": block_result.paired_dates,
+                    "raw_p_value": block_result.raw_p_value,
                 }
             )
         result = sensitivity_results[int(config.evaluation["bootstrap_block_dates"])]
@@ -1834,6 +1865,7 @@ def report_stage(
                 "mean_difference": result.mean_difference,
                 "ci_lower": result.confidence_interval[0],
                 "ci_upper": result.confidence_interval[1],
+                "raw_p_value": result.raw_p_value,
                 "matched_cases": paired.matched_rows,
                 "dropped_baseline": paired.dropped_baseline_rows,
                 "dropped_candidate": paired.dropped_candidate_rows,
@@ -1856,7 +1888,7 @@ def report_stage(
     common_cases = set.intersection(*case_sets)
     forecast["case_key"] = forecast["fold_id"].astype(str) + "|" + forecast["sample_id"].astype(str)
     matched_forecast = forecast.loc[forecast["case_key"].isin(common_cases)]
-    forecasting = (
+    forecast_by_asof = (
         matched_forecast.groupby(["method", "seed", "as_of_token"], dropna=False, as_index=False)
         .agg(
             log_remaining_volume_mae=("log_remaining_volume_absolute_error", "mean"),
@@ -1865,6 +1897,29 @@ def report_stage(
             causal_baseline_remaining_volume=("causal_baseline_remaining_volume", "mean"),
         )
         .sort_values(["method", "seed", "as_of_token"], kind="stable")
+    )
+    forecast_performance = (
+        matched_forecast.groupby(["method", "seed"], dropna=False, as_index=False)
+        .agg(
+            log_remaining_volume_mae=("log_remaining_volume_absolute_error", "mean"),
+            conditional_curve_error=("conditional_curve_wasserstein", "mean"),
+            matched_cases=("sample_id", "size"),
+        )
+        .sort_values(["method", "seed"], kind="stable")
+    )
+    confirmatory, confirmatory_seeds, confirmatory_sensitivity = build_confirmatory_inference(
+        representation_dates,
+        forecast,
+        definitions=tuple(
+            {str(name): str(value) for name, value in definition.items()}
+            for definition in config.evaluation["confirmatory_contrast_definitions"]
+        ),
+        block_length=int(config.evaluation["bootstrap_block_dates"]),
+        sensitivity_block_lengths=tuple(
+            int(value) for value in config.evaluation["bootstrap_block_sensitivity_dates"]
+        ),
+        repetitions=int(config.evaluation["bootstrap_repetitions"]),
+        confidence=float(config.evaluation["confidence"]),
     )
     dataset_rows = []
     for fold in config.evaluation["folds"]:
@@ -1880,11 +1935,87 @@ def report_stage(
                     "excluded": len(manifest["exclusions"]),
                 }
             )
+    jepa_diagnostics = (
+        accessibility.groupby(["fold_id", "geometry", "seed"], sort=True, as_index=False)
+        .agg(
+            zero_fraction=("zero_fraction", "first"),
+            mean_active_dimensions=("mean_active_dimensions", "first"),
+        )
+        .sort_values(["fold_id", "geometry", "seed"], kind="stable")
+    )
+    representation_accessibility = accessibility.loc[
+        :,
+        [
+            "fold_id",
+            "geometry",
+            "seed",
+            "horizon",
+            "probe_capacity",
+            "parameter_count",
+            "approximate_macs",
+            "inference_seconds",
+            "normalized_latent_error",
+            "zero_baseline",
+            "train_mean_baseline",
+            "persistence_baseline",
+            "test_rows",
+        ],
+    ].copy()
+    observable_accessibility = accessibility.loc[
+        :,
+        [
+            "fold_id",
+            "geometry",
+            "seed",
+            "horizon",
+            "probe_capacity",
+            "observable_volume_probe_mae",
+            "observable_volume_probe_rmse",
+            "observable_parameter_count",
+            "observable_approximate_macs",
+            "observable_inference_seconds",
+            "observable_test_rows",
+        ],
+    ].copy()
+    lightgbm_parameters = []
+    for manifest_path in sorted((config.artifact_root / "lightgbm").glob("*/*/*/manifest.json")):
+        payload = read_json(manifest_path)
+        scale = payload["selected_scale_config"]
+        shape = payload["selected_shape_config"]
+        iterations = payload["selected_iterations"]
+        lightgbm_parameters.append(
+            {
+                "fold_id": payload["fold_id"],
+                "method": payload["method"],
+                "seed": payload["seed"],
+                "scale_num_leaves": scale["num_leaves"],
+                "scale_min_child_samples": scale["min_child_samples"],
+                "scale_reg_lambda": scale["reg_lambda"],
+                "scale_best_iteration": iterations["scale"],
+                "shape_num_leaves": shape["num_leaves"],
+                "shape_min_child_samples": shape["min_child_samples"],
+                "shape_reg_lambda": shape["reg_lambda"],
+                "shape_best_iteration": iterations["shape"],
+            }
+        )
+    appendix_frames = [
+        pd.DataFrame(bootstrap_sensitivity_rows).assign(analysis="tca_block_length"),
+        tca_sensitivity.assign(analysis="tca_order_size"),
+        confirmatory_seeds.assign(analysis="confirmatory_seed_effect"),
+        confirmatory_sensitivity.assign(analysis="confirmatory_block_length"),
+    ]
     tables = {
         "dataset_folds_exclusions": pd.DataFrame(dataset_rows),
-        "representation_accessibility": accessibility,
-        "forecasting": forecasting,
-        "execution": pd.DataFrame(execution_rows),
+        "jepa_representation_diagnostics": jepa_diagnostics,
+        "representation_accessibility": representation_accessibility,
+        "observable_financial_accessibility": observable_accessibility,
+        "forecast_performance": forecast_performance,
+        "forecast_by_asof": forecast_by_asof,
+        "lightgbm_selected_parameters": pd.DataFrame(lightgbm_parameters),
+        "tca_execution": pd.DataFrame(execution_rows),
+        "confirmatory_statistics": confirmatory,
+        "support_regime_diagnostics": support,
+        "appendix_sensitivities": pd.concat(appendix_frames, ignore_index=True, sort=False),
     }
     output = write_historical_paper_bundle(
         config.report_root,
@@ -1903,7 +2034,6 @@ def report_stage(
     pd.DataFrame(bootstrap_sensitivity_rows).to_parquet(
         appendix / "bootstrap-block-sensitivity.parquet", index=False
     )
-    support = pd.read_parquet(report_inputs["support"])
     support.to_parquet(appendix / "support-regimes.parquet", index=False)
     return {"status": "SOFTWARE READY", "output": str(output)}
 
@@ -2174,6 +2304,11 @@ def run_authorized_stages(
     else:
         results["training"] = "TRAINING NOT RUN"
     if evaluation_enabled:
+        results["locked_test"] = open_locked_test(
+            config,
+            full_run_cli_enabled=full_run_cli_enabled,
+            runtime_approval=runtime_approval,
+        )
         results["evaluate_forecast"] = evaluate_forecasts_stage(
             config,
             full_run_cli_enabled=full_run_cli_enabled,
@@ -2194,6 +2329,7 @@ def run_authorized_stages(
             full_run_cli_enabled=full_run_cli_enabled,
             runtime_approval=runtime_approval,
         )
+        results["final_result_freeze"] = write_final_result_freeze(config)
     else:
         results["evaluation"] = "EMPIRICAL RESULT NOT AVAILABLE"
     return results
@@ -2642,6 +2778,7 @@ def _require_parameter_freeze(config: PaperRunConfig) -> dict[str, object]:
         or payload.get("paper_config_hash") != config.config_hash
         or payload.get("test_or_tca_used") is not False
         or payload.get("git_commit") != _git_head()
+        or payload.get("git_tree") != _git_tree()
     ):
         raise ValueError("Parameter-selection freeze is incompatible with this paper run.")
     receipt = config.artifact_root / "selection" / "rdm-lambda.json"
@@ -2654,6 +2791,11 @@ def _require_parameter_freeze(config: PaperRunConfig) -> dict[str, object]:
         or selection.get("test_or_tca_used") is not False
     ):
         raise ValueError("Parameter-selection freeze RDM receipt identity mismatch.")
+    execution_receipt = config.artifact_root / "lightgbm" / "execution-receipt.json"
+    if not execution_receipt.is_file() or payload.get(
+        "lightgbm_execution_receipt_sha256"
+    ) != file_sha256(execution_receipt):
+        raise ValueError("Parameter-selection freeze LightGBM execution identity mismatch.")
     records = payload.get("lightgbm_manifests", [])
     expected_paths = {
         (
@@ -2682,6 +2824,226 @@ def _require_parameter_freeze(config: PaperRunConfig) -> dict[str, object]:
         if not artifact.is_file() or file_sha256(artifact) != record.get("sha256"):
             raise ValueError("Parameter-selection freeze LightGBM checksum mismatch.")
     return payload
+
+
+def write_prelock_amendment_receipt(config: PaperRunConfig) -> dict[str, object]:
+    """Freeze the secondary observable analysis before TEST effectiveness is opened."""
+    if not _git_tracked_worktree_clean():
+        raise RuntimeError("BLOCKED: the pre-lock amendment requires a clean source tree.")
+    specification = Path("docs/SECONDARY_OBSERVABLE_CAPACITY_EXTENSION.md")
+    if not specification.is_file():
+        raise RuntimeError("BLOCKED: the pre-lock observable-capacity specification is missing.")
+    payload: dict[str, object] = {
+        "schema_version": "paper-prelock-amendment-v1",
+        "status": "OBSERVABLE_CAPACITY_EXTENSION_FROZEN",
+        "frozen_at_utc": datetime.now(UTC).isoformat(),
+        "downstream_git_commit": _git_head(),
+        "downstream_git_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "specification": specification.as_posix(),
+        "specification_sha256": file_sha256(specification),
+        "target": (
+            "log1p(actual future bucket volume) - "
+            "log1p(causal historical baseline future bucket volume)"
+        ),
+        "horizons": [1, 2, 4, 8],
+        "capacities": ["Affine", "MLP-64", "MLP-256"],
+        "roles": {"train": "fit", "validation": "select ridge alpha", "test": "score once"},
+        "classification": "SECONDARY_EXPLORATORY_MECHANISM_ANALYSIS",
+        "locked_test_effectiveness_inspection": "NOT RUN",
+    }
+    path = config.artifact_root / "selection" / "prelock-observable-amendment-v1.json"
+    _write_or_verify_timestamped_receipt(path, payload, timestamp_field="frozen_at_utc")
+    return {**read_json(path), "path": str(path), "sha256": file_sha256(path)}
+
+
+def write_locked_test_ready_receipt(config: PaperRunConfig) -> dict[str, object]:
+    """Prove that code and validation-selected artifacts are frozen before TEST opens."""
+    if not _git_tracked_worktree_clean():
+        raise RuntimeError("BLOCKED: LOCKED-TEST-READY requires a clean source tree.")
+    parameter_path = config.artifact_root / "selection" / "parameter-freeze-v1.json"
+    parameter = _require_parameter_freeze(config)
+    amendment = write_prelock_amendment_receipt(config)
+    embedding_path = config.artifact_root / "embeddings" / "completion-receipt.json"
+    execution_path = config.artifact_root / "lightgbm" / "execution-receipt.json"
+    for required in (embedding_path, execution_path):
+        if not required.is_file():
+            raise RuntimeError(f"BLOCKED: LOCKED-TEST-READY input is missing: {required}")
+    forbidden = (
+        config.artifact_root / "evaluation" / "forecast-results.parquet",
+        config.artifact_root / "evaluation" / "representation-accessibility.parquet",
+        config.artifact_root / "tca" / "main.parquet",
+    )
+    if any(path.exists() for path in forbidden):
+        raise RuntimeError("BLOCKED: locked result artifacts exist before LOCKED-TEST-READY.")
+    payload = {
+        "schema_version": "paper-locked-test-ready-v1",
+        "status": "LOCKED-TEST-READY",
+        "ready_at_utc": datetime.now(UTC).isoformat(),
+        "downstream_git_commit": _git_head(),
+        "downstream_git_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "parameter_freeze_sha256": file_sha256(parameter_path),
+        "embedding_completion_receipt_sha256": file_sha256(embedding_path),
+        "lightgbm_execution_receipt_sha256": file_sha256(execution_path),
+        "prelock_amendment_receipt_sha256": amendment["sha256"],
+        "selected_rdm_lambda": parameter["selected_rdm_lambda"],
+        "firewall": {
+            "jepa_test_effectiveness": "NOT INSPECTED",
+            "forecast_test_effectiveness": "NOT INSPECTED",
+            "historical_tca": "NOT RUN",
+            "bootstrap_inference": "NOT RUN",
+            "confirmatory_p_values": "NOT COMPUTED",
+        },
+    }
+    path = config.artifact_root / "selection" / "locked-test-ready-v1.json"
+    _write_or_verify_timestamped_receipt(path, payload, timestamp_field="ready_at_utc")
+    return {**read_json(path), "path": str(path), "sha256": file_sha256(path)}
+
+
+def open_locked_test(
+    config: PaperRunConfig,
+    *,
+    full_run_cli_enabled: bool,
+    runtime_approval: PaperRuntimeApproval | None,
+) -> dict[str, object]:
+    """Open TEST once, only after authorization and the complete pre-lock firewall."""
+    config.authorize(
+        "locked_result_evaluation",
+        approval=runtime_approval,
+        cli_enabled=full_run_cli_enabled,
+    )
+    ready = write_locked_test_ready_receipt(config)
+    parameter_path = config.artifact_root / "selection" / "parameter-freeze-v1.json"
+    embedding_path = config.artifact_root / "embeddings" / "completion-receipt.json"
+    execution_path = config.artifact_root / "lightgbm" / "execution-receipt.json"
+    representation_completion = config.artifact_root / "representations" / "completion-receipt.json"
+    payload = {
+        "schema_version": "paper-locked-test-open-v1",
+        "status": "LOCKED-TEST-OPENED",
+        "opened_at_utc": datetime.now(UTC).isoformat(),
+        "evaluation_git_commit": _git_head(),
+        "evaluation_git_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "locked_test_ready_receipt_sha256": ready["sha256"],
+        "parameter_freeze_sha256": file_sha256(parameter_path),
+        "embedding_completion_receipt_sha256": file_sha256(embedding_path),
+        "lightgbm_execution_receipt_sha256": file_sha256(execution_path),
+        "representation_completion_receipt_sha256": (
+            file_sha256(representation_completion) if representation_completion.is_file() else None
+        ),
+        "confirmatory_contrasts": config.evaluation["confirmatory_contrast_definitions"],
+        "secondary_analyses": ["observable-capacity", "support-regime", "sensitivities"],
+    }
+    path = config.artifact_root / "selection" / "locked-test-opened-v1.json"
+    _write_or_verify_timestamped_receipt(path, payload, timestamp_field="opened_at_utc")
+    return {**read_json(path), "path": str(path), "sha256": file_sha256(path)}
+
+
+def _require_locked_test_opened(config: PaperRunConfig) -> dict[str, object]:
+    path = config.artifact_root / "selection" / "locked-test-opened-v1.json"
+    if not path.is_file():
+        raise RuntimeError("BLOCKED: locked TEST has not been durably opened.")
+    payload = read_json(path)
+    ready_path = config.artifact_root / "selection" / "locked-test-ready-v1.json"
+    if (
+        payload.get("status") != "LOCKED-TEST-OPENED"
+        or payload.get("evaluation_git_commit") != _git_head()
+        or payload.get("evaluation_git_tree") != _git_tree()
+        or payload.get("paper_config_hash") != config.config_hash
+        or not ready_path.is_file()
+        or payload.get("locked_test_ready_receipt_sha256") != file_sha256(ready_path)
+    ):
+        raise ValueError("Locked-TEST-open receipt is incompatible with this execution.")
+    _require_parameter_freeze(config)
+    return payload
+
+
+def _write_or_verify_timestamped_receipt(
+    path: Path, payload: dict[str, object], *, timestamp_field: str
+) -> None:
+    if path.is_file():
+        existing = read_json(path)
+        comparable = {name: value for name, value in payload.items() if name != timestamp_field}
+        existing_comparable = {
+            name: value for name, value in existing.items() if name != timestamp_field
+        }
+        if existing_comparable != comparable:
+            raise ValueError(f"Existing receipt is incompatible: {path}")
+        return
+    write_json_atomic(path, payload)
+
+
+def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
+    """Hash the complete locked result bundle after every declared stage finishes."""
+    opened_path = config.artifact_root / "selection" / "locked-test-opened-v1.json"
+    _require_locked_test_opened(config)
+    required = {
+        "parameter_freeze": config.artifact_root / "selection" / "parameter-freeze-v1.json",
+        "representation_evaluation": config.artifact_root
+        / "evaluation"
+        / "representation-evaluation-manifest.json",
+        "forecast_evaluation": config.artifact_root
+        / "evaluation"
+        / "forecast-results.manifest.json",
+        "tca": config.artifact_root / "tca" / "manifest.json",
+        "report_provenance": config.report_root / config.paper_run_id / "provenance.json",
+    }
+    missing = [name for name, path in required.items() if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"BLOCKED: final result-freeze inputs are missing: {missing}")
+    result_root = config.report_root / config.paper_run_id
+    result_files = sorted(
+        path
+        for path in result_root.rglob("*")
+        if path.is_file() and path.name != "final-result-freeze-v1.json"
+    )
+    if not result_files:
+        raise RuntimeError("BLOCKED: final historical result bundle is empty.")
+    representation_manifests = sorted(
+        (config.artifact_root / "representations").glob("*/*/*/final/manifest.json")
+    )
+    representation_commits = {
+        str(read_json(path).get("code_commit")) for path in representation_manifests
+    }
+    if len(representation_manifests) != 18 or len(representation_commits) != 1:
+        raise RuntimeError("BLOCKED: representation source identity is not uniquely frozen.")
+    lightgbm_manifests = sorted((config.artifact_root / "lightgbm").glob("*/*/*/manifest.json"))
+    if len(lightgbm_manifests) != 24:
+        raise RuntimeError("BLOCKED: final result freeze requires 24 LightGBM manifests.")
+    payload = {
+        "schema_version": "paper-final-result-freeze-v1",
+        "status": "FINAL-RESULTS-FROZEN",
+        "frozen_at_utc": datetime.now(UTC).isoformat(),
+        "representation_source_commit": representation_commits.pop(),
+        "downstream_evaluation_commit": _git_head(),
+        "downstream_evaluation_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "selected_rdm_lambda": 10.0,
+        "locked_test_open_receipt_sha256": file_sha256(opened_path),
+        "stage_receipts": {
+            name: {"path": str(path), "sha256": file_sha256(path)}
+            for name, path in required.items()
+        },
+        "lightgbm_manifests": [
+            {
+                "path": str(path.relative_to(config.artifact_root)).replace("\\", "/"),
+                "sha256": file_sha256(path),
+            }
+            for path in lightgbm_manifests
+        ],
+        "result_bundle": str(result_root),
+        "result_files": [
+            {
+                "path": str(path.relative_to(result_root)).replace("\\", "/"),
+                "sha256": file_sha256(path),
+            }
+            for path in result_files
+        ],
+    }
+    path = result_root / "final-result-freeze-v1.json"
+    _write_or_verify_timestamped_receipt(path, payload, timestamp_field="frozen_at_utc")
+    return {**read_json(path), "path": str(path), "sha256": file_sha256(path)}
 
 
 def _load_common_lambda_receipt(config: PaperRunConfig) -> dict[str, object]:
@@ -2788,6 +3150,172 @@ def _grouped_support_transitions(
         "support_state_transition_matrix": support_state_matrix,
         "per_regime_support_jaccard": {
             regime: float(np.mean(values)) for regime, values in regime_values.items()
+        },
+        "regime_transition_matrix": matrix,
+    }
+
+
+def _stream_embedding_diagnostics(
+    path: Path,
+    states: pd.DataFrame,
+    *,
+    latent_width: int = 128,
+    batch_size: int = 4096,
+) -> tuple[dict[str, float], dict[str, object], dict[str, int]]:
+    """Compute TEST support diagnostics without materializing the embedding matrix."""
+    import pyarrow.parquet as pq
+
+    from execsim.ml.representations.diagnostics import support_transition_diagnostics
+
+    required = {"sample_id", "session_id", "instrument_id", "session_date", "as_of_token", "regime"}
+    missing = required.difference(states.columns)
+    if missing:
+        raise ValueError(f"Regime state frame is missing columns: {sorted(missing)}")
+    ordered = states.sort_values(
+        ["instrument_id", "session_date", "as_of_token"], kind="stable"
+    ).reset_index(drop=True)
+    ordered["sample_id"] = ordered["sample_id"].astype(str)
+    if ordered["sample_id"].duplicated().any():
+        raise ValueError("Regime state frame duplicates TEST sample identities.")
+    metadata = ordered.set_index("sample_id")
+    if not metadata.index.is_unique:
+        raise ValueError("Regime state frame duplicates TEST sample identities.")
+    expected_ids = ordered["sample_id"].astype(str).tolist()
+    seen: set[str] = set()
+    count = 0
+    value_sum = np.zeros(latent_width, dtype=np.float64)
+    gram = np.zeros((latent_width, latent_width), dtype=np.float64)
+    activation_count = np.zeros(latent_width, dtype=np.int64)
+    active_counts: list[int] = []
+    hoyer_sum = 0.0
+    all_finite = True
+    current_session: str | None = None
+    session_latents: list[np.ndarray] = []
+    session_labels: list[str] = []
+    transition_results: list[dict[str, object]] = []
+    regime_counts: dict[str, int] = {}
+
+    def finish_session() -> None:
+        if len(session_latents) >= 2:
+            transition_results.append(
+                support_transition_diagnostics(
+                    np.stack(session_latents), np.asarray(session_labels, dtype=object)
+                )
+            )
+        session_latents.clear()
+        session_labels.clear()
+
+    parquet = pq.ParquetFile(path)
+    for batch in parquet.iter_batches(batch_size=batch_size, columns=["sample_id", "embedding"]):
+        frame = batch.to_pandas()
+        for sample_id, embedding in zip(frame["sample_id"], frame["embedding"], strict=True):
+            key = str(sample_id)
+            if key in seen or key not in metadata.index:
+                raise ValueError(f"Embedding TEST identity is duplicate or unexpected: {key}")
+            if count >= len(expected_ids) or key != expected_ids[count]:
+                raise ValueError(
+                    "Embedding TEST rows do not follow the frozen sequence-index order."
+                )
+            seen.add(key)
+            row = metadata.loc[key]
+            latent = np.asarray(embedding, dtype=np.float64)[:latent_width]
+            if latent.shape != (latent_width,):
+                raise ValueError("Embedding latent width is incompatible with diagnostics.")
+            finite = bool(np.isfinite(latent).all())
+            all_finite = all_finite and finite
+            safe = np.nan_to_num(latent)
+            support = np.abs(safe) > 0.0
+            value_sum += safe
+            gram += np.outer(safe, safe)
+            activation_count += support
+            active = int(support.sum())
+            active_counts.append(active)
+            l2 = float(np.linalg.norm(safe, ord=2))
+            hoyer_sum += float(
+                (np.sqrt(latent_width) - np.linalg.norm(safe, ord=1) / max(l2, 1e-12))
+                / (np.sqrt(latent_width) - 1)
+            )
+            session_id = str(row["session_id"])
+            if current_session is not None and session_id != current_session:
+                finish_session()
+            current_session = session_id
+            label = str(row["regime"])
+            session_latents.append(safe)
+            session_labels.append(label)
+            regime_counts[label] = regime_counts.get(label, 0) + 1
+            count += 1
+    finish_session()
+    if count == 0 or count != len(expected_ids) or len(seen) != len(expected_ids):
+        raise ValueError("Embedding TEST rows do not exactly match the frozen sequence index.")
+    mean = value_sum / count
+    centered_gram = gram - count * np.outer(mean, mean)
+    eigenvalues = np.clip(np.linalg.eigvalsh(centered_gram), 0.0, None)
+    probabilities = eigenvalues / max(float(eigenvalues.sum()), 1e-12)
+    effective_rank = float(np.exp(-np.sum(probabilities * np.log(probabilities + 1e-12))))
+    activation = activation_count / count
+    entropy = -activation * np.log(activation + 1e-12) - (1 - activation) * np.log(
+        1 - activation + 1e-12
+    )
+    active_values = np.asarray(active_counts)
+    diagnostics = {
+        "finite": float(all_finite),
+        "mean_variance": float(np.trace(centered_gram) / count / latent_width),
+        "effective_rank": effective_rank,
+        "zero_fraction": float(1.0 - activation.mean()),
+        "active_dimension_fraction": float((activation > 0).mean()),
+        "dead_dimension_fraction": float((activation == 0).mean()),
+        "always_on_dimension_fraction": float((activation == 1).mean()),
+        "mean_hoyer_sparsity": hoyer_sum / count,
+        "mean_support_entropy": float(entropy.mean()),
+        "mean_active_dimensions": float(active_values.mean()),
+        "median_active_dimensions": float(np.median(active_values)),
+        "p95_active_dimensions": float(np.quantile(active_values, 0.95)),
+        "activation_frequency_q05": float(np.quantile(activation, 0.05)),
+        "activation_frequency_q50": float(np.quantile(activation, 0.50)),
+        "activation_frequency_q95": float(np.quantile(activation, 0.95)),
+    }
+    if not transition_results:
+        raise ValueError("Support diagnostics require consecutive rows within a session.")
+    transitions = _combine_support_transition_results(transition_results)
+    return diagnostics, transitions, regime_counts
+
+
+def _combine_support_transition_results(results: list[dict[str, object]]) -> dict[str, object]:
+    """Combine session-local transition summaries with the frozen equal-session estimator."""
+    regime_values: dict[str, list[float]] = {}
+    matrix: dict[str, dict[str, int]] = {}
+    support_state_matrix = {
+        "inactive_to_inactive": 0,
+        "inactive_to_active": 0,
+        "active_to_inactive": 0,
+        "active_to_active": 0,
+    }
+    for result in results:
+        per_regime = cast(dict[str, float], result["per_regime_support_jaccard"])
+        transitions = cast(dict[str, dict[str, int]], result["regime_transition_matrix"])
+        for regime, value in per_regime.items():
+            regime_values.setdefault(regime, []).append(float(value))
+        for source, targets in transitions.items():
+            for target, value in targets.items():
+                matrix.setdefault(source, {})[target] = matrix.setdefault(source, {}).get(
+                    target, 0
+                ) + int(value)
+        dimension_transitions = cast(dict[str, int], result["support_state_transition_matrix"])
+        for name in support_state_matrix:
+            support_state_matrix[name] += int(dimension_transitions[name])
+    return {
+        "mean_consecutive_support_jaccard": float(
+            np.mean([cast(float, row["mean_consecutive_support_jaccard"]) for row in results])
+        ),
+        "support_transition_rate": float(
+            np.mean([cast(float, row["support_transition_rate"]) for row in results])
+        ),
+        "chance_support_jaccard": float(
+            np.mean([cast(float, row["chance_support_jaccard"]) for row in results])
+        ),
+        "support_state_transition_matrix": support_state_matrix,
+        "per_regime_support_jaccard": {
+            name: float(np.mean(values)) for name, values in regime_values.items()
         },
         "regime_transition_matrix": matrix,
     }

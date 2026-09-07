@@ -24,6 +24,7 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0016](0016-separate-lightgbm-opencl-execution-identity.md) | Accepted | Separate LightGBM OpenCL runtime selection from the scientific grid and bind it to artifacts |
 | [0017](0017-bound-historical-lightgbm-frame-construction.md) | Accepted | Bound historical LightGBM frame construction without changing rows or targets |
 | [0018](0018-stream-historical-embedding-export.md) | Accepted | Stream historical embedding export with bounded memory and atomic failure cleanup |
+| [0019](0019-freeze-observable-capacity-and-block-null.md) | Accepted | Freeze the secondary observable-capacity ladder and block-aware confirmatory null test before TEST |
 
 ## Recording a decision
 

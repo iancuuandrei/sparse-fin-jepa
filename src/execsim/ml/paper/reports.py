@@ -21,6 +21,26 @@ FIGURE_NAMES = (
     "forecast_error_vs_asof",
     "allocation_regret_with_paired_intervals",
 )
+HISTORICAL_TABLE_NAMES = (
+    "dataset_folds_exclusions",
+    "jepa_representation_diagnostics",
+    "representation_accessibility",
+    "observable_financial_accessibility",
+    "forecast_performance",
+    "forecast_by_asof",
+    "lightgbm_selected_parameters",
+    "tca_execution",
+    "confirmatory_statistics",
+    "support_regime_diagnostics",
+    "appendix_sensitivities",
+)
+HISTORICAL_FIGURE_NAMES = (
+    "capacity_vs_normalized_latent_error",
+    "observable_capacity_vs_error",
+    "forecast_performance_by_model",
+    "forecast_error_vs_asof",
+    "allocation_regret_with_paired_intervals",
+)
 
 
 def write_paper_bundle(
@@ -148,18 +168,55 @@ HISTORICAL_TABLE_SCHEMAS = {
         "zero_baseline",
         "train_mean_baseline",
         "persistence_baseline",
-        "observable_volume_probe_mae",
-        "observable_volume_probe_rmse",
+    },
+    "jepa_representation_diagnostics": {
+        "fold_id",
+        "geometry",
+        "seed",
         "zero_fraction",
         "mean_active_dimensions",
     },
-    "forecasting": {
+    "observable_financial_accessibility": {
+        "geometry",
+        "seed",
+        "horizon",
+        "probe_capacity",
+        "observable_volume_probe_mae",
+        "observable_volume_probe_rmse",
+        "observable_parameter_count",
+        "observable_approximate_macs",
+        "observable_inference_seconds",
+        "observable_test_rows",
+    },
+    "forecast_performance": {
         "method",
+        "seed",
+        "log_remaining_volume_mae",
+        "conditional_curve_error",
+        "matched_cases",
+    },
+    "forecast_by_asof": {
+        "method",
+        "seed",
         "as_of_token",
         "log_remaining_volume_mae",
         "conditional_curve_error",
+        "matched_cases",
     },
-    "execution": {
+    "lightgbm_selected_parameters": {
+        "fold_id",
+        "method",
+        "seed",
+        "scale_num_leaves",
+        "scale_min_child_samples",
+        "scale_reg_lambda",
+        "scale_best_iteration",
+        "shape_num_leaves",
+        "shape_min_child_samples",
+        "shape_reg_lambda",
+        "shape_best_iteration",
+    },
+    "tca_execution": {
         "method",
         "comparison_baseline",
         "seed",
@@ -171,6 +228,30 @@ HISTORICAL_TABLE_SCHEMAS = {
         "ci_lower",
         "ci_upper",
     },
+    "confirmatory_statistics": {
+        "contrast_id",
+        "stage",
+        "candidate",
+        "baseline",
+        "endpoint",
+        "mean_difference",
+        "median_difference",
+        "ci_lower",
+        "ci_upper",
+        "paired_dates",
+        "date_win_rate",
+        "standardized_effect",
+        "raw_p_value",
+        "holm_adjusted_p_value",
+    },
+    "support_regime_diagnostics": {
+        "fold_id",
+        "geometry",
+        "seed",
+        "zero_fraction",
+        "mean_active_dimensions",
+    },
+    "appendix_sensitivities": {"analysis"},
 }
 
 
@@ -197,7 +278,7 @@ def write_historical_paper_bundle(
     figure_dir = destination / "figures"
     table_dir.mkdir()
     figure_dir.mkdir()
-    for name in TABLE_NAMES:
+    for name in HISTORICAL_TABLE_NAMES:
         frame = tables[name]
         frame.to_parquet(table_dir / f"{name}.parquet", index=False)
         (table_dir / f"{name}.json").write_text(
@@ -266,7 +347,27 @@ def _render_historical_figures(
     axis.set(xlabel="probe parameter count", ylabel="TRAIN-covariance-normalized latent error")
     _save_historical(figure, figure_dir / "capacity_vs_normalized_latent_error.png", fixture_label)
 
-    combined = tables["forecasting"]
+    observable = tables["observable_financial_accessibility"]
+    observable = observable.groupby(
+        ["geometry", "horizon", "probe_capacity", "observable_parameter_count"],
+        sort=True,
+        as_index=False,
+    ).agg(observable_volume_probe_mae=("observable_volume_probe_mae", "mean"))
+    figure, axis = plt.subplots(figsize=(6.4, 3.6))
+    for (geometry, horizon), group in observable.groupby(["geometry", "horizon"], sort=True):
+        group = group.sort_values("observable_parameter_count", kind="stable")
+        axis.plot(
+            group["observable_parameter_count"],
+            group["observable_volume_probe_mae"],
+            marker="o",
+            label=f"{geometry} / h{horizon}",
+        )
+    axis.set_xscale("log")
+    axis.legend()
+    axis.set(xlabel="probe parameter count", ylabel="future-volume-surprise MAE")
+    _save_historical(figure, figure_dir / "observable_capacity_vs_error.png", fixture_label)
+
+    combined = tables["forecast_by_asof"]
     summary = combined.groupby("method", sort=True, as_index=False).agg(
         log_remaining_volume_mae=("log_remaining_volume_mae", "mean"),
         conditional_curve_error=("conditional_curve_error", "mean"),
@@ -297,7 +398,7 @@ def _render_historical_figures(
     axis.set(xlabel="as-of token", ylabel="forecast error")
     _save_historical(figure, figure_dir / "forecast_error_vs_asof.png", fixture_label)
 
-    paired = tables["execution"].drop_duplicates(["method", "seed"])
+    paired = tables["tca_execution"].drop_duplicates(["method", "seed"])
     figure, axis = plt.subplots(figsize=(6.4, 3.6))
     errors = np.vstack(
         (

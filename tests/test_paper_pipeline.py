@@ -38,6 +38,7 @@ from execsim.ml.paper.orchestration import (
     _paper_symbol_intervals,
     _require_parameter_freeze,
     _require_representation_parameter_freeze,
+    _stream_embedding_diagnostics,
     run_authorized_stages,
 )
 from execsim.ml.paper.provenance import build_run_provenance
@@ -48,12 +49,16 @@ from execsim.ml.paper.regimes import (
     label_unusual_sessions,
 )
 from execsim.ml.paper.reports import (
+    HISTORICAL_FIGURE_NAMES,
+    HISTORICAL_TABLE_NAMES,
     TABLE_NAMES,
     write_historical_paper_bundle,
     write_paper_bundle,
 )
 from execsim.ml.paper.statistics import (
+    build_confirmatory_inference,
     construct_complete_case_differences,
+    construct_seed_matched_differences,
     holm_adjust_pvalues,
     moving_block_bootstrap,
     paper_forecast_metrics,
@@ -65,6 +70,10 @@ from execsim.ml.paper.tca import (
     mean_seed_forecast,
     realized_volume_oracle_cost,
     select_liquidity_spaced_instruments,
+)
+from execsim.ml.representations.diagnostics import (
+    representation_diagnostics,
+    support_transition_diagnostics,
 )
 from execsim.orders import ParentOrder
 from execsim.policies import AdaptiveMPCPolicy, ExecutionConstraints
@@ -435,6 +444,7 @@ def test_block_bootstrap_and_synthetic_report_bundle(tmp_path: Path) -> None:
 
     assert result.paired_dates == 12
     assert result.mean_difference < 0
+    assert 0 < result.raw_p_value <= 1
     assert forecast_metrics["log_remaining_volume_mae"] > 0
     assert forecast_metrics["conditional_curve_wasserstein"] > 0
     assert (output / "PAPER_OUTLINE.md").is_file()
@@ -473,6 +483,111 @@ def test_statistics_intersect_exact_complete_cases_before_date_averaging() -> No
     assert result.paired_rows["difference"].iloc[0] == -2
 
 
+def test_statistics_pair_each_candidate_seed_with_shared_or_same_seed_baseline() -> None:
+    rows = pd.DataFrame(
+        {
+            "method": ["raw", "raw", "sparse", "sparse", "sparse", "sparse"],
+            "seed": [None, None, 13, 13, 29, 29],
+            "fold_id": ["fold-1"] * 6,
+            "sample_id": ["a", "b", "a", "b", "a", "b"],
+            "error": [2.0, 4.0, 1.0, 3.0, 1.5, 3.5],
+        }
+    )
+    result = construct_seed_matched_differences(
+        rows,
+        baseline="raw",
+        candidate="sparse",
+        value_column="error",
+        identity_columns=("fold_id", "sample_id"),
+    )
+    assert result.matched_rows == 4
+    assert set(result.paired_rows["pair_seed"]) == {13, 29}
+    assert result.paired_rows.groupby("pair_seed")["difference"].mean().to_dict() == {
+        13: -1.0,
+        29: -0.5,
+    }
+
+
+def test_confirmatory_inference_preserves_five_test_family_and_seed_pairing() -> None:
+    dates = ("2024-04-01", "2024-04-02")
+    representation = pd.DataFrame(
+        [
+            {
+                "fold_id": "fold-1",
+                "date": day,
+                "geometry": geometry,
+                "seed": seed,
+                "horizon": 1,
+                "probe_capacity": "affine_ridge",
+                "sample_identity_sha256": "a" * 64,
+                "normalized_latent_error": value,
+            }
+            for day in dates
+            for seed in (13, 29)
+            for geometry, value in (("dense", 1.0), ("sparse", 0.8))
+        ]
+    )
+    forecast = pd.DataFrame(
+        [
+            {
+                "fold_id": "fold-1",
+                "session_date": day,
+                "instrument_id": "asset-a",
+                "sample_id": f"{day}-sample",
+                "as_of_token": 4,
+                "method": method,
+                "seed": seed,
+                "log_remaining_volume_absolute_error": scale,
+                "conditional_curve_wasserstein": shape,
+            }
+            for day in dates
+            for method, seed, scale, shape in (
+                ("raw", None, 1.2, 1.1),
+                ("dense", 13, 1.0, 0.9),
+                ("dense", 29, 1.0, 0.9),
+                ("sparse", 13, 0.8, 0.7),
+                ("sparse", 29, 0.8, 0.7),
+            )
+        ]
+    )
+    definitions = (
+        {
+            "stage": "representation",
+            "candidate": "sparse",
+            "baseline": "dense",
+            "endpoint": "affine_normalized_latent_error",
+        },
+        *(
+            {
+                "stage": "forecasting",
+                "candidate": "sparse",
+                "baseline": baseline,
+                "endpoint": endpoint,
+            }
+            for baseline, endpoint in (
+                ("dense", "log_remaining_volume_mae"),
+                ("dense", "conditional_curve_error"),
+                ("raw", "log_remaining_volume_mae"),
+                ("raw", "conditional_curve_error"),
+            )
+        ),
+    )
+    overall, seeds, sensitivity = build_confirmatory_inference(
+        representation,
+        forecast,
+        definitions=definitions,
+        block_length=1,
+        sensitivity_block_lengths=(2,),
+        repetitions=99,
+        confidence=0.95,
+    )
+    assert len(overall) == 5
+    assert len(seeds) == 10
+    assert len(sensitivity) == 10
+    assert set(overall["contrast_id"]) == {1, 2, 3, 4, 5}
+    assert np.isfinite(overall["holm_adjusted_p_value"]).all()
+
+
 def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_path: Path) -> None:
     tables = {
         "dataset_folds_exclusions": pd.DataFrame(
@@ -491,21 +606,66 @@ def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_pat
                 "zero_baseline": [1.0],
                 "train_mean_baseline": [0.9],
                 "persistence_baseline": [0.8],
-                "observable_volume_probe_mae": [0.15],
-                "observable_volume_probe_rmse": [0.2],
+            }
+        ),
+        "jepa_representation_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
                 "zero_fraction": [0.75],
                 "mean_active_dimensions": [32.0],
             }
         ),
-        "forecasting": pd.DataFrame(
+        "observable_financial_accessibility": pd.DataFrame(
+            {
+                "geometry": ["sparse"],
+                "seed": [13],
+                "horizon": [1],
+                "probe_capacity": ["affine_ridge"],
+                "observable_volume_probe_mae": [0.15],
+                "observable_volume_probe_rmse": [0.2],
+                "observable_parameter_count": [1_028],
+                "observable_approximate_macs": [1_024],
+                "observable_inference_seconds": [0.01],
+                "observable_test_rows": [100],
+            }
+        ),
+        "forecast_performance": pd.DataFrame(
             {
                 "method": ["raw"],
+                "seed": [None],
+                "log_remaining_volume_mae": [0.2],
+                "conditional_curve_error": [0.1],
+                "matched_cases": [4],
+            }
+        ),
+        "forecast_by_asof": pd.DataFrame(
+            {
+                "method": ["raw"],
+                "seed": [None],
                 "as_of_token": [4],
                 "log_remaining_volume_mae": [0.2],
                 "conditional_curve_error": [0.1],
+                "matched_cases": [4],
             }
         ),
-        "execution": pd.DataFrame(
+        "lightgbm_selected_parameters": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "method": ["raw"],
+                "seed": [None],
+                "scale_num_leaves": [15],
+                "scale_min_child_samples": [50],
+                "scale_reg_lambda": [1.0],
+                "scale_best_iteration": [10],
+                "shape_num_leaves": [31],
+                "shape_min_child_samples": [50],
+                "shape_reg_lambda": [10.0],
+                "shape_best_iteration": [12],
+            }
+        ),
+        "tca_execution": pd.DataFrame(
             {
                 "method": ["raw"],
                 "comparison_baseline": ["raw"],
@@ -519,6 +679,36 @@ def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_pat
                 "ci_upper": [-0.05],
             }
         ),
+        "confirmatory_statistics": pd.DataFrame(
+            {
+                "contrast_id": [1],
+                "stage": ["representation"],
+                "candidate": ["sparse"],
+                "baseline": ["dense"],
+                "endpoint": ["affine_normalized_latent_error"],
+                "mean_difference": [-0.1],
+                "median_difference": [-0.1],
+                "ci_lower": [-0.2],
+                "ci_upper": [-0.05],
+                "paired_dates": [10],
+                "date_win_rate": [0.8],
+                "standardized_effect": [-0.5],
+                "raw_p_value": [0.01],
+                "holm_adjusted_p_value": [0.05],
+            }
+        ),
+        "support_regime_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
+                "zero_fraction": [0.75],
+                "mean_active_dimensions": [32.0],
+            }
+        ),
+        "appendix_sensitivities": pd.DataFrame(
+            {"analysis": ["confirmatory_block_length"], "block_length_dates": [5]}
+        ),
     }
     output = write_historical_paper_bundle(
         tmp_path,
@@ -529,12 +719,13 @@ def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_pat
     )
 
     assert (output / "REPORT.md").is_file()
-    assert len(list((output / "figures").glob("*.png"))) == 4
+    assert len(list((output / "tables").glob("*.parquet"))) == len(HISTORICAL_TABLE_NAMES)
+    assert len(list((output / "figures").glob("*.png"))) == len(HISTORICAL_FIGURE_NAMES)
     with pytest.raises(ValueError, match="Historical table"):
         write_historical_paper_bundle(
             tmp_path,
             paper_run_id="broken",
-            tables={**tables, "forecasting": pd.DataFrame({"value": [1]})},
+            tables={**tables, "forecast_by_asof": pd.DataFrame({"value": [1]})},
             provenance={"data_classification": "synthetic_fixture"},
             historical_schema_fixture=True,
         )
@@ -546,6 +737,18 @@ def test_holm_adjustment_is_monotone_in_sorted_pvalues() -> None:
     ordered = np.argsort(values, kind="stable")
     assert np.all(np.diff(adjusted[ordered]) >= 0)
     assert np.all((0 <= adjusted) & (adjusted <= 1))
+
+
+def test_block_bootstrap_null_pvalue_uses_fold_safe_centered_blocks() -> None:
+    rows = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=20, freq="D"),
+            "fold_id": ["fold-1"] * 10 + ["fold-2"] * 10,
+            "difference": [-1.0] * 20,
+        }
+    )
+    result = moving_block_bootstrap(rows, block_length=5, repetitions=999, seed=13)
+    assert result.raw_p_value == pytest.approx(0.001)
 
 
 def test_protocol_freeze_is_complete_and_checksum_bound() -> None:
@@ -569,6 +772,7 @@ def test_locked_test_parameter_freeze_requires_the_exact_model_matrix(
     sections = {**loaded.sections, "data": {**loaded.data, "artifact_root": str(tmp_path)}}
     config = replace(loaded, sections=sections)
     monkeypatch.setattr("execsim.ml.paper.orchestration._git_head", lambda: "f" * 40)
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_tree", lambda: "e" * 40)
     selection = tmp_path / "selection" / "rdm-lambda.json"
     write_json_atomic(
         selection,
@@ -616,10 +820,14 @@ def test_locked_test_parameter_freeze_requires_the_exact_model_matrix(
             write_json_atomic(artifact, {"method": method, "seed": seed})
             records.append({"path": relative.as_posix(), "sha256": file_sha256(artifact)})
     freeze = tmp_path / "selection" / "parameter-freeze-v1.json"
+    execution_receipt = tmp_path / "lightgbm" / "execution-receipt.json"
+    write_json_atomic(execution_receipt, {"device_type": "gpu"})
     payload = {
         "status": "PARAMETERS_FROZEN",
         "git_commit": "f" * 40,
+        "git_tree": "e" * 40,
         "paper_config_hash": config.config_hash,
+        "lightgbm_execution_receipt_sha256": file_sha256(execution_receipt),
         "rdm_lambda_receipt_sha256": file_sha256(selection),
         "selected_rdm_lambda": 1.0,
         "lightgbm_manifests": records,
@@ -1170,3 +1378,41 @@ def test_frozen_v2_formation_evidence_reuses_preapproval_receipts(tmp_path: Path
     assert _has_frozen_v2_formation_evidence(config)
     receipt.write_bytes(b"changed receipt")
     assert not _has_frozen_v2_formation_evidence(config)
+
+
+def test_streamed_embedding_diagnostics_match_in_memory_estimator(tmp_path: Path) -> None:
+    rng = np.random.default_rng(47)
+    latents = np.maximum(rng.normal(size=(6, 128)), 0.0)
+    embeddings = [np.concatenate((row, np.zeros(516))) for row in latents]
+    path = tmp_path / "embeddings.parquet"
+    pd.DataFrame(
+        {"sample_id": [f"sample-{index}" for index in range(6)], "embedding": embeddings}
+    ).to_parquet(path, index=False, row_group_size=2)
+    states = pd.DataFrame(
+        {
+            "sample_id": [f"sample-{index}" for index in range(6)],
+            "session_id": ["session-a"] * 3 + ["session-b"] * 3,
+            "instrument_id": ["asset-a"] * 3 + ["asset-b"] * 3,
+            "session_date": ["2025-01-02"] * 3 + ["2025-01-03"] * 3,
+            "as_of_token": [4, 5, 6, 4, 5, 6],
+            "regime": ["ordinary", "ordinary", "unusual"] * 2,
+        }
+    )
+
+    streamed, transitions, counts = _stream_embedding_diagnostics(path, states, batch_size=2)
+    expected = representation_diagnostics(latents)
+
+    assert streamed == pytest.approx(expected, rel=1e-10, abs=1e-10)
+    assert transitions["mean_consecutive_support_jaccard"] == pytest.approx(
+        np.mean(
+            [
+                support_transition_diagnostics(latents[:3], states["regime"].to_numpy()[:3])[
+                    "mean_consecutive_support_jaccard"
+                ],
+                support_transition_diagnostics(latents[3:], states["regime"].to_numpy()[3:])[
+                    "mean_consecutive_support_jaccard"
+                ],
+            ]
+        )
+    )
+    assert counts == {"ordinary": 4, "unusual": 2}

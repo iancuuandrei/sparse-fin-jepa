@@ -23,6 +23,7 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0015](0015-complete-rdm-sweep-after-candidate-rejection.md) | Accepted | Complete the frozen RDM sweep after a candidate-level gate rejection |
 | [0016](0016-separate-lightgbm-opencl-execution-identity.md) | Accepted | Separate LightGBM OpenCL runtime selection from the scientific grid and bind it to artifacts |
 | [0017](0017-bound-historical-lightgbm-frame-construction.md) | Accepted | Bound historical LightGBM frame construction without changing rows or targets |
+| [0018](0018-stream-historical-embedding-export.md) | Accepted | Stream historical embedding export with bounded memory and atomic failure cleanup |
 
 ## Recording a decision
 

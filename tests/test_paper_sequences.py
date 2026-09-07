@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -533,9 +534,12 @@ def _run_fixture_pipeline(
             geometry=geometry,
             adaptation="none",
             device="cpu",
-            batch_size=256,
+            batch_size=2,
         )
         assert read_json(embedding_manifest)["rows"] > 0
+        for partition in ("train", "validation", "test"):
+            parquet = embedding_root / f"partition={partition}" / "embeddings.parquet"
+            assert pq.ParquetFile(parquet).metadata.num_row_groups > 1
         frozen = PredictiveRepresentationModel(representation)
         load_checkpoint(frozen, checkpoint_root / "final", expected=compatibility)
 

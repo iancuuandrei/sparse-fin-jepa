@@ -22,6 +22,7 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0014](0014-cache-manifest-keyed-sequence-indexes.md) | Accepted | Cache sequence indexes by exact manifest identity |
 | [0015](0015-complete-rdm-sweep-after-candidate-rejection.md) | Accepted | Complete the frozen RDM sweep after a candidate-level gate rejection |
 | [0016](0016-separate-lightgbm-opencl-execution-identity.md) | Accepted | Separate LightGBM OpenCL runtime selection from the scientific grid and bind it to artifacts |
+| [0017](0017-bound-historical-lightgbm-frame-construction.md) | Accepted | Bound historical LightGBM frame construction without changing rows or targets |
 
 ## Recording a decision
 

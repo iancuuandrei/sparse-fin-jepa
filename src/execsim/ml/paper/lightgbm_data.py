@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,7 @@ from execsim.data.paper.manifests import read_json
 from execsim.ml.paper.features import append_embedding, build_raw_feature_frame
 from execsim.ml.sequences.dataset import extract_window
 from execsim.ml.sequences.manifests import read_sequence_record
-from execsim.ml.sequences.schemas import SequenceSample
+from execsim.ml.sequences.schemas import SequenceRecord, SequenceSample
 from execsim.ml.sequences.streaming import _sample_from_row
 
 
@@ -46,9 +47,11 @@ def build_lightgbm_frames(
             str(row.sample_id): np.asarray(row.embedding, dtype=float)
             for row in embeddings.itertuples(index=False)
         }
-    scale_frames = []
+    scale_frames: list[pd.DataFrame] = []
+    scale_chunks: list[pd.DataFrame] = []
     scale_targets = []
-    shape_frames = []
+    shape_frames: list[pd.DataFrame] = []
+    shape_chunks: list[pd.DataFrame] = []
     shape_targets = []
     samples = [
         _sample_from_row(row)
@@ -60,8 +63,21 @@ def build_lightgbm_frames(
         if partition == "train"
         else {sample.sample_id: 1.0 for sample in samples}
     )
+
+    @lru_cache(maxsize=512)
+    def cached_record(session_id: str) -> SequenceRecord:
+        return read_sequence_record(sequence_paths[session_id])
+
+    def flush_frames(*, force: bool = False) -> None:
+        if scale_frames and (force or len(scale_frames) >= 1_024):
+            scale_chunks.append(pd.concat(scale_frames, ignore_index=True))
+            scale_frames.clear()
+        if shape_frames and (force or len(shape_frames) >= 1_024):
+            shape_chunks.append(pd.concat(shape_frames, ignore_index=True))
+            shape_frames.clear()
+
     for sample in samples:
-        record = read_sequence_record(sequence_paths[sample.session_id])
+        record = cached_record(sample.session_id)
         window = extract_window(record, sample)
         timestamp = pd.Timestamp(sample.as_of_ns, tz="UTC").tz_convert("America/New_York")
         metadata = pd.DataFrame(
@@ -121,12 +137,14 @@ def build_lightgbm_frames(
         repeated["sample_weight"] = repeated["shape_row_weight"]
         shape_frames.append(repeated)
         shape_targets.extend((future / total).tolist())
-    if not scale_frames or not shape_frames:
+        flush_frames()
+    flush_frames(force=True)
+    if not scale_chunks or not shape_chunks:
         raise ValueError(f"No valid LightGBM rows were produced for {partition}.")
     return (
-        pd.concat(scale_frames, ignore_index=True),
+        pd.concat(scale_chunks, ignore_index=True),
         np.asarray(scale_targets, dtype=float),
-        pd.concat(shape_frames, ignore_index=True),
+        pd.concat(shape_chunks, ignore_index=True),
         np.asarray(shape_targets, dtype=float),
     )
 

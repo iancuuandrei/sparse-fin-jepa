@@ -986,6 +986,37 @@ def train_volume_models_stage(
 
     execution_options = execution or LightGBMExecutionOptions()
     source_commit = _git_head()
+    operational_receipts: dict[str, object] = {}
+    if execution_options.device_type == "gpu":
+        qualification_path = Path(".runtime/lightgbm-gpu/qualification-receipt.json")
+        build_path = Path(".runtime/lightgbm-gpu/build-provenance.json")
+        for name, path in (("qualification", qualification_path), ("build", build_path)):
+            if not path.is_file():
+                raise RuntimeError(f"BLOCKED: LightGBM GPU {name} receipt is missing: {path}")
+        qualification = read_json(qualification_path)
+        build = read_json(build_path)
+        if (
+            qualification.get("status") != "PASS"
+            or qualification.get("source_commit") != source_commit
+            or qualification.get("source_tree") != _git_tree()
+            or qualification.get("paper_config_hash") != config.config_hash
+            or qualification.get("execution")
+            != {
+                "device_type": execution_options.device_type,
+                "gpu_platform_id": execution_options.gpu_platform_id,
+                "gpu_device_id": execution_options.gpu_device_id,
+                "gpu_use_dp": execution_options.gpu_use_dp,
+                "selected_num_threads": execution_options.num_threads,
+            }
+            or build.get("status") != "PASS"
+            or build.get("lightgbm_version") != "4.7.0"
+        ):
+            raise ValueError("LightGBM GPU qualification/build identity is incompatible.")
+        operational_receipts = {
+            "qualification_receipt_sha256": file_sha256(qualification_path),
+            "build_provenance_sha256": file_sha256(build_path),
+            "build_provenance": build,
+        }
     execution_receipt_path = config.artifact_root / "lightgbm" / "execution-receipt.json"
     execution_receipt = {
         "schema_version": "paper-lightgbm-execution-v1",
@@ -1000,6 +1031,7 @@ def train_volume_models_stage(
         ),
         "scientific_grid_changed": False,
         "locked_test_or_tca_used": False,
+        **operational_receipts,
     }
     if execution_receipt_path.is_file():
         if read_json(execution_receipt_path) != execution_receipt:

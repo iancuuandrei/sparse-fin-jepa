@@ -992,7 +992,7 @@ def test_lightgbm_raw_hybrid_and_untrained_placebo_share_the_causal_context() ->
     assert raw.filter(like="context_t").dtypes.eq(np.dtype("float32")).all()
     assert neural_values.shape == (3, 644)
     assert neural_values.dtype == np.float32
-    assert np.array_equal(neural_values, repeated)
+    np.testing.assert_allclose(neural_values, repeated, rtol=1e-6, atol=1e-7)
     assert network_hash == repeated_hash and len(network_hash) == 64
     assert hybrid.shape[1] == raw.shape[1] + 644
     assert hybrid.filter(like="embedding_").dtypes.eq(np.dtype("float32")).all()

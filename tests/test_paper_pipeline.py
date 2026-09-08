@@ -27,6 +27,7 @@ from execsim.ml.paper.benchmark import estimate_manifest_resources, predictor_ca
 from execsim.ml.paper.configs import load_paper_config, load_runtime_approval
 from execsim.ml.paper.features import (
     append_embedding,
+    append_untrained_neural_control_frames,
     build_raw_feature_frame,
     build_untrained_neural_control,
 )
@@ -983,15 +984,34 @@ def test_lightgbm_raw_hybrid_and_untrained_placebo_share_the_causal_context() ->
         context, mask, np.ones((3, 4), dtype=bool), fold_seed=13
     )
     repeated, repeated_hash = build_untrained_neural_control(
-        context, mask, np.ones((3, 4), dtype=bool), fold_seed=13
+        context, mask, np.ones((3, 4), dtype=bool), fold_seed=13, batch_size=2
     )
     hybrid = append_embedding(raw, neural_values)
 
     assert raw.shape[1] == 162
+    assert raw.filter(like="context_t").dtypes.eq(np.dtype("float32")).all()
     assert neural_values.shape == (3, 644)
+    assert neural_values.dtype == np.float32
     assert np.array_equal(neural_values, repeated)
     assert network_hash == repeated_hash and len(network_hash) == 64
     assert hybrid.shape[1] == raw.shape[1] + 644
+    assert hybrid.filter(like="embedding_").dtypes.eq(np.dtype("float32")).all()
+
+    scale = raw.copy()
+    scale.insert(0, "sample_id", ["a", "b", "c"])
+    scale["as_of"] = [4, 5, 6]
+    shape = scale.iloc[[2, 0, 2]].reset_index(drop=True)
+    augmented_scale, _, augmented_shape, _ = append_untrained_neural_control_frames(
+        (scale, np.ones(3), shape, np.ones(3)), fold_seed=13
+    )
+    embedding_columns = list(augmented_scale.filter(like="embedding_").columns)
+    expected = augmented_scale.set_index("sample_id").loc[["c", "a", "c"], embedding_columns]
+    assert np.array_equal(augmented_shape.loc[:, embedding_columns].to_numpy(), expected.to_numpy())
+
+    with pytest.raises(ValueError, match="batch_size"):
+        build_untrained_neural_control(
+            context, mask, np.ones((3, 4), dtype=bool), fold_seed=13, batch_size=0
+        )
 
 
 def test_paper_cli_dry_run_does_not_enable_expensive_operations(capsys) -> None:

@@ -27,7 +27,7 @@ def build_raw_feature_frame(
     context: np.ndarray, mask: np.ndarray, metadata: pd.DataFrame
 ) -> pd.DataFrame:
     """Flatten the same causal context and append the locked tabular metadata."""
-    values = np.asarray(context, dtype=float)
+    values = np.asarray(context, dtype=np.float32)
     masks = np.asarray(mask, dtype=bool)
     missing = set(METADATA_COLUMNS).difference(metadata.columns)
     if values.ndim != 3 or values.shape[1:] != (8, 18) or masks.shape != values.shape[:2]:
@@ -49,7 +49,7 @@ def build_raw_feature_frame(
 
 def append_embedding(raw: pd.DataFrame, embedding: np.ndarray) -> pd.DataFrame:
     """Append 640 latent values plus four explicit horizon-availability flags."""
-    values = np.asarray(embedding, dtype=float)
+    values = np.asarray(embedding, dtype=np.float32)
     if values.shape != (len(raw), 644) or not np.isfinite(values).all():
         raise ValueError("Hybrid embedding matrix must have shape [row, 644] and be finite.")
     embedding_frame = pd.DataFrame(
@@ -79,8 +79,9 @@ def build_untrained_neural_control(
     horizon_mask: np.ndarray,
     *,
     fold_seed: int,
+    batch_size: int = 8_192,
 ) -> tuple[np.ndarray, str]:
-    """Export a frozen nonlinear target-free placebo with the JEPA architecture."""
+    """Export a frozen nonlinear target-free placebo in bounded inference batches."""
     import hashlib
 
     import torch
@@ -96,6 +97,8 @@ def build_untrained_neural_control(
         raise ValueError("Untrained neural control inputs must match the raw context contract.")
     if horizons.shape != (len(values), 4):
         raise ValueError("Untrained neural control requires four availability flags per row.")
+    if batch_size < 1:
+        raise ValueError("Untrained neural control batch_size must be positive.")
     with torch.random.fork_rng():
         torch.manual_seed(fold_seed)
         model = PredictiveRepresentationModel(RepresentationConfig("dense", seed=fold_seed)).eval()
@@ -104,12 +107,15 @@ def build_untrained_neural_control(
             digest.update(name.encode("utf-8"))
             digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
         identity = digest.hexdigest()
-        exported = export_frozen_embedding_batch(
-            model,
-            torch.from_numpy(values),
-            torch.from_numpy(masks),
-            torch.from_numpy(horizons),
-        )
+        exported = np.empty((len(values), 644), dtype=np.float32)
+        for start in range(0, len(values), batch_size):
+            stop = min(start + batch_size, len(values))
+            exported[start:stop] = export_frozen_embedding_batch(
+                model,
+                torch.from_numpy(values[start:stop]),
+                torch.from_numpy(masks[start:stop]),
+                torch.from_numpy(horizons[start:stop]),
+            )
     return exported, identity
 
 
@@ -132,7 +138,12 @@ def append_untrained_neural_control_frames(
         context, mask, horizons, fold_seed=fold_seed
     )
     scale_output = append_embedding(scale, embedding)
-    by_sample = dict(zip(scale["sample_id"].astype(str), embedding, strict=True))
-    shape_embedding = np.stack([by_sample[str(value)] for value in shape["sample_id"]])
+    scale_ids = pd.Index(scale["sample_id"].astype(str))
+    if scale_ids.has_duplicates:
+        raise ValueError("Untrained neural control scale rows duplicate sample identity.")
+    shape_positions = scale_ids.get_indexer(shape["sample_id"].astype(str))
+    if np.any(shape_positions < 0):
+        raise ValueError("Untrained neural control shape rows lack matching scale samples.")
+    shape_embedding = embedding[shape_positions]
     shape_output = append_embedding(shape, shape_embedding)
     return scale_output, scale_target, shape_output, shape_target

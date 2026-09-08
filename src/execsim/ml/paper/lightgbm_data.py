@@ -44,7 +44,7 @@ def build_lightgbm_frames(
         if embeddings["sample_id"].duplicated().any():
             raise ValueError("Embedding corpus duplicates sample identity.")
         embedding_by_sample = {
-            str(row.sample_id): np.asarray(row.embedding, dtype=float)
+            str(row.sample_id): np.asarray(row.embedding, dtype=np.float32)
             for row in embeddings.itertuples(index=False)
         }
     scale_frames: list[pd.DataFrame] = []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Iterator
 from dataclasses import asdict
 from datetime import UTC, date, datetime
@@ -1163,6 +1164,11 @@ def train_volume_models_stage(
             results.append(
                 {"fold_id": fold_id, "method": method, "seed": seed, "artifact": str(output)}
             )
+            # Each coordinate owns several multi-gigabyte historical frames. Release
+            # them before constructing the next coordinate so peak memory does not
+            # include both the completed and incoming feature matrices.
+            del training, validation, model, candidates
+            gc.collect()
     selection_receipt = config.artifact_root / "selection" / "rdm-lambda.json"
     model_manifests = sorted((config.artifact_root / "lightgbm").glob("*/*/*/manifest.json"))
     expected_model_count = len(config.evaluation["folds"]) * (

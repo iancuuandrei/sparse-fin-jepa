@@ -8,6 +8,26 @@ from formation data, target data, historical training, and empirical evidence.
 It makes no claim about representation quality, forecast accuracy, execution
 cost, or economic value.
 
+## 2026-09-08 pre-lock execution addendum
+
+The authorized v2 target corpus, fold-safe sequences, common-RDM selection at
+`lambda = 10`, 18 primary JEPA checkpoints, and 18 embedding exports are now
+complete. The consolidated embedding audit reports 18 of 18 valid coordinates,
+including structural and provenance validation of TRAIN, VALIDATION, and sealed
+TEST partitions. No TEST effectiveness metric has been inspected.
+
+The Windows OpenCL LightGBM 4.7.0 build and NVIDIA RTX 5050 qualification pass.
+The first historical TRAIN+VALIDATION attempt completed
+`fold-1/raw/shared`, then failed before the second coordinate when the process
+could not allocate a 1.16 GiB pandas consolidation block. The failure exposed
+an operational memory-lifetime defect: completed coordinate frames remained
+reachable while the next coordinate was built, and native FP32 context and
+embedding values were promoted to FP64. ADR 0020 records the pre-lock
+correction. The first model is preserved as superseded evidence and cannot be
+reused under the corrected downstream source identity. Historical LightGBM
+matrix status remains **INCOMPLETE**; parameter freeze, locked TEST evaluation,
+historical TCA, and confirmatory inference remain **NOT RUN**.
+
 ## Status
 
 | Evidence class | Status |

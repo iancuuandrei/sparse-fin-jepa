@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import os
+import tempfile
 from collections.abc import Iterator
 from dataclasses import asdict
 from datetime import UTC, date, datetime
@@ -969,6 +971,8 @@ def train_volume_models_stage(
     training_cli_enabled: bool,
     runtime_approval: PaperRuntimeApproval | None,
     execution: LightGBMExecutionOptions | None = None,
+    fold_id: str | None = None,
+    input_identity: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Train the exact validation-only LightGBM grid for all locked feature rows."""
     config.authorize(
@@ -983,14 +987,23 @@ def train_volume_models_stage(
         LightGBMVolumeModel,
         run_lightgbm_grid,
     )
-    from execsim.ml.paper.lightgbm_data import build_lightgbm_frames
+    from execsim.ml.paper.lightgbm_data import (
+        attach_lightgbm_embeddings,
+        cached_lightgbm_base_frames,
+    )
 
     execution_options = execution or LightGBMExecutionOptions()
+    selected_folds = [
+        fold for fold in config.evaluation["folds"] if fold_id is None or str(fold["id"]) == fold_id
+    ]
+    if not selected_folds:
+        raise ValueError(f"Unknown LightGBM fold: {fold_id}")
+    requested_fold = fold_id
     source_commit = _git_head()
     operational_receipts: dict[str, object] = {}
     if execution_options.device_type == "gpu":
-        qualification_path = Path(".runtime/lightgbm-gpu/qualification-receipt.json")
-        build_path = Path(".runtime/lightgbm-gpu/build-provenance.json")
+        qualification_path = config.cache_root / "lightgbm-gpu" / "qualification-receipt.json"
+        build_path = config.cache_root / "lightgbm-gpu" / "build-provenance.json"
         for name, path in (("qualification", qualification_path), ("build", build_path)):
             if not path.is_file():
                 raise RuntimeError(f"BLOCKED: LightGBM GPU {name} receipt is missing: {path}")
@@ -1018,7 +1031,10 @@ def train_volume_models_stage(
             "build_provenance_sha256": file_sha256(build_path),
             "build_provenance": build,
         }
-    execution_receipt_path = config.artifact_root / "lightgbm" / "execution-receipt.json"
+    execution_receipt_path = config.lightgbm_root
+    if requested_fold is not None:
+        execution_receipt_path /= requested_fold
+    execution_receipt_path /= "execution-receipt.json"
     execution_receipt = {
         "schema_version": "paper-lightgbm-execution-v1",
         "paper_config_hash": config.config_hash,
@@ -1033,6 +1049,9 @@ def train_volume_models_stage(
         "scientific_grid_changed": False,
         "locked_test_or_tca_used": False,
         **operational_receipts,
+        "fold_id": requested_fold,
+        "input_identity": input_identity,
+        "qualification": qualification if execution_options.device_type == "gpu" else None,
     }
     if execution_receipt_path.is_file():
         if read_json(execution_receipt_path) != execution_receipt:
@@ -1040,7 +1059,7 @@ def train_volume_models_stage(
     else:
         write_json_atomic(execution_receipt_path, execution_receipt)
 
-    universe = read_json(Path(config.data["universe_manifest"]))
+    universe = read_json(config.data_path("universe_manifest"))
     liquidity = {
         str(member["instrument_id"]): int(member["liquidity_group"])
         for member in universe["members"]
@@ -1062,18 +1081,37 @@ def train_volume_models_stage(
         for child in config.lightgbm["min_child_samples"]
         for l2 in config.lightgbm["reg_lambda"]
     )
-    for fold in config.evaluation["folds"]:
+    for fold in selected_folds:
         fold_id = str(fold["id"])
-        sequence = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
+        sequence = config.sequence_root / fold_id / "sequence-manifest.json"
+        # The raw causal rows, targets, weights, and identities are invariant across
+        # representation variants. Build them once per fold/partition; only the
+        # active coordinate receives a temporary 644-column representation block.
+        base_training = cached_lightgbm_base_frames(
+            sequence,
+            partition="train",
+            liquidity_groups=liquidity,
+            cache_directory=config.cache_root / "lightgbm-base" / fold_id / "train",
+            source_commit=source_commit,
+            config_hash=config.config_hash,
+        )
+        base_validation = cached_lightgbm_base_frames(
+            sequence,
+            partition="validation",
+            liquidity_groups=liquidity,
+            cache_directory=config.cache_root / "lightgbm-base" / fold_id / "validation",
+            source_commit=source_commit,
+            config_hash=config.config_hash,
+        )
         variants: list[tuple[str, int | None, Path | None]] = [("raw", None, None)]
         variants.append(("untrained_neural", None, None))
         for name in ("dense", "sparse"):
             variants.extend(
-                (name, int(seed), config.artifact_root / "embeddings" / fold_id / name / str(seed))
+                (name, int(seed), config.embedding_root / fold_id / name / str(seed))
                 for seed in config.representation["seeds"]
             )
         for method, seed, embedding_root in variants:
-            output = config.artifact_root / "lightgbm" / fold_id / method / str(seed or "shared")
+            output = config.lightgbm_root / fold_id / method / str(seed or "shared")
             if (output / "manifest.json").is_file():
                 _, metadata = LightGBMVolumeModel.load_native(
                     output, expected_execution=execution_options
@@ -1092,6 +1130,8 @@ def train_volume_models_stage(
                 ]
                 if mismatches:
                     raise ValueError(f"Reusable LightGBM identity mismatch: {sorted(mismatches)}")
+                if file_sha256(output / "grid-results.json") != metadata.get("grid_results_sha256"):
+                    raise ValueError("Reusable LightGBM grid checksum mismatch.")
                 results.append(
                     {"fold_id": fold_id, "method": method, "seed": seed, "status": "reused"}
                 )
@@ -1106,21 +1146,35 @@ def train_volume_models_stage(
                 if embedding_root is not None
                 else None
             )
-            training = build_lightgbm_frames(
-                sequence,
-                partition="train",
-                liquidity_groups=liquidity,
-                embedding_path=train_embedding,
-            )
-            validation = build_lightgbm_frames(
-                sequence,
-                partition="validation",
-                liquidity_groups=liquidity,
-                embedding_path=validation_embedding,
-            )
+            training_frames = base_training
+            validation_frames = base_validation
+            if train_embedding is not None and validation_embedding is not None:
+                training_frames = attach_lightgbm_embeddings(
+                    base_training, embedding_path=train_embedding
+                )
+                validation_frames = attach_lightgbm_embeddings(
+                    base_validation, embedding_path=validation_embedding
+                )
+            training = training_frames.as_tuple()
+            validation = validation_frames.as_tuple()
             if method == "untrained_neural":
                 training = _append_untrained_control(training, fold_seed=13)
                 validation = _append_untrained_control(validation, fold_seed=13)
+            candidate_cache = (
+                config.cache_root
+                / "lightgbm-grid-cache"
+                / config.config_hash
+                / source_commit
+                / fold_id
+                / method
+                / str(seed or "shared")
+            )
+            embedding_identity = {
+                "train": file_sha256(train_embedding) if train_embedding is not None else None,
+                "validation": (
+                    file_sha256(validation_embedding) if validation_embedding is not None else None
+                ),
+            }
             model, candidates = run_lightgbm_grid(
                 training,
                 validation,
@@ -1131,6 +1185,20 @@ def train_volume_models_stage(
                     LightGBMConfig(**{**asdict(item), "seed": int(seed or 13)})
                     for item in lightgbm_candidates
                 ),
+                resume_directory=candidate_cache,
+                resume_identity={
+                    "schema_version": "paper-lightgbm-grid-resume-v1",
+                    "training_cutoff": str(fold["train"][1]),
+                    "validation_range": [str(value) for value in fold["validation"]],
+                    "paper_config_hash": config.config_hash,
+                    "git_commit": source_commit,
+                    "fold_id": fold_id,
+                    "sequence_manifest_hash": file_sha256(sequence),
+                    "method": method,
+                    "seed": seed,
+                    "embedding_sha256": embedding_identity,
+                    "execution_receipt_sha256": file_sha256(execution_receipt_path),
+                },
             )
             metadata = {
                 "fold_id": fold_id,
@@ -1143,10 +1211,16 @@ def train_volume_models_stage(
                 "method": method,
                 "seed": seed,
                 "git_commit": source_commit,
+                "embedding_sha256": embedding_identity,
+                "execution_receipt_sha256": file_sha256(execution_receipt_path),
+                "input_identity": input_identity,
             }
-            model.save_native(output, metadata)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            staging_parent = Path(tempfile.mkdtemp(prefix=".coordinate-", dir=output.parent))
+            staging = staging_parent / "complete"
+            model.save_native(staging, metadata)
             write_json_atomic(
-                output / "grid-results.json",
+                staging / "grid-results.json",
                 {
                     "candidates": [
                         {
@@ -1161,14 +1235,29 @@ def train_volume_models_stage(
                     "selection_data": "validation_only",
                 },
             )
+            completed_manifest = read_json(staging / "manifest.json")
+            completed_manifest["grid_results_sha256"] = file_sha256(staging / "grid-results.json")
+            write_json_atomic(staging / "manifest.json", completed_manifest)
+            os.replace(staging, output)
+            staging_parent.rmdir()
             results.append(
                 {"fold_id": fold_id, "method": method, "seed": seed, "artifact": str(output)}
             )
             # Each coordinate owns several multi-gigabyte historical frames. Release
             # them before constructing the next coordinate so peak memory does not
             # include both the completed and incoming feature matrices.
-            del training, validation, model, candidates
+            del training, validation, training_frames, validation_frames, model, candidates
             gc.collect()
+        del base_training, base_validation
+        gc.collect()
+    if requested_fold is not None:
+        return {
+            "status": "FOLD_TRAINING_COMPLETE",
+            "fold_id": requested_fold,
+            "models": results,
+            "parameter_freeze_created": False,
+            "locked_test_opened": False,
+        }
     selection_receipt = config.artifact_root / "selection" / "rdm-lambda.json"
     model_manifests = sorted((config.artifact_root / "lightgbm").glob("*/*/*/manifest.json"))
     expected_model_count = len(config.evaluation["folds"]) * (

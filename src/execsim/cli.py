@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import date, time
@@ -115,6 +116,26 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--enable-historical-training", action="store_true")
         command.add_argument("--enable-full-paper-run", action="store_true")
         command.add_argument("--runtime-approval", type=Path, default=None)
+        command.add_argument(
+            "--paper-artifact-root",
+            type=Path,
+            default=_environment_path("EXECSIM_PAPER_ARTIFACT_ROOT"),
+        )
+        command.add_argument(
+            "--paper-data-root",
+            type=Path,
+            default=_environment_path("EXECSIM_PAPER_DATA_ROOT"),
+        )
+        command.add_argument(
+            "--paper-cache-root",
+            type=Path,
+            default=_environment_path("EXECSIM_PAPER_CACHE_ROOT"),
+        )
+        command.add_argument(
+            "--paper-report-root",
+            type=Path,
+            default=_environment_path("EXECSIM_PAPER_REPORT_ROOT"),
+        )
         command.add_argument("--trust-local-resume", action="store_true")
         command.add_argument("--synthetic-fixture", action="store_true")
         command.add_argument("--input", type=Path, default=None)
@@ -127,6 +148,18 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--spy-seasonal-input", type=Path, default=None)
         command.add_argument("--previous-close", type=float, default=None)
         if command_name == "train-volume-model":
+            command.add_argument(
+                "--sequence-root", type=Path, default=_environment_path("EXECSIM_SEQUENCE_ROOT")
+            )
+            command.add_argument(
+                "--embedding-root", type=Path, default=_environment_path("EXECSIM_EMBEDDING_ROOT")
+            )
+            command.add_argument(
+                "--model-output-root",
+                type=Path,
+                default=_environment_path("EXECSIM_MODEL_OUTPUT_ROOT"),
+            )
+            command.add_argument("--fold", choices=("fold-1", "fold-2", "fold-3"))
             command.add_argument("--lightgbm-device", choices=("cpu", "gpu"), default="cpu")
             command.add_argument("--lightgbm-gpu-platform-id", type=int, default=None)
             command.add_argument("--lightgbm-gpu-device-id", type=int, default=None)
@@ -154,6 +187,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) as exc:
         parser.error(str(exc))
     return 2
+
+
+def _environment_path(name: str) -> Path | None:
+    """Return one optional runtime path from the process environment."""
+    value = os.environ.get(name)
+    return Path(value) if value else None
 
 
 def _dispatch(args: argparse.Namespace) -> int:
@@ -382,7 +421,15 @@ def _paper(args: argparse.Namespace) -> int:
     from execsim.ml.paper.benchmark import build_compute_plan
     from execsim.ml.paper.configs import load_paper_config, load_runtime_approval
 
-    config = load_paper_config(args.config)
+    config = load_paper_config(args.config).with_runtime_roots(
+        artifact_root=args.paper_artifact_root,
+        data_root=args.paper_data_root,
+        cache_root=args.paper_cache_root,
+        report_root=args.paper_report_root,
+        sequence_root=getattr(args, "sequence_root", None),
+        embedding_root=getattr(args, "embedding_root", None),
+        output_root=getattr(args, "model_output_root", None),
+    )
     runtime_approval = (
         load_runtime_approval(args.runtime_approval, config)
         if args.runtime_approval is not None
@@ -556,6 +603,7 @@ def _execute_paper_command(
             training_cli_enabled=args.enable_historical_training,
             runtime_approval=runtime_approval,
             execution=_lightgbm_execution_options(args),
+            fold_id=args.fold,
         )
     if args.paper_command == "export-embeddings" and args.synthetic_fixture:
         import hashlib

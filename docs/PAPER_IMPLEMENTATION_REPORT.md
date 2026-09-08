@@ -1,5 +1,11 @@
 # Sparse-JEPA paper implementation report
 
+The RunPod execution correction is specified in [ADR 0021](ADRs/0021-run-independent-lightgbm-folds-on-runpod.md)
+and [the executable deployment procedure](RUNPOD_EXECUTION.md). The local LightGBM attempt
+was interrupted gracefully at 0/24. Pod provisioning, Ubuntu setup, RTX 3090 qualification
+and historical fitting on this downstream revision are NOT RUN. Upstream JEPA and embedding
+artifacts remain unchanged; TEST remains closed.
+
 Privileged stage execution follows the separate [paper runtime authorization specification](PAPER_RUNTIME_AUTHORIZATION.md). Runtime approval is external to the six scientifically frozen YAML files and requires a matching command-line opt-in; this operational mechanism does not alter the sparse-jepa-v2 protocol hash.
 
 This report records the active `sparse-jepa-v2` corpus-protocol correction and

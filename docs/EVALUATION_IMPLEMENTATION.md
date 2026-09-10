@@ -170,6 +170,11 @@ and report commands. Derived caches, numerical outputs, and report bundles are
 directed into that namespace. Loaders accept the original parameter source only
 through the verified new execution receipt. This is an implementation-source
 bridge, not permission to regenerate parameters or reopen an unrelated TEST run.
+Learned-ledger identities in both forecast and TCA must hash the base manifest
+under this configured evaluation root, never a similarly named cache under the
+upstream artifact root. A missing isolated base is an error even if a legacy
+base exists. Regression tests exercise default and isolated forecast orchestration,
+resume, and conflicting legacy caches for every learned-method family.
 CLI help and synthetic receipt tests are executed; no historical seal has been
 created yet. All original checkpoint bytes must be available on the execution
 host before sealing can pass. `--representation-root` selects the immutable

@@ -1362,7 +1362,7 @@ def _learned_ledger_identity(
             root / "lightgbm" / fold_id / method / str(seed or "shared") / "manifest.json"
         ),
         "base_manifest_sha256": file_sha256(
-            root / "evaluation-v2" / "bases" / fold_id / "manifest.json"
+            evaluation_root(config) / "evaluation-v2" / "bases" / fold_id / "manifest.json"
         ),
         "embedding_sha256": file_sha256(embedding) if embedding is not None else None,
     }

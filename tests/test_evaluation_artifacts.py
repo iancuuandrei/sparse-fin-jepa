@@ -183,7 +183,10 @@ def test_vector_metrics_match_reference_and_reject_unmatched_forecasts():
         )
 
 
-def test_forecast_stage_builds_one_base_and_resumes_published_predictions(tmp_path, monkeypatch):
+@pytest.mark.parametrize("isolated", [False, True])
+def test_forecast_stage_builds_one_base_and_resumes_published_predictions(
+    tmp_path, monkeypatch, isolated
+):
     from functools import partial
     from types import SimpleNamespace
 
@@ -217,6 +220,8 @@ def test_forecast_stage_builds_one_base_and_resumes_published_predictions(tmp_pa
         evaluation={"folds": [{"id": "fold-1"}]},
         representation={"seeds": []},
     )
+    if isolated:
+        config.runtime_evaluation_root = tmp_path / "evaluation-executions" / "fixture"
     calls = []
 
     def build(*args, **kwargs):
@@ -266,6 +271,53 @@ def test_forecast_stage_builds_one_base_and_resumes_published_predictions(tmp_pa
     )
     assert second["rows"] == 6
     assert calls == ["build", "predict", "predict"]
+    if isolated:
+        assert not (tmp_path / "evaluation-v2").exists()
+
+
+@pytest.mark.parametrize(
+    ("method", "seed"), [("raw", None), ("untrained_neural", None), ("dense", 13), ("sparse", 47)]
+)
+def test_learned_ledger_identity_never_uses_legacy_base(tmp_path, monkeypatch, method, seed):
+    from types import SimpleNamespace
+
+    from execsim.data.paper.manifests import file_sha256
+    from execsim.ml.paper import orchestration
+
+    config = SimpleNamespace(
+        artifact_root=tmp_path,
+        runtime_evaluation_root=tmp_path / "evaluation-executions" / "isolated",
+        config_hash="frozen-config",
+    )
+    relative = "evaluation-v2/bases/fold-1/manifest.json"
+    legacy = tmp_path / relative
+    selected = config.runtime_evaluation_root / relative
+    for path, content in (
+        (legacy, "legacy"),
+        (selected, "isolated"),
+        (tmp_path / "selection/parameter-freeze-v1.json", "freeze"),
+        (tmp_path / "lightgbm/fold-1" / method / str(seed or "shared") / "manifest.json", "model"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    if seed is not None:
+        embedding = (
+            tmp_path
+            / "embeddings/fold-1"
+            / method
+            / str(seed)
+            / "partition=test/embeddings.parquet"
+        )
+        embedding.parent.mkdir(parents=True)
+        embedding.write_bytes(b"fixture-embedding")
+    monkeypatch.setattr(orchestration, "_git_head", lambda: "a" * 40)
+    monkeypatch.setattr(orchestration, "_git_tree", lambda: "b" * 40)
+    identity = orchestration._learned_ledger_identity(config, "fold-1", method, seed)
+    assert identity["base_manifest_sha256"] == file_sha256(selected)
+    assert identity["base_manifest_sha256"] != file_sha256(legacy)
+    selected.unlink()
+    with pytest.raises(FileNotFoundError):
+        orchestration._learned_ledger_identity(config, "fold-1", method, seed)
 
 
 @pytest.mark.parametrize("tamper", ["current", "original", "freeze", "science", "yaml"])

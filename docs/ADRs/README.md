@@ -29,6 +29,9 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 
 ## Recording a decision
 
+ADR [0022](0022-index-history-and-reseal-evaluation.md) is accepted: index historical
+scope once and reseal optimized downstream evaluation without changing fitted models.
+
 ADR [0021](0021-run-independent-lightgbm-folds-on-runpod.md) is accepted: run independent
 LightGBM folds on three RunPod RTX 3090 pods with verified transfer and resumable artifacts.
 

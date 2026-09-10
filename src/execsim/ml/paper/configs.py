@@ -69,6 +69,8 @@ class PaperRunConfig:
     runtime_sequence_root: Path | None = None
     runtime_embedding_root: Path | None = None
     runtime_output_root: Path | None = None
+    runtime_evaluation_root: Path | None = None
+    runtime_representation_root: Path | None = None
 
     @property
     def sequence_root(self) -> Path:
@@ -156,6 +158,8 @@ class PaperRunConfig:
         sequence_root: Path | None = None,
         embedding_root: Path | None = None,
         output_root: Path | None = None,
+        evaluation_root: Path | None = None,
+        representation_root: Path | None = None,
     ) -> PaperRunConfig:
         """Apply operational path relocation without changing the canonical config hash."""
         return PaperRunConfig(
@@ -170,6 +174,8 @@ class PaperRunConfig:
             runtime_sequence_root=sequence_root,
             runtime_embedding_root=embedding_root,
             runtime_output_root=output_root,
+            runtime_evaluation_root=evaluation_root,
+            runtime_representation_root=representation_root,
         )
 
     def authorization_granted(
@@ -341,7 +347,9 @@ def _validate_design_freeze(
         or _portable_document_sha256(repository_root / relative) != expected
     ]
     if mismatches:
-        raise ValueError(f"Paper design freeze normative document mismatch: {sorted(mismatches)}")
+        _validate_implementation_document_amendment(
+            root, repository_root, freeze_path, documents, mismatches
+        )
     specification = str(freeze.get("source_specification", ""))
     if (
         documents.get(specification) != freeze.get("source_specification_sha256")
@@ -355,6 +363,58 @@ def _portable_document_sha256(path: Path) -> str:
     raw = path.read_bytes()
     normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     return hashlib.sha256(normalized).hexdigest()
+
+
+def _validate_implementation_document_amendment(
+    root: Path,
+    repository_root: Path,
+    freeze_path: Path,
+    documents: dict[str, Any],
+    mismatches: list[str],
+) -> None:
+    """Reconstruct frozen document bytes from explicitly reviewed implementation edits.
+
+    The original design receipt is never regenerated. No scientific specification
+    or YAML is eligible for this documentary compatibility bridge.
+    """
+    allowed = {
+        "docs/DATA_LEAKAGE_CONTRACT.md",
+        "docs/SPECIFICATIONS.md",
+        "docs/standards/implementation.md",
+        "repo_manifest.yaml",
+    }
+    path = root / "implementation-document-amendment.json"
+    failure = f"Paper design freeze normative document mismatch: {sorted(mismatches)}"
+    if not path.is_file() or not set(mismatches).issubset(allowed):
+        raise ValueError(failure)
+    amendment = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        amendment.get("schema_version") != "paper-implementation-document-amendment-v1"
+        or amendment.get("design_freeze_sha256") != file_sha256(freeze_path)
+        or amendment.get("scientific_changes") is not False
+        or set(amendment.get("documents", {})) != set(mismatches)
+    ):
+        raise ValueError(failure)
+    for relative in mismatches:
+        record = amendment["documents"][relative]
+        current = (repository_root / relative).read_text(encoding="utf-8")
+        if record.get("frozen_sha256") != documents[relative] or hashlib.sha256(
+            current.encode()
+        ).hexdigest() != record.get("current_sha256"):
+            raise ValueError(failure)
+        lines = current.splitlines(keepends=True)
+        edits = record.get("edits", [])
+        last_start = len(lines) + 1
+        for edit in reversed(edits):
+            start, end = edit["start"], edit["end"]
+            if not 0 <= start <= end <= len(lines) or end > last_start:
+                raise ValueError(failure)
+            if "".join(lines[start:end]) != edit["replacement"]:
+                raise ValueError(failure)
+            lines[start:end] = edit["original"].splitlines(keepends=True)
+            last_start = start
+        if hashlib.sha256("".join(lines).encode()).hexdigest() != documents[relative]:
+            raise ValueError(failure)
 
 
 def _validate_archived_v1_receipts(freeze_path: Path) -> None:

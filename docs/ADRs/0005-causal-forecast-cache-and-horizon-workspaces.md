@@ -4,6 +4,10 @@
 - Date: 2026-09-04
 - Owners: ExecSim maintainers
 
+The historical matrix cache decision is superseded by
+[ADR 0022](0022-index-history-and-reseal-evaluation.md). The solver workspace
+decision remains accepted; the original rationale below is preserved.
+
 ## Context
 
 The 2026-09-04 baseline profile attributed 3.76 of 4.54 seconds in one synthetic MPC replay to forecast generation, primarily repeated timestamp formatting and pivot construction. Repeated experiment units also reconstructed identical historical providers and solver setups. Performance work must preserve the objective, constraints, information boundary, integer schedule, and public results.

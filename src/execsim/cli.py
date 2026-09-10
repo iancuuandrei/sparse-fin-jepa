@@ -101,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         "train-volume-model",
         "evaluate-forecast",
         "evaluate-representation",
+        "reseal-evaluation",
         "run-tca",
         "report",
         "run",
@@ -116,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--enable-historical-training", action="store_true")
         command.add_argument("--enable-full-paper-run", action="store_true")
         command.add_argument("--runtime-approval", type=Path, default=None)
+        command.add_argument("--evaluation-root", type=Path, default=None)
+        command.add_argument("--representation-root", type=Path, default=None)
+        if command_name == "reseal-evaluation":
+            command.add_argument("--supersession-receipt", type=Path, required=True)
         command.add_argument(
             "--paper-artifact-root",
             type=Path,
@@ -429,6 +434,8 @@ def _paper(args: argparse.Namespace) -> int:
         sequence_root=getattr(args, "sequence_root", None),
         embedding_root=getattr(args, "embedding_root", None),
         output_root=getattr(args, "model_output_root", None),
+        evaluation_root=args.evaluation_root,
+        representation_root=args.representation_root,
     )
     runtime_approval = (
         load_runtime_approval(args.runtime_approval, config)
@@ -515,6 +522,23 @@ def _execute_paper_command(
     args: argparse.Namespace, config: Any, runtime_approval: Any
 ) -> dict[str, object] | None:
     """Execute bounded paper operations after the command-level safety checks."""
+    if args.paper_command == "reseal-evaluation":
+        from execsim.ml.paper.evaluation_execution import seal_evaluation_execution
+        from execsim.ml.paper.orchestration import _git_head, _git_tracked_worktree_clean, _git_tree
+
+        config.authorize(
+            "locked_result_evaluation",
+            approval=runtime_approval,
+            cli_enabled=args.enable_full_paper_run,
+        )
+        if not _git_tracked_worktree_clean():
+            raise RuntimeError("BLOCKED: resealing requires a clean committed evaluator source.")
+        return seal_evaluation_execution(
+            config,
+            source_commit=_git_head(),
+            source_tree=_git_tree(),
+            supersession=args.supersession_receipt,
+        )
     if args.paper_command == "run":
         from execsim.ml.paper.orchestration import run_authorized_stages
 

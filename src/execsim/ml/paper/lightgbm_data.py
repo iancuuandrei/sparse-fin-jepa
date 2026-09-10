@@ -230,6 +230,13 @@ def build_lightgbm_base_frames(
 def attach_lightgbm_embeddings(base: LightGBMFrames, *, embedding_path: Path) -> LightGBMFrames:
     """Attach one frozen representation by exact sample identity for one coordinate."""
     embeddings = pd.read_parquet(embedding_path, columns=["sample_id", "embedding"])
+    return attach_lightgbm_embedding_frame(base, embeddings=embeddings)
+
+
+def attach_lightgbm_embedding_frame(
+    base: LightGBMFrames, *, embeddings: pd.DataFrame
+) -> LightGBMFrames:
+    """Attach a verified compact embedding slice without rereading its source file."""
     embedding_ids = pd.Index(embeddings["sample_id"].astype(str))
     if embedding_ids.has_duplicates:
         raise ValueError("Embedding corpus duplicates sample identity.")

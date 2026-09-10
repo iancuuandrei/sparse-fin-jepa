@@ -20,6 +20,8 @@ class _HistoricalMatrix:
     volumes: NDArray[np.float64]
     bucket_columns: dict[str, int]
     session_dates: tuple[date, ...]
+    date_ordinals: NDArray[np.int64]
+    finite: NDArray[np.bool_]
 
 
 @dataclass(slots=True)
@@ -33,7 +35,7 @@ class HistoricalProfileForecaster:
     pooled: bool = False
     feature_schema_version: str = "volume-profile-v1"
     data_manifest_hash: str | None = None
-    _history_cache: dict[tuple[str, date], _HistoricalMatrix] = field(
+    _history_cache: dict[str, _HistoricalMatrix] = field(
         default_factory=dict, init=False, repr=False
     )
 
@@ -86,17 +88,16 @@ class HistoricalProfileForecaster:
             raise ValueError("At least one future bucket is required.")
         expected_times = [timestamp.strftime("%H:%M") for timestamp in timestamps]
         history = self._history_matrix(symbol, session_date)
+        end = int(np.searchsorted(history.date_ordinals, session_date.toordinal(), side="left"))
+        if not end:
+            raise ValueError(f"No prior sessions are available for {symbol} before {session_date}.")
         try:
             column_indices = [history.bucket_columns[value] for value in expected_times]
         except KeyError:
             column_indices = []
-        window = (
-            history.volumes[:, column_indices]
-            if column_indices
-            else np.empty((len(history.session_dates), 0))
-        )
+        window = history.volumes[:end, column_indices] if column_indices else np.empty((end, 0))
         complete = (
-            np.all(np.isfinite(window), axis=1)
+            np.all(history.finite[:end, column_indices], axis=1)
             if window.shape[1]
             else np.zeros(len(window), dtype=bool)
         )
@@ -157,18 +158,19 @@ class HistoricalProfileForecaster:
         )
 
     def _history_matrix(self, symbol: str, session_date: date) -> _HistoricalMatrix:
-        """Return a cached, causally filtered session-by-bucket volume matrix."""
+        """Build one immutable scope index; callers slice strictly before their cutoff."""
         cache_symbol = "*" if self.pooled else symbol.upper()
-        key = (cache_symbol, session_date)
+        key = cache_symbol
         cached = self._history_cache.get(key)
         if cached is not None:
             return cached
 
         bars = self.historical_bars
-        mask = bars["_session_date"] < session_date
-        if not self.pooled:
-            mask &= bars["symbol"].astype(str).str.upper() == cache_symbol
-        prior = bars.loc[mask]
+        prior = (
+            bars
+            if self.pooled
+            else bars.loc[bars["symbol"].astype(str).str.upper() == cache_symbol]
+        )
         if prior.empty:
             raise ValueError(f"No prior sessions are available for {symbol} before {session_date}.")
         session_order = (
@@ -189,10 +191,17 @@ class HistoricalProfileForecaster:
             .reindex(session_order)
             .tolist()
         )
+        volumes = matrix.to_numpy(dtype=float)
+        ordinals = np.asarray([value.toordinal() for value in session_dates], dtype=np.int64)
+        finite = np.isfinite(volumes)
+        for array in (volumes, ordinals, finite):
+            array.setflags(write=False)
         cached = _HistoricalMatrix(
-            volumes=matrix.to_numpy(dtype=float),
+            volumes=volumes,
             bucket_columns={str(value): index for index, value in enumerate(matrix.columns)},
             session_dates=session_dates,
+            date_ordinals=ordinals,
+            finite=finite,
         )
         self._history_cache[key] = cached
         return cached

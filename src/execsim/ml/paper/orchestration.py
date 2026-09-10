@@ -35,6 +35,12 @@ from execsim.data.paper.schemas import InstrumentSymbolInterval
 from execsim.data.paper.universe import select_frozen_universe, write_universe_manifest
 from execsim.data.paper.validation import validate_exact_xnys_session
 from execsim.ml.paper.configs import PaperRunConfig, PaperRuntimeApproval
+from execsim.ml.paper.evaluation_execution import (
+    evaluation_report_root,
+    evaluation_root,
+    representation_root,
+    verify_evaluation_execution,
+)
 from execsim.ml.sequences.corpus import (
     build_fold_sequence_corpus,
     build_fold_sequence_corpus_from_root,
@@ -1322,6 +1328,46 @@ def train_volume_models_stage(
     }
 
 
+def _learned_ledger_identity(
+    config: PaperRunConfig,
+    fold_id: str,
+    method: str,
+    seed: int | None,
+) -> dict[str, Any]:
+    """Bind reused predictions to the same immutable inputs as their original call."""
+    root = config.artifact_root
+    embedding = (
+        (
+            root
+            / "embeddings"
+            / fold_id
+            / method
+            / str(seed)
+            / "partition=test"
+            / "embeddings.parquet"
+        )
+        if seed is not None
+        else None
+    )
+    return {
+        "schema_version": "paper-forecast-ledger-v2",
+        "fold_id": fold_id,
+        "method": method,
+        "seed": seed,
+        "paper_config_hash": config.config_hash,
+        "source_commit": _git_head(),
+        "source_tree": _git_tree(),
+        "parameter_freeze_sha256": file_sha256(root / "selection" / "parameter-freeze-v1.json"),
+        "model_manifest_sha256": file_sha256(
+            root / "lightgbm" / fold_id / method / str(seed or "shared") / "manifest.json"
+        ),
+        "base_manifest_sha256": file_sha256(
+            root / "evaluation-v2" / "bases" / fold_id / "manifest.json"
+        ),
+        "embedding_sha256": file_sha256(embedding) if embedding is not None else None,
+    }
+
+
 def evaluate_forecasts_stage(
     config: PaperRunConfig,
     *,
@@ -1336,18 +1382,40 @@ def evaluate_forecasts_stage(
     )
     _require_parameter_freeze(config)
     _require_locked_test_opened(config)
-    from execsim.forecasting import HistoricalProfileForecaster
     from execsim.ml.models.lightgbm_adapter import LightGBMVolumeModel
-    from execsim.ml.paper.lightgbm_data import build_lightgbm_frames
+    from execsim.ml.paper.evaluation_artifacts import (
+        evaluation_base,
+        forecast_metric_frame,
+        prediction_batches,
+        publish_frames,
+        verify_artifact,
+    )
+    from execsim.ml.paper.evaluation_workers import (
+        EWMAWork,
+        compact_profile_corpus,
+        instrument_key,
+        run_ewma_workers,
+    )
 
     universe = read_json(Path(config.data["universe_manifest"]))
     liquidity = {
         str(member["instrument_id"]): int(member["liquidity_group"])
         for member in universe["members"]
     }
-    bars = _load_parquet_corpus(Path(config.data["target_corpus_root"]))
-    ewma = HistoricalProfileForecaster(bars, estimator="ewma", lookback_sessions=20)
-    output_rows = []
+    execution_identity = {
+        "source_commit": _git_head(),
+        "source_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "parameter_freeze_sha256": file_sha256(
+            config.artifact_root / "selection" / "parameter-freeze-v1.json"
+        ),
+    }
+    market_inputs = compact_profile_corpus(
+        Path(config.data["target_corpus_root"]),
+        evaluation_root(config) / "evaluation-v2" / "profile-corpus",
+        identity=execution_identity,
+    )
+    output_parts: list[Path] = []
     for fold in config.evaluation["folds"]:
         fold_id = str(fold["id"])
         sequence = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
@@ -1360,141 +1428,136 @@ def evaluate_forecasts_stage(
                 (name, int(seed), config.artifact_root / "embeddings" / fold_id / name / str(seed))
                 for seed in config.representation["seeds"]
             )
-        raw_frames = None
+        base = evaluation_base(
+            sequence,
+            partition="test",
+            liquidity_groups=liquidity,
+            directory=evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
+            execution_identity={
+                "source_commit": _git_head(),
+                "source_tree": _git_tree(),
+                "paper_config_hash": config.config_hash,
+                "parameter_freeze_sha256": file_sha256(
+                    config.artifact_root / "selection" / "parameter-freeze-v1.json"
+                ),
+            },
+        )
         for method, seed, embedding_root in variants:
             embedding = (
                 embedding_root / "partition=test" / "embeddings.parquet"
                 if embedding_root is not None
                 else None
             )
-            frames = build_lightgbm_frames(
-                sequence,
-                partition="test",
-                liquidity_groups=liquidity,
-                embedding_path=embedding,
-            )
-            if method == "raw":
-                raw_frames = frames
-            if method == "untrained_neural":
-                frames = _append_untrained_control(frames, fold_seed=13)
             model_root = (
                 config.artifact_root / "lightgbm" / fold_id / method / str(seed or "shared")
             )
+            ledger_root = (
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / method
+                / str(seed or "shared")
+            )
+            ledger_identity = _learned_ledger_identity(config, fold_id, method, seed)
+            ledger_files = ("scale.parquet", "shape.parquet", "metrics.parquet")
+            if ledger_root.exists():
+                verify_artifact(ledger_root, identity=ledger_identity, names=ledger_files)
+                output_parts.append(ledger_root / "metrics.parquet")
+                continue
             model, metadata = LightGBMVolumeModel.load_native(model_root)
             if metadata.get("paper_config_hash") != config.config_hash:
                 raise ValueError(f"LightGBM config identity mismatch: {model_root}")
-            totals, predicted_shape = model.predict_frames(
-                frames[0], frames[2], group_columns=("case_id",)
-            )
-            actual_shape = frames[2].loc[:, ["case_id", "target_bucket"]].copy()
-            actual_shape["actual_share"] = frames[3]
-            shape_joined = actual_shape.merge(
-                predicted_shape,
-                on=["case_id", "target_bucket"],
-                validate="one_to_one",
-            )
-            shape_error = {
-                str(case_id): float(
-                    np.mean(
-                        np.abs(
-                            np.cumsum(group.sort_values("target_bucket")["actual_share"])
-                            - np.cumsum(group.sort_values("target_bucket")["conditional_share"])
-                        )
-                    )
+            total_batches = []
+            shape_batches = []
+            for batch in prediction_batches(
+                base, embedding_path=embedding, untrained_control=method == "untrained_neural"
+            ):
+                batch_totals, batch_shape = model.predict_frames(
+                    batch.scale, batch.shape, group_columns=("case_id",)
                 )
-                for case_id, group in shape_joined.groupby("case_id", sort=False)
-            }
-            for index, row in frames[0].reset_index(drop=True).iterrows():
-                output_rows.append(
-                    {
-                        "fold_id": fold_id,
-                        "method": method,
-                        "seed": seed,
-                        "sample_id": row["sample_id"],
-                        "instrument_id": row["instrument_id"],
-                        "session_date": row["session_date"],
-                        "as_of_token": int(row["as_of"]),
-                        "actual_remaining_volume": float(frames[1][index]),
-                        "causal_baseline_remaining_volume": float(row["baseline_remaining_volume"]),
-                        "predicted_remaining_volume": float(totals[index]),
-                        "log_remaining_volume_absolute_error": abs(
-                            np.log1p(float(totals[index])) - np.log1p(float(frames[1][index]))
-                        ),
-                        "conditional_curve_wasserstein": shape_error[str(row["sample_id"])],
-                    }
-                )
-        if raw_frames is None:
-            raise RuntimeError("Raw forecast rows were not constructed.")
-        shape_by_case = pd.DataFrame(
-            {
-                "case_id": raw_frames[2]["case_id"].astype(str),
-                "target_bucket": raw_frames[2]["target_bucket"].astype(int),
-                "actual_share": raw_frames[3],
-            }
-        )
-        for index, row in raw_frames[0].reset_index(drop=True).iterrows():
-            day = pd.Timestamp(row["session_date"]).date()
-            generated = pd.Timestamp.combine(day, pd.Timestamp("09:30").time()).tz_localize(
-                "America/New_York"
-            ) + pd.Timedelta(minutes=15 * int(row["as_of"]))
-            minutes = tuple(
-                pd.date_range(
-                    generated,
-                    pd.Timestamp.combine(day, pd.Timestamp("15:59").time()).tz_localize(
-                        "America/New_York"
-                    ),
-                    freq="min",
-                )
+                total_batches.append(batch_totals)
+                shape_batches.append(batch_shape)
+                del batch
+            totals = np.concatenate(total_batches)
+            predicted_shape = pd.concat(shape_batches, ignore_index=True)
+            del total_batches, shape_batches
+            metrics = forecast_metric_frame(
+                base, totals, predicted_shape, fold_id=fold_id, method=method, seed=seed
             )
-            forecast = ewma.forecast(
-                symbol=str(row["symbol"]),
-                session_date=day,
-                generated_at=generated,
-                bucket_timestamps=minutes,
+            ledger_scale = base.scale.loc[
+                :,
+                [
+                    "sample_id",
+                    "fold_id",
+                    "instrument_id",
+                    "symbol",
+                    "session_date",
+                    "as_of",
+                    "training_cutoff",
+                    "market_information_as_of",
+                    "feature_history_end",
+                ],
+            ].copy()
+            ledger_scale["predicted_remaining_volume"] = totals
+            publish_frames(
+                ledger_root,
+                identity=ledger_identity,
+                frames={
+                    "scale.parquet": ledger_scale,
+                    "shape.parquet": predicted_shape.sort_values(
+                        ["case_id", "target_bucket"], kind="stable"
+                    ).reset_index(drop=True),
+                    "metrics.parquet": metrics,
+                },
             )
-            predicted_tokens = np.asarray(forecast.expected_volumes).reshape(-1, 15).sum(axis=1)
-            predicted_shape = predicted_tokens / predicted_tokens.sum()
-            actual = shape_by_case.loc[
-                shape_by_case["case_id"] == str(row["sample_id"])
-            ].sort_values("target_bucket")
-            actual_shape = actual["actual_share"].to_numpy(dtype=float)
-            output_rows.append(
-                {
-                    "fold_id": fold_id,
-                    "method": "ewma",
-                    "seed": None,
-                    "sample_id": row["sample_id"],
-                    "instrument_id": row["instrument_id"],
-                    "session_date": row["session_date"],
-                    "as_of_token": int(row["as_of"]),
-                    "actual_remaining_volume": float(raw_frames[1][index]),
-                    "causal_baseline_remaining_volume": float(row["baseline_remaining_volume"]),
-                    "predicted_remaining_volume": float(forecast.expected_remaining_volume),
-                    "log_remaining_volume_absolute_error": abs(
-                        np.log1p(forecast.expected_remaining_volume)
-                        - np.log1p(float(raw_frames[1][index]))
-                    ),
-                    "conditional_curve_wasserstein": float(
-                        np.mean(np.abs(np.cumsum(predicted_shape) - np.cumsum(actual_shape)))
-                    ),
-                }
+            output_parts.append(ledger_root / "metrics.parquet")
+            del model, predicted_shape, ledger_scale
+            gc.collect()
+        ewma_tasks = [
+            EWMAWork(
+                evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
+                market_inputs[str(instrument)],
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / "ewma"
+                / instrument_key(str(instrument)),
+                str(instrument),
+                {**execution_identity, "fold_id": fold_id},
             )
-    output = pd.DataFrame(output_rows)
-    destination = config.artifact_root / "evaluation" / "forecast-results.parquet"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    output.to_parquet(destination, index=False)
-    from execsim.data.paper.manifests import write_json_atomic
+            for instrument in sorted(base.scale["instrument_id"].astype(str).unique())
+        ]
+        for completed in run_ewma_workers(ewma_tasks):
+            output_parts.append(completed / "metrics.parquet")
+        del base
+        gc.collect()
+    from execsim.ml.paper.evaluation_artifacts import merge_result_shards
 
-    write_json_atomic(
-        destination.with_suffix(".manifest.json"),
-        {
-            "schema_version": "paper-forecast-evaluation-v1",
-            "paper_config_hash": config.config_hash,
-            "rows": len(output),
-            "parquet_sha256": file_sha256(destination),
+    destination = evaluation_root(config) / "evaluation" / "forecast-results.parquet"
+    merged = merge_result_shards(
+        destination,
+        sources={
+            str(path.relative_to(config.artifact_root)): (
+                path,
+                read_json(path.parent / "manifest.json")["files"][path.name]["sha256"],
+            )
+            for path in output_parts
         },
+        keys=(
+            "fold_id",
+            "method",
+            "seed",
+            "instrument_id",
+            "session_date",
+            "as_of_token",
+            "sample_id",
+        ),
+        identity=execution_identity,
+        schema_version="paper-forecast-evaluation-v1",
     )
-    return {"status": "SOFTWARE READY", "rows": len(output), "artifact": str(destination)}
+    return {"status": "SOFTWARE READY", "rows": merged["rows"], "artifact": str(destination)}
 
 
 def evaluate_representations_stage(
@@ -1515,6 +1578,11 @@ def evaluate_representations_stage(
 
     import torch
 
+    from execsim.ml.paper.evaluation_artifacts import (
+        merge_result_shards,
+        publish_frames,
+        verify_artifact,
+    )
     from execsim.ml.paper.lightgbm_data import build_historical_baseline_regime_frame
     from execsim.ml.paper.regimes import (
         fit_unusual_session_thresholds,
@@ -1530,22 +1598,63 @@ def evaluate_representations_stage(
     from execsim.ml.sequences.streaming import PaperSequenceDataset, build_sequence_dataloader
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    accessibility_rows: list[dict[str, object]] = []
-    date_metric_rows: list[dict[str, object]] = []
-    support_rows: list[dict[str, object]] = []
+    execution_identity = {
+        "source_commit": _git_head(),
+        "source_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "parameter_freeze_sha256": file_sha256(
+            config.artifact_root / "selection" / "parameter-freeze-v1.json"
+        ),
+    }
+    parts: dict[str, dict[str, tuple[Path, str]]] = {
+        "accessibility": {},
+        "date-metrics": {},
+        "support": {},
+    }
     for fold in config.evaluation["folds"]:
         fold_id = str(fold["id"])
         sequence = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
-        training_states = build_historical_baseline_regime_frame(sequence, partition="train")
-        test_states = label_unusual_sessions(
-            build_historical_baseline_regime_frame(sequence, partition="test"),
-            fit_unusual_session_thresholds(training_states),
-        )
+        test_states: pd.DataFrame | None = None
         for method in ("dense", "sparse"):
             for seed in config.representation["seeds"]:
-                checkpoint_root = (
-                    config.artifact_root / "representations" / fold_id / method / str(seed)
+                checkpoint_root = representation_root(config) / fold_id / method / str(seed)
+                embedding_root = config.artifact_root / "embeddings" / fold_id / method / str(seed)
+                coordinate = f"{fold_id}/{method}/{seed}"
+                destination = (
+                    evaluation_root(config) / "evaluation-v2" / "representations" / coordinate
                 )
+                identity = {
+                    **execution_identity,
+                    "schema_version": "paper-representation-coordinate-v1",
+                    "coordinate": coordinate,
+                    "sequence_sha256": file_sha256(sequence),
+                    "checkpoint_sha256": file_sha256(checkpoint_root / "final" / "manifest.json"),
+                    "compatibility_sha256": file_sha256(checkpoint_root / "compatibility.json"),
+                    "embedding_manifest_sha256": file_sha256(embedding_root / "manifest.json"),
+                }
+                names = ["accessibility.parquet", "date-metrics.parquet"]
+                if method == "sparse":
+                    names.append("support.parquet")
+                if destination.exists():
+                    receipt = verify_artifact(destination, identity=identity, names=names)
+                    for name in names:
+                        parts[Path(name).stem][coordinate] = (
+                            destination / name,
+                            receipt["files"][name]["sha256"],
+                        )
+                    continue
+                if test_states is None:
+                    training_states = build_historical_baseline_regime_frame(
+                        sequence, partition="train"
+                    )
+                    test_states = label_unusual_sessions(
+                        build_historical_baseline_regime_frame(sequence, partition="test"),
+                        fit_unusual_session_thresholds(training_states),
+                    )
+                    del training_states
+                accessibility_rows: list[dict[str, object]] = []
+                date_metric_rows: list[dict[str, object]] = []
+                support_rows: list[dict[str, object]] = []
                 expected = CheckpointCompatibility(
                     **read_json(checkpoint_root / "compatibility.json")
                 )
@@ -1611,7 +1720,6 @@ def evaluate_representations_stage(
                     }
                     for row in dated
                 )
-                embedding_root = config.artifact_root / "embeddings" / fold_id / method / str(seed)
                 diagnostics, transitions, regime_counts = _stream_embedding_diagnostics(
                     embedding_root / "partition=test" / "embeddings.parquet",
                     test_states,
@@ -1646,14 +1754,37 @@ def evaluate_representations_stage(
                             "unusual_rows": regime_counts.get("unusual", 0),
                         }
                     )
-    output_root = config.artifact_root / "evaluation"
+                frames = {
+                    "accessibility.parquet": pd.DataFrame(accessibility_rows),
+                    "date-metrics.parquet": pd.DataFrame(date_metric_rows),
+                }
+                if method == "sparse":
+                    frames["support.parquet"] = pd.DataFrame(support_rows)
+                receipt = publish_frames(destination, identity=identity, frames=frames)
+                for name in names:
+                    parts[Path(name).stem][coordinate] = (
+                        destination / name,
+                        receipt["files"][name]["sha256"],
+                    )
+                del model, frames, capacity, observable, dated
+                gc.collect()
+    output_root = evaluation_root(config) / "evaluation"
     output_root.mkdir(parents=True, exist_ok=True)
     accessibility_path = output_root / "representation-accessibility.parquet"
     date_metrics_path = output_root / "representation-date-metrics.parquet"
     support_path = output_root / "support-regimes.parquet"
-    pd.DataFrame(accessibility_rows).to_parquet(accessibility_path, index=False)
-    pd.DataFrame(date_metric_rows).to_parquet(date_metrics_path, index=False)
-    pd.DataFrame(support_rows).to_parquet(support_path, index=False)
+    for kind, path, extra_keys in (
+        ("accessibility", accessibility_path, ["probe_capacity", "horizon"]),
+        ("date-metrics", date_metrics_path, ["probe_capacity", "horizon", "date"]),
+        ("support", support_path, []),
+    ):
+        merge_result_shards(
+            path,
+            sources=parts[kind],
+            keys=["fold_id", "geometry", "seed", *extra_keys],
+            identity=execution_identity,
+            schema_version="paper-representation-result-v1",
+        )
     from execsim.data.paper.manifests import write_json_atomic
 
     write_json_atomic(
@@ -1681,7 +1812,7 @@ def run_tca_stage(
     full_run_cli_enabled: bool,
     runtime_approval: PaperRuntimeApproval | None,
 ) -> dict[str, object]:
-    """Run main, seed-specific, and 1%/5% ADV matched historical TCA outputs."""
+    """Run independent matched date shards using the frozen forecast ledgers."""
     config.authorize(
         "locked_result_evaluation",
         approval=runtime_approval,
@@ -1689,158 +1820,195 @@ def run_tca_stage(
     )
     _require_parameter_freeze(config)
     _require_locked_test_opened(config)
-    from execsim.forecasting import HistoricalProfileForecaster
-    from execsim.ml.models.lightgbm_adapter import LightGBMVolumeModel
-    from execsim.ml.paper.forecast_provider import PaperLightGBMForecastProvider
-    from execsim.ml.paper.lightgbm_data import build_lightgbm_frames
-    from execsim.ml.paper.tca import PAPER_METHODS, run_historical_tca
+    from execsim.ml.paper.evaluation_artifacts import publish_frames, verify_artifact
+    from execsim.ml.paper.evaluation_workers import (
+        EWMAWork,
+        compact_profile_corpus,
+        ewma_ledger_identity,
+        instrument_key,
+    )
+    from execsim.ml.paper.tca import select_liquidity_spaced_instruments
+    from execsim.ml.paper.tca_inputs import prepare_tca_history, read_tca_date
+    from execsim.ml.paper.tca_workers import TCAWork, run_tca_workers
 
-    bars = _load_parquet_corpus(source or Path(config.data["target_corpus_root"]))
-    universe_payload = read_json(Path(config.data["universe_manifest"]))
-    universe = pd.DataFrame(universe_payload["members"])
-    liquidity = dict(
-        zip(
-            universe["instrument_id"].astype(str),
-            universe["liquidity_group"].astype(int),
-            strict=True,
+    execution = {
+        "source_commit": _git_head(),
+        "source_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "parameter_freeze_sha256": file_sha256(
+            config.artifact_root / "selection" / "parameter-freeze-v1.json"
+        ),
+    }
+    profile_root = evaluation_root(config) / "evaluation-v2" / "profile-corpus"
+    profile_receipt = read_json(profile_root / "manifest.json")
+    profile_identity = profile_receipt["identity"]
+    if any(profile_identity.get(key) != value for key, value in execution.items()):
+        raise ValueError("TCA profile corpus belongs to another evaluation execution.")
+    verify_artifact(profile_root, identity=profile_identity, names=tuple(profile_receipt["files"]))
+    market_profiles = {
+        key: profile_root / name for key, name in profile_receipt["instruments"].items()
+    }
+    universe = pd.DataFrame(read_json(Path(config.data["universe_manifest"]))["members"])
+    instruments = set(
+        select_liquidity_spaced_instruments(universe, size=int(config.tca["universe_size"]))
+    ) | set(
+        select_liquidity_spaced_instruments(
+            universe, size=int(config.tca["sensitivity_universe_size"])
         )
     )
-    adv20 = _causal_adv20(bars)
-    main_outputs = []
-    sensitivity_outputs = []
+    market = compact_profile_corpus(
+        source or Path(config.data["target_corpus_root"]),
+        evaluation_root(config) / "evaluation-v2" / "tca-market",
+        identity=execution,
+        include_market_bars=True,
+        selected_instruments=tuple(sorted(instruments)),
+    )
+    market_manifest = evaluation_root(config) / "evaluation-v2" / "tca-market" / "manifest.json"
+    if (
+        read_json(market_manifest)["identity"]["source_inventory_sha256"]
+        != profile_identity["source_inventory_sha256"]
+    ):
+        raise ValueError("TCA and forecast ledgers require the same immutable source corpus.")
+    histories = {
+        instrument: prepare_tca_history(
+            market[instrument],
+            evaluation_root(config) / "evaluation-v2" / "tca-history" / instrument_key(instrument),
+            instrument_id=instrument,
+            cutoffs={
+                str(fold["id"]): pd.Timestamp(fold["train"][1]).date()
+                for fold in config.evaluation["folds"]
+            },
+            identity=execution,
+        )
+        for instrument in sorted(instruments)
+    }
+    dates = sorted(
+        {
+            pd.Timestamp(day).date()
+            for history in histories.values()
+            for day in pd.read_parquet(history / "sessions.parquet")["session_date"]
+        }
+    )
+    main_outputs, sensitivity_outputs = [], []
     for fold in config.evaluation["folds"]:
         fold_id = str(fold["id"])
         start, end = (pd.Timestamp(value).date() for value in fold["test"])
-        local_dates = pd.to_datetime(bars["timestamp"]).dt.tz_convert("America/New_York").dt.date
-        test_bars = bars.loc[(local_dates >= start) & (local_dates <= end)].copy()
         sequence = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
-        frames: dict[tuple[str, int | None], tuple[pd.DataFrame, Any, pd.DataFrame, Any]] = {}
-        models: dict[tuple[str, int | None], LightGBMVolumeModel] = {}
-        variants: list[tuple[str, int | None, Path | None]] = [
-            ("raw", None, None),
-            ("untrained_neural", None, None),
-        ]
-        for name in ("dense", "sparse"):
-            variants.extend(
-                (name, int(seed), config.artifact_root / "embeddings" / fold_id / name / str(seed))
+        variants = [
+            ("raw", None),
+            ("untrained_neural", None),
+            *(
+                (geometry, int(seed))
+                for geometry in ("dense", "sparse")
                 for seed in config.representation["seeds"]
-            )
-        for method, seed, embedding_root in variants:
-            embedding = (
-                embedding_root / "partition=test" / "embeddings.parquet"
-                if embedding_root is not None
-                else None
-            )
-            built = build_lightgbm_frames(
-                sequence, partition="test", liquidity_groups=liquidity, embedding_path=embedding
-            )
-            if method == "untrained_neural":
-                built = _append_untrained_control(built, fold_seed=13)
-            frames[(method, seed)] = built
-            models[(method, seed)] = LightGBMVolumeModel.load_native(
-                config.artifact_root / "lightgbm" / fold_id / method / str(seed or "shared")
-            )[0]
-        ewma = HistoricalProfileForecaster(bars, estimator="ewma", lookback_sessions=20)
-        fold_frames = frames
-        fold_models = models
-        training_cutoff_value = pd.Timestamp(fold["train"][1]).date()
-        sequence_hash_value = file_sha256(sequence)
-
-        def learned(
-            method: str,
-            seed: int | None,
-            instrument_id: str,
-            session_date: date,
-            fold_frames: dict[
-                tuple[str, int | None], tuple[pd.DataFrame, Any, pd.DataFrame, Any]
-            ] = fold_frames,
-            fold_models: dict[tuple[str, int | None], LightGBMVolumeModel] = fold_models,
-            training_cutoff: date = training_cutoff_value,
-            sequence_hash: str = sequence_hash_value,
-        ) -> Any:
-            scale, _, shape, _ = fold_frames[(method, seed)]
-            profile = _within_token_profile(bars, instrument_id, training_cutoff)
-            return PaperLightGBMForecastProvider(
-                fold_models[(method, seed)],
-                feature_resolver=_feature_resolver(scale, shape, instrument_id),
-                within_token_profile=profile,
-                training_cutoff=training_cutoff,
-                manifest_hash=sequence_hash,
-                method_id=f"{method}-{seed or 'shared'}",
-            )
-
-        providers: dict[str, Any] = {
-            "ewma": lambda _instrument, _date, ewma=ewma: ewma,
-            "lightgbm_raw": lambda instrument, day: learned("raw", None, instrument, day),
-            "raw_untrained_neural": lambda instrument, day: learned(
-                "untrained_neural", None, instrument, day
             ),
-        }
-        for geometry in ("dense", "sparse"):
-            for seed in config.representation["seeds"]:
-                providers[f"raw_{geometry}_jepa_seed_{seed}"] = (
-                    lambda instrument, day, geometry=geometry, seed=int(seed): learned(
-                        geometry, seed, instrument, day
-                    )
+        ]
+        ledgers = tuple(
+            (
+                method,
+                seed,
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / method
+                / str(seed or "shared"),
+                _learned_ledger_identity(config, fold_id, method, seed),
+            )
+            for method, seed in variants
+        )
+        ewma_records = {}
+        for instrument in sorted(instruments):
+            work = EWMAWork(
+                evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
+                market_profiles[instrument],
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / "ewma"
+                / instrument_key(instrument),
+                instrument,
+                {**execution, "fold_id": fold_id},
+            )
+            ewma_records[instrument] = (work.output_directory, ewma_ledger_identity(work))
+        cutoff = pd.Timestamp(fold["train"][1]).date()
+        profiles = pd.concat(
+            [
+                pd.read_parquet(path / "profiles.parquet", filters=[("fold_id", "==", fold_id)])
+                for path in histories.values()
+            ],
+            ignore_index=True,
+        ).drop(columns="fold_id")
+        tasks = []
+        for day in dates:
+            if not start <= day <= end:
+                continue
+            date_bars, date_adv = read_tca_date(histories, day)
+            identity = {
+                **execution,
+                "fold_id": fold_id,
+                "session_date": str(day),
+                "profile_corpus_manifest_sha256": file_sha256(profile_root / "manifest.json"),
+            }
+            input_directory = (
+                evaluation_root(config) / "evaluation-v2" / "tca-inputs" / fold_id / str(day)
+            )
+            publish_frames(
+                input_directory,
+                identity=identity,
+                frames={
+                    "bars.parquet": date_bars.reset_index(drop=True),
+                    "adv.parquet": date_adv.reset_index(drop=True),
+                    "profiles.parquet": profiles,
+                    "universe.parquet": universe,
+                },
+            )
+            del date_bars, date_adv
+            tasks.append(
+                TCAWork(
+                    input_directory,
+                    evaluation_root(config) / "evaluation-v2" / "tca-shards" / fold_id / str(day),
+                    ledgers,
+                    ewma_records,
+                    cutoff,
+                    file_sha256(sequence),
+                    dict(config.tca),
+                    identity,
                 )
-
-        def configured_tca(
-            active_providers: dict[str, Any],
-            *,
-            required_methods: tuple[str, ...] = PAPER_METHODS,
-            liquidity_size: int = int(config.tca["universe_size"]),
-            order_fraction: float = float(config.tca["quantity_fraction_adv20"]),
-            _test_bars: pd.DataFrame = test_bars,
-        ) -> pd.DataFrame:
-            return run_historical_tca(
-                _test_bars,
-                universe,
-                adv20,
-                active_providers,
-                liquidity_size=liquidity_size,
-                order_fraction=order_fraction,
-                required_methods=required_methods,
-                start=str(config.tca["window"][0]),
-                end=str(config.tca["window"][1]),
-                planned_participation=float(config.tca["planned_participation_rate"]),
-                hard_participation=float(config.tca["hard_participation_rate"]),
-                risk_aversion=float(config.tca["risk_aversion"]),
-                tracking_penalty=float(config.tca["tracking_penalty"]),
-                half_spread_arrival_fraction=float(config.tca["half_spread_arrival_fraction"]),
-                temporary_impact_arrival_fraction=float(
-                    config.tca["temporary_impact_at_full_participation"]
-                ),
             )
-
-        main = configured_tca(providers)
-        main.insert(0, "fold_id", fold_id)
-        main_outputs.append(main)
-        for fraction in config.tca["sensitivity_quantity_fraction_adv20"]:
-            sensitivity = configured_tca(
-                providers,
-                liquidity_size=int(config.tca["sensitivity_universe_size"]),
-                order_fraction=float(fraction),
-                required_methods=PAPER_METHODS,
-            )
-            sensitivity.insert(0, "fold_id", fold_id)
-            sensitivity_outputs.append(sensitivity)
-    output_root = config.artifact_root / "tca"
+        for completed in run_tca_workers(tasks):
+            main_outputs.append(completed / "main.parquet")
+            sensitivity_outputs.append(completed / "sensitivity.parquet")
+        del profiles, tasks
+        gc.collect()
+    output_root = evaluation_root(config) / "tca"
     output_root.mkdir(parents=True, exist_ok=True)
     paths = {}
-    for name, parts in (
-        ("main", main_outputs),
-        ("sensitivity", sensitivity_outputs),
-    ):
+    for name, parts in (("main", main_outputs), ("sensitivity", sensitivity_outputs)):
         path = output_root / f"{name}.parquet"
-        pd.concat(parts, ignore_index=True).to_parquet(path, index=False)
-        paths[name] = str(path)
-    from execsim.data.paper.manifests import write_json_atomic
+        from execsim.ml.paper.evaluation_artifacts import merge_result_shards
 
+        merge_result_shards(
+            path,
+            sources={
+                str(part.relative_to(config.artifact_root)): (
+                    part,
+                    read_json(part.parent / "manifest.json")["files"][part.name]["sha256"],
+                )
+                for part in parts
+            },
+            keys=("fold_id", "date", "instrument_id", "method", "order_fraction_adv20"),
+            identity=execution,
+            schema_version="paper-tca-merged-v2",
+        )
+        paths[name] = str(path)
     write_json_atomic(
         output_root / "manifest.json",
         {
             "schema_version": "paper-tca-v1",
             "paper_config_hash": config.config_hash,
+            "evaluation_identity": execution,
             "files": {
                 name: {"path": path, "sha256": file_sha256(Path(path))}
                 for name, path in paths.items()
@@ -1856,17 +2024,66 @@ def report_stage(
     full_run_cli_enabled: bool,
     runtime_approval: PaperRuntimeApproval | None,
 ) -> dict[str, object]:
-    """Construct named historical tables, matched inference, and the real report bundle."""
+    """Publish the full report atomically and verify all output bytes on resume."""
     config.authorize(
-        "locked_result_evaluation",
-        approval=runtime_approval,
-        cli_enabled=full_run_cli_enabled,
+        "locked_result_evaluation", approval=runtime_approval, cli_enabled=full_run_cli_enabled
     )
     _require_parameter_freeze(config)
     _require_locked_test_opened(config)
+    from execsim.ml.paper.evaluation_artifacts import publish_bundle
+
+    root = evaluation_root(config)
+    input_names = (
+        "evaluation/forecast-results.parquet",
+        "evaluation/representation-accessibility.parquet",
+        "evaluation/representation-date-metrics.parquet",
+        "evaluation/support-regimes.parquet",
+        "tca/main.parquet",
+        "tca/sensitivity.parquet",
+    )
+    inputs = {}
+    for name in input_names:
+        path = root / name
+        digest = file_sha256(path)
+        if config.runtime_evaluation_root is not None:
+            receipt = read_json(path.with_suffix(".manifest.json"))
+            if (
+                receipt.get("parquet_sha256") != digest
+                or receipt.get("paper_config_hash") != config.config_hash
+                or receipt.get("merge_identity", {}).get("source_commit") != _git_head()
+            ):
+                raise ValueError("Report input merge checksum or source identity mismatch.")
+        inputs[name] = digest
+    identity = {
+        "source_commit": _git_head(),
+        "source_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "parameter_freeze_sha256": file_sha256(
+            config.artifact_root / "selection/parameter-freeze-v1.json"
+        ),
+        "input_sha256": inputs,
+    }
+    destination = evaluation_report_root(config) / config.paper_run_id
+
+    def build(staging: Path) -> None:
+        _build_report_stage(config, output_root=staging)
+        built = staging / config.paper_run_id
+        for path in list(built.iterdir()):
+            os.replace(path, staging / path.name)
+        built.rmdir()
+
+    reused = destination.exists()
+    publish_bundle(destination, identity=identity, build=build)
+    return {
+        "status": "SOFTWARE READY",
+        "output": str(destination),
+        "reuse": "validated" if reused else "created",
+    }
+
+
+def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[str, object]:
+    """Construct named historical tables, matched inference, and the real report bundle."""
     from execsim.ml.paper.reports import (
-        HISTORICAL_FIGURE_NAMES,
-        HISTORICAL_TABLE_NAMES,
         write_historical_paper_bundle,
     )
     from execsim.ml.paper.statistics import (
@@ -1875,37 +2092,17 @@ def report_stage(
         moving_block_bootstrap,
     )
 
-    existing = config.report_root / config.paper_run_id
-    if existing.exists():
-        if not (existing / "provenance.json").is_file():
-            raise RuntimeError("BLOCKED: existing historical report has no provenance receipt.")
-        provenance = read_json(existing / "provenance.json")
-        required = [existing / "tables" / f"{name}.parquet" for name in HISTORICAL_TABLE_NAMES]
-        required.extend(existing / "figures" / f"{name}.png" for name in HISTORICAL_FIGURE_NAMES)
-        required.extend(
-            (
-                existing / "appendix" / "bootstrap-block-sensitivity.parquet",
-                existing / "appendix" / "support-regimes.parquet",
-            )
-        )
-        if (
-            provenance.get("paper_config_hash") != config.config_hash
-            or provenance.get("data_classification") != "historical"
-            or not all(path.is_file() for path in required)
-        ):
-            raise ValueError("Existing historical report bundle is incomplete or incompatible.")
-        return {"status": "SOFTWARE READY", "output": str(existing), "reuse": "validated"}
     report_inputs = {
-        "forecast": config.artifact_root / "evaluation" / "forecast-results.parquet",
-        "tca": config.artifact_root / "tca" / "main.parquet",
-        "accessibility": config.artifact_root
+        "forecast": evaluation_root(config) / "evaluation" / "forecast-results.parquet",
+        "tca": evaluation_root(config) / "tca" / "main.parquet",
+        "accessibility": evaluation_root(config)
         / "evaluation"
         / "representation-accessibility.parquet",
-        "representation_dates": config.artifact_root
+        "representation_dates": evaluation_root(config)
         / "evaluation"
         / "representation-date-metrics.parquet",
-        "support": config.artifact_root / "evaluation" / "support-regimes.parquet",
-        "tca_sensitivity": config.artifact_root / "tca" / "sensitivity.parquet",
+        "support": evaluation_root(config) / "evaluation" / "support-regimes.parquet",
+        "tca_sensitivity": evaluation_root(config) / "tca" / "sensitivity.parquet",
     }
     if missing := [name for name, path in report_inputs.items() if not path.is_file()]:
         raise RuntimeError(f"BLOCKED: historical report inputs are missing: {missing}")
@@ -2145,7 +2342,7 @@ def report_stage(
         "appendix_sensitivities": pd.concat(appendix_frames, ignore_index=True, sort=False),
     }
     output = write_historical_paper_bundle(
-        config.report_root,
+        output_root,
         paper_run_id=config.paper_run_id,
         tables=tables,
         provenance={
@@ -2900,12 +3097,18 @@ def _require_parameter_freeze(config: PaperRunConfig) -> dict[str, object]:
             "BLOCKED: parameter-selection freeze is missing; locked test artifacts cannot be read."
         )
     payload = read_json(path)
+    parameter_source = {"commit": _git_head(), "tree": _git_tree()}
+    if getattr(config, "runtime_evaluation_root", None) is not None:
+        execution = verify_evaluation_execution(
+            config, source_commit=_git_head(), source_tree=_git_tree()
+        )
+        parameter_source = execution["upstream_parameter_source"]
     if (
         payload.get("status") != "PARAMETERS_FROZEN"
         or payload.get("paper_config_hash") != config.config_hash
         or payload.get("test_or_tca_used") is not False
-        or payload.get("git_commit") != _git_head()
-        or payload.get("git_tree") != _git_tree()
+        or payload.get("git_commit") != parameter_source["commit"]
+        or payload.get("git_tree") != parameter_source["tree"]
     ):
         raise ValueError("Parameter-selection freeze is incompatible with this paper run.")
     receipt = config.artifact_root / "selection" / "rdm-lambda.json"
@@ -2997,9 +3200,9 @@ def write_locked_test_ready_receipt(config: PaperRunConfig) -> dict[str, object]
         if not required.is_file():
             raise RuntimeError(f"BLOCKED: LOCKED-TEST-READY input is missing: {required}")
     forbidden = (
-        config.artifact_root / "evaluation" / "forecast-results.parquet",
-        config.artifact_root / "evaluation" / "representation-accessibility.parquet",
-        config.artifact_root / "tca" / "main.parquet",
+        evaluation_root(config) / "evaluation" / "forecast-results.parquet",
+        evaluation_root(config) / "evaluation" / "representation-accessibility.parquet",
+        evaluation_root(config) / "tca" / "main.parquet",
     )
     if any(path.exists() for path in forbidden):
         raise RuntimeError("BLOCKED: locked result artifacts exist before LOCKED-TEST-READY.")
@@ -3073,10 +3276,16 @@ def _require_locked_test_opened(config: PaperRunConfig) -> dict[str, object]:
         raise RuntimeError("BLOCKED: locked TEST has not been durably opened.")
     payload = read_json(path)
     ready_path = config.artifact_root / "selection" / "locked-test-ready-v1.json"
+    opened_source = {"commit": _git_head(), "tree": _git_tree()}
+    if getattr(config, "runtime_evaluation_root", None) is not None:
+        execution = verify_evaluation_execution(
+            config, source_commit=_git_head(), source_tree=_git_tree()
+        )
+        opened_source = execution["previous_evaluation_source"]
     if (
         payload.get("status") != "LOCKED-TEST-OPENED"
-        or payload.get("evaluation_git_commit") != _git_head()
-        or payload.get("evaluation_git_tree") != _git_tree()
+        or payload.get("evaluation_git_commit") != opened_source["commit"]
+        or payload.get("evaluation_git_tree") != opened_source["tree"]
         or payload.get("paper_config_hash") != config.config_hash
         or not ready_path.is_file()
         or payload.get("locked_test_ready_receipt_sha256") != file_sha256(ready_path)
@@ -3103,23 +3312,47 @@ def _write_or_verify_timestamped_receipt(
 
 def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
     """Hash the complete locked result bundle after every declared stage finishes."""
+    _require_parameter_freeze(config)
     opened_path = config.artifact_root / "selection" / "locked-test-opened-v1.json"
     _require_locked_test_opened(config)
     required = {
         "parameter_freeze": config.artifact_root / "selection" / "parameter-freeze-v1.json",
-        "representation_evaluation": config.artifact_root
+        "representation_evaluation": evaluation_root(config)
         / "evaluation"
         / "representation-evaluation-manifest.json",
-        "forecast_evaluation": config.artifact_root
+        "forecast_evaluation": evaluation_root(config)
         / "evaluation"
         / "forecast-results.manifest.json",
-        "tca": config.artifact_root / "tca" / "manifest.json",
-        "report_provenance": config.report_root / config.paper_run_id / "provenance.json",
+        "tca": evaluation_root(config) / "tca" / "manifest.json",
+        "report_provenance": evaluation_report_root(config)
+        / config.paper_run_id
+        / "provenance.json",
     }
+    if getattr(config, "runtime_evaluation_root", None) is not None:
+        required["evaluation_execution"] = evaluation_root(config) / "execution.json"
+        required["report_completion"] = (
+            evaluation_report_root(config) / config.paper_run_id / "completion.json"
+        )
     missing = [name for name, path in required.items() if not path.is_file()]
     if missing:
         raise RuntimeError(f"BLOCKED: final result-freeze inputs are missing: {missing}")
-    result_root = config.report_root / config.paper_run_id
+    result_root = evaluation_report_root(config) / config.paper_run_id
+    if getattr(config, "runtime_evaluation_root", None) is not None:
+        from execsim.ml.paper.evaluation_artifacts import publish_bundle
+
+        completion = read_json(required["report_completion"])
+        identity = completion["identity"]
+        if (
+            identity.get("source_commit") != _git_head()
+            or identity.get("source_tree") != _git_tree()
+            or identity.get("paper_config_hash") != config.config_hash
+            or identity.get("parameter_freeze_sha256") != file_sha256(required["parameter_freeze"])
+        ):
+            raise ValueError("Final report completion identity mismatch.")
+        publish_bundle(result_root, identity=identity, build=lambda _: None)
+        for name, digest in identity["input_sha256"].items():
+            if file_sha256(evaluation_root(config) / name) != digest:
+                raise ValueError("Final report numerical input checksum mismatch.")
     result_files = sorted(
         path
         for path in result_root.rglob("*")
@@ -3127,9 +3360,7 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
     )
     if not result_files:
         raise RuntimeError("BLOCKED: final historical result bundle is empty.")
-    representation_manifests = sorted(
-        (config.artifact_root / "representations").glob("*/*/*/final/manifest.json")
-    )
+    representation_manifests = sorted(representation_root(config).glob("*/*/*/final/manifest.json"))
     representation_commits = {
         str(read_json(path).get("code_commit")) for path in representation_manifests
     }
@@ -3168,7 +3399,11 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
             for path in result_files
         ],
     }
-    path = result_root / "final-result-freeze-v1.json"
+    path = (
+        evaluation_root(config) / "selection" / "final-result-freeze-v1.json"
+        if getattr(config, "runtime_evaluation_root", None) is not None
+        else result_root / "final-result-freeze-v1.json"
+    )
     _write_or_verify_timestamped_receipt(path, payload, timestamp_field="frozen_at_utc")
     return {**read_json(path), "path": str(path), "sha256": file_sha256(path)}
 
@@ -3446,45 +3681,6 @@ def _combine_support_transition_results(results: list[dict[str, object]]) -> dic
         },
         "regime_transition_matrix": matrix,
     }
-
-
-def _causal_adv20(bars: pd.DataFrame) -> pd.DataFrame:
-    frame = bars.copy()
-    frame["session_date"] = (
-        pd.to_datetime(frame["timestamp"]).dt.tz_convert("America/New_York").dt.date
-    )
-    daily = (
-        frame.groupby(["instrument_id", "session_date"], sort=True, as_index=False)["volume"]
-        .sum()
-        .sort_values(["instrument_id", "session_date"], kind="stable")
-    )
-    daily["adv20"] = daily.groupby("instrument_id", sort=False)["volume"].transform(
-        lambda values: values.shift(1).rolling(20, min_periods=20).mean()
-    )
-    return daily.dropna(subset=["adv20"])
-
-
-def _within_token_profile(
-    bars: pd.DataFrame, instrument_id: str, training_cutoff: date
-) -> np.ndarray:
-    selected = bars.loc[
-        (bars["instrument_id"].astype(str) == instrument_id)
-        & (
-            pd.to_datetime(bars["timestamp"]).dt.tz_convert("America/New_York").dt.date
-            <= training_cutoff
-        )
-    ].copy()
-    if selected.empty:
-        raise ValueError(
-            f"No TRAIN-only within-token history for {instrument_id}/{training_cutoff}."
-        )
-    local = pd.to_datetime(selected["timestamp"]).dt.tz_convert("America/New_York")
-    selected["minute_in_token"] = ((local.dt.hour * 60 + local.dt.minute) - 570) % 15
-    profile = selected.groupby("minute_in_token", sort=True)["volume"].mean().reindex(range(15))
-    values = profile.to_numpy(dtype=float)
-    if not np.isfinite(values).all() or values.sum() <= 0:
-        raise ValueError("Within-token profile is incomplete or non-positive.")
-    return values / values.sum()
 
 
 def _feature_resolver(scale: pd.DataFrame, shape: pd.DataFrame, instrument_id: str) -> Any:

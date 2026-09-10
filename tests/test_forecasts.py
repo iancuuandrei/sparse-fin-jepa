@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from execsim.forecasting import HistoricalProfileForecaster, VolumeForecast
+from execsim.forecasting.historical import _HistoricalMatrix
 
 
 def _history() -> pd.DataFrame:
@@ -89,8 +91,87 @@ def test_historical_profile_reuses_only_same_point_in_time_history() -> None:
         bucket_timestamps=march_17,
     )
 
-    assert len(forecaster._history_cache) == 2
+    assert len(forecaster._history_cache) == 1
+    assert not forecaster._history_cache["AAPL"].volumes.flags.writeable
     assert first.training_data_cutoff == date(2026, 3, 13)
     assert repeated.training_data_cutoff == date(2026, 3, 13)
     assert next_day.training_data_cutoff == date(2026, 3, 16)
     assert next_day.expected_volumes != first.expected_volumes
+
+
+class _PrefixReference(HistoricalProfileForecaster):
+    """Original per-date pandas construction retained only as a semantic oracle."""
+
+    def _history_matrix(self, symbol: str, session_date: date) -> _HistoricalMatrix:
+        bars = self.historical_bars
+        mask = bars["_session_date"] < session_date
+        if not self.pooled:
+            mask &= bars["symbol"].astype(str).str.upper() == symbol.upper()
+        prior = bars.loc[mask]
+        if prior.empty:
+            raise ValueError(f"No prior sessions are available for {symbol} before {session_date}.")
+        order = (
+            prior.groupby("_session_key", sort=False)["timestamp"]
+            .min()
+            .sort_values(kind="stable")
+            .index
+        )
+        matrix = prior.pivot_table(
+            index="_session_key", columns="_bucket_time", values="volume", aggfunc="sum"
+        ).reindex(index=order)
+        dates = tuple(
+            prior.groupby("_session_key", sort=False)["_session_date"]
+            .first()
+            .reindex(order)
+            .tolist()
+        )
+        volumes = matrix.to_numpy(dtype=float)
+        return _HistoricalMatrix(
+            volumes,
+            {str(value): i for i, value in enumerate(matrix.columns)},
+            dates,
+            np.asarray([value.toordinal() for value in dates], dtype=np.int64),
+            np.isfinite(volumes),
+        )
+
+
+@pytest.mark.parametrize("estimator", ["mean", "median", "previous", "ewma"])
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("lookback", [1, 20, None])
+def test_indexed_history_matches_prefix_semantics(estimator, pooled, lookback) -> None:
+    rows = []
+    dates = pd.bdate_range("2024-01-02", periods=35)
+    for index, day in enumerate(dates):
+        for symbol in ("BBB", "AAA"):
+            for bucket, stamp in enumerate(
+                pd.date_range(f"{day.date()} 09:30", periods=4, freq="min", tz="America/New_York")
+            ):
+                if index % 7 == 0 and bucket == 1:
+                    continue
+                volume = 0 if index % 9 == 0 else (index + 1) * (bucket + 1)
+                rows.append({"symbol": symbol, "timestamp": stamp, "volume": volume})
+    bars = pd.DataFrame(rows).sample(frac=1, random_state=13)
+    options = dict(estimator=estimator, pooled=pooled, lookback_sessions=lookback)
+    reference = _PrefixReference(bars, **options)
+    indexed = HistoricalProfileForecaster(bars, **options)
+    for day in pd.date_range("2024-01-01", "2024-02-22", freq="3D"):
+        for symbol in ("AAA", "BBB", "UNKNOWN"):
+            for start, length in ((0, 4), (2, 2), (4, 1)):
+                timestamps = pd.date_range(
+                    f"{day.date()} 09:30", periods=5, freq="min", tz="America/New_York"
+                )[start : start + length]
+                request = dict(
+                    symbol=symbol,
+                    session_date=day.date(),
+                    generated_at=timestamps[0],
+                    bucket_timestamps=timestamps,
+                )
+                try:
+                    expected = reference.forecast(**request)
+                except ValueError as error:
+                    with pytest.raises(ValueError) as actual:
+                        indexed.forecast(**request)
+                    assert str(actual.value) == str(error)
+                else:
+                    assert indexed.forecast(**request) == expected
+    assert len(indexed._history_cache) == (1 if pooled else 2)

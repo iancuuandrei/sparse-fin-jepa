@@ -53,8 +53,7 @@ def test_prediction_batches_preserve_full_frames_and_native_predictions(tmp_path
         pd.testing.assert_frame_equal(
             pd.concat([getattr(batch, attr) for batch in batches], ignore_index=True),
             getattr(expected, attr),
-            rtol=1e-6,
-            atol=1e-7,
+            check_exact=True,
         )
     for attr in ("scale_target", "shape_target"):
         np.testing.assert_array_equal(
@@ -239,8 +238,8 @@ def test_forecast_stage_builds_one_base_and_resumes_published_predictions(tmp_pa
     monkeypatch.setattr(orchestration, "_git_head", lambda: "a" * 40)
     monkeypatch.setattr(orchestration, "_git_tree", lambda: "b" * 40)
     monkeypatch.setattr(
-        "execsim.ml.paper.features.append_untrained_neural_control_frames",
-        lambda frames, **kwargs: frames,
+        "execsim.ml.paper.features.untrained_neural_control_embedding",
+        lambda scale, **kwargs: np.zeros((len(scale), 644), dtype=np.float32),
     )
     monkeypatch.setattr(
         LightGBMVolumeModel, "load_native", lambda *args: (Model(), {"paper_config_hash": "config"})

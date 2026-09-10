@@ -124,6 +124,21 @@ def append_untrained_neural_control_frames(
 ) -> tuple[pd.DataFrame, Any, pd.DataFrame, Any]:
     """Append one target-free neural placebo consistently to scale and long-shape rows."""
     scale, scale_target, shape, shape_target = values
+    embedding = untrained_neural_control_embedding(scale, fold_seed=fold_seed)
+    scale_output = append_embedding(scale, embedding)
+    scale_ids = pd.Index(scale["sample_id"].astype(str))
+    if scale_ids.has_duplicates:
+        raise ValueError("Untrained neural control scale rows duplicate sample identity.")
+    shape_positions = scale_ids.get_indexer(shape["sample_id"].astype(str))
+    if np.any(shape_positions < 0):
+        raise ValueError("Untrained neural control shape rows lack matching scale samples.")
+    shape_embedding = embedding[shape_positions]
+    shape_output = append_embedding(shape, shape_embedding)
+    return scale_output, scale_target, shape_output, shape_target
+
+
+def untrained_neural_control_embedding(scale: pd.DataFrame, *, fold_seed: int) -> np.ndarray:
+    """Preserve the original 8,192-row neural batches independently of shape expansion."""
     feature_columns = [
         f"context_t{token:02d}_f{feature:02d}" for token in range(8) for feature in range(18)
     ]
@@ -137,13 +152,4 @@ def append_untrained_neural_control_frames(
     embedding, _identity = build_untrained_neural_control(
         context, mask, horizons, fold_seed=fold_seed
     )
-    scale_output = append_embedding(scale, embedding)
-    scale_ids = pd.Index(scale["sample_id"].astype(str))
-    if scale_ids.has_duplicates:
-        raise ValueError("Untrained neural control scale rows duplicate sample identity.")
-    shape_positions = scale_ids.get_indexer(shape["sample_id"].astype(str))
-    if np.any(shape_positions < 0):
-        raise ValueError("Untrained neural control shape rows lack matching scale samples.")
-    shape_embedding = embedding[shape_positions]
-    shape_output = append_embedding(shape, shape_embedding)
-    return scale_output, scale_target, shape_output, shape_target
+    return embedding

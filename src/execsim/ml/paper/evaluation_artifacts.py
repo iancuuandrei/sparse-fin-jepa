@@ -48,6 +48,11 @@ def prediction_batches(
         embeddings.index = pd.Index(embeddings["sample_id"].astype(str))
         if embeddings.index.has_duplicates or not scale_ids.isin(embeddings.index).all():
             raise ValueError("Prediction embedding sample identities are missing or duplicated.")
+    control = None
+    if untrained_control:
+        from execsim.ml.paper.features import untrained_neural_control_embedding
+
+        control = untrained_neural_control_embedding(base.scale, fold_seed=13)
     for start in range(0, len(base.scale), batch_samples):
         end = min(start + batch_samples, len(base.scale))
         left, right = np.searchsorted(positions, [start, end])
@@ -61,11 +66,14 @@ def prediction_batches(
             batch = attach_lightgbm_embedding_frame(
                 batch, embeddings=embeddings.loc[scale_ids[start:end]].reset_index(drop=True)
             )
-        if untrained_control:
-            from execsim.ml.paper.features import append_untrained_neural_control_frames
+        if control is not None:
+            from execsim.ml.paper.features import append_embedding
 
             batch = LightGBMFrames(
-                *append_untrained_neural_control_frames(batch.as_tuple(), fold_seed=13)
+                append_embedding(batch.scale, control[start:end]),
+                batch.scale_target,
+                append_embedding(batch.shape, control[positions[left:right]]),
+                batch.shape_target,
             )
         yield batch
 

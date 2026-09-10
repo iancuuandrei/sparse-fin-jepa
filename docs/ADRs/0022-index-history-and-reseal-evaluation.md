@@ -58,6 +58,13 @@ Historical matrix storage is proportional to scope history rather than the sum o
 all requested date prefixes. The superseded run and its logs remain provenance.
 The parameter freeze and fitted upstream artifacts remain immutable.
 
+Linux qualification found that changing the untrained-control neural batch size
+changes floating-point kernel results slightly. Preserve its original 8,192-row
+inference batches and retain only the compact exported vectors; batch the wide
+shape expansion and LightGBM prediction separately. This avoids a new numerical
+confound without retaining a fold-wide expanded representation table. Regression
+checks require exact feature equality rather than a relaxed tolerance.
+
 The original design freeze also binds four living implementation/navigation
 documents. A separate reversible amendment binds their current hashes and exact
 edits; reversing them must reproduce the original frozen hashes. Scientific YAML,

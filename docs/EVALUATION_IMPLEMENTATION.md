@@ -213,6 +213,12 @@ across the full fold's shape table. Scale order and complete conditional horizon
 are preserved; noncanonical shape order or missing/duplicate embedding identities
 fail closed. Tests compare full and batched raw, hybrid, and untrained-control
 feature frames and actual native LightGBM predictions on synthetic inputs.
+The untrained neural control retains its original 8,192-row encoder batches:
+its compact 644-value vectors are computed once in original scale order, then
+attached to bounded prediction batches. Changing the neural batch size produced
+small CPU-kernel arithmetic differences on Linux, so the implementation preserves
+that boundary instead of relaxing the equality check. Raw and embedding features
+must match the unbatched path exactly in the regression fixture.
 
 A bounded historical semantic check also passed on 47,990 observed ABT/SPY
 minute rows from November 2023 through January 2024, exclusively Fold-1 TRAIN

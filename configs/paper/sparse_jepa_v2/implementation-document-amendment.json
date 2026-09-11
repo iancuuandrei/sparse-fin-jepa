@@ -35,7 +35,7 @@
     },
     "docs/standards/implementation.md": {
       "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
-      "current_sha256": "7bf15ca05c75e109968654061979c90e3a0ff2520ce7da84724b7d3b49320343",
+      "current_sha256": "d7067ff5c6fe860c6fdd2b4ef5c628f53bdc5746d7e78948ec4dffb0fe30ff20",
       "edits": [
         {
           "start": 23,
@@ -45,9 +45,9 @@
         },
         {
           "start": 43,
-          "end": 44,
+          "end": 45,
           "original": "",
-          "replacement": "| Evaluation derived state | Build one compact base per fold and publish learned predictions with checksum-bound atomic manifests; reuse completed predictions within the new evaluation identity | Reconstructing raw rows or rerunning identical frozen predictions adds work without information; incomplete artifacts must never be treated as completed stages |\n"
+          "replacement": "| Historical forecast availability | Record unavailable exact EWMA requests and method-specific TCA cases; retain other methods and report paired coverage | Missing eligible history is not a fabricated zero forecast or a reason to remove an instrument globally; see ADR 0023 |\n| Evaluation derived state | Build one compact base per fold and publish learned predictions with checksum-bound atomic manifests; reuse completed predictions within the new evaluation identity | Reconstructing raw rows or rerunning identical frozen predictions adds work without information; incomplete artifacts must never be treated as completed stages |\n"
         }
       ]
     },

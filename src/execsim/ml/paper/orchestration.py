@@ -1557,6 +1557,33 @@ def evaluate_forecasts_stage(
         identity=execution_identity,
         schema_version="paper-forecast-evaluation-v1",
     )
+    missing_parts = [
+        path.parent / "unavailable.parquet"
+        for path in output_parts
+        if (path.parent / "unavailable.parquet").is_file()
+    ]
+    if missing_parts:
+        merge_result_shards(
+            destination.with_name("forecast-unavailable.parquet"),
+            sources={
+                str(path.relative_to(config.artifact_root)): (
+                    path,
+                    read_json(path.parent / "manifest.json")["files"][path.name]["sha256"],
+                )
+                for path in missing_parts
+            },
+            keys=(
+                "fold_id",
+                "instrument_id",
+                "session_date",
+                "as_of",
+                "end_token",
+                "generated_at",
+                "sample_id",
+            ),
+            identity=execution_identity,
+            schema_version="paper-forecast-unavailable-v1",
+        )
     return {"status": "SOFTWARE READY", "rows": merged["rows"], "artifact": str(destination)}
 
 
@@ -2000,7 +2027,7 @@ def run_tca_stage(
             },
             keys=("fold_id", "date", "instrument_id", "method", "order_fraction_adv20"),
             identity=execution,
-            schema_version="paper-tca-merged-v2",
+            schema_version="paper-tca-merged-v3",
         )
         paths[name] = str(path)
     write_json_atomic(
@@ -2033,7 +2060,7 @@ def report_stage(
     from execsim.ml.paper.evaluation_artifacts import publish_bundle
 
     root = evaluation_root(config)
-    input_names = (
+    input_names: tuple[str, ...] = (
         "evaluation/forecast-results.parquet",
         "evaluation/representation-accessibility.parquet",
         "evaluation/representation-date-metrics.parquet",
@@ -2041,6 +2068,8 @@ def report_stage(
         "tca/main.parquet",
         "tca/sensitivity.parquet",
     )
+    if (root / "evaluation/forecast-unavailable.parquet").is_file():
+        input_names += ("evaluation/forecast-unavailable.parquet",)
     inputs = {}
     for name in input_names:
         path = root / name
@@ -2128,6 +2157,7 @@ def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[st
     )
     execution_rows = []
     bootstrap_sensitivity_rows = []
+    unavailable_comparisons = []
     for candidate in sorted(set(tca["method"].astype(str))):
         if candidate.startswith("raw_sparse_jepa_seed_"):
             baseline = candidate.replace("raw_sparse_jepa", "raw_dense_jepa")
@@ -2140,6 +2170,17 @@ def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[st
             value_column="normalized_allocation_regret",
             identity_columns=identity,
         )
+        if not paired.matched_rows:
+            unavailable_comparisons.append(
+                {
+                    "candidate": candidate,
+                    "baseline": baseline,
+                    "status": "NO_MATCHED_CASES",
+                    "dropped_baseline": paired.dropped_baseline_rows,
+                    "dropped_candidate": paired.dropped_candidate_rows,
+                }
+            )
+            continue
         by_date = paired.paired_rows.groupby(["fold_id", "date"], sort=True, as_index=False)[
             "difference"
         ].mean()
@@ -2359,6 +2400,40 @@ def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[st
         appendix / "bootstrap-block-sensitivity.parquet", index=False
     )
     support.to_parquet(appendix / "support-regimes.parquet", index=False)
+    pd.DataFrame(
+        unavailable_comparisons,
+        columns=[
+            "candidate",
+            "baseline",
+            "status",
+            "dropped_baseline",
+            "dropped_candidate",
+        ],
+    ).to_parquet(appendix / "unavailable-comparisons.parquet", index=False)
+    for name, frame in (("main", tca), ("sensitivity", tca_sensitivity)):
+        if "status" in frame:
+            frame.loc[frame["status"] == "EWMA_UNAVAILABLE"].to_parquet(
+                appendix / f"tca-{name}-unavailable.parquet",
+                index=False,
+            )
+    missing_path = evaluation_root(config) / "evaluation" / "forecast-unavailable.parquet"
+    if missing_path.is_file():
+        import shutil
+
+        shutil.copyfile(missing_path, appendix / "forecast-unavailable.parquet")
+    pd.DataFrame(
+        [
+            {
+                "method_key": key,
+                "available_cases": len(group),
+                "all_method_matched_cases": int(group["case_key"].isin(common_cases).sum()),
+                "dropped_from_all_method_summary": int(
+                    (~group["case_key"].isin(common_cases)).sum()
+                ),
+            }
+            for key, group in forecast.groupby("method_key", sort=True)
+        ]
+    ).to_parquet(appendix / "forecast-case-coverage.parquet", index=False)
     return {"status": "SOFTWARE READY", "output": str(output)}
 
 

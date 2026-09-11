@@ -10,8 +10,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from execsim.forecasting.historical import HistoricalForecastUnavailable
 from execsim.forecasting.models import VolumeForecast
 from execsim.ml.paper.evaluation_artifacts import VerifiedArtifact, verify_artifact
+from execsim.ml.paper.evaluation_workers import EWMA_FILES
 from execsim.ml.paper.forecast_provider import _is_update_boundary, _truncate_forecast
 from execsim.ml.paper.tca import expand_volume_forecast
 
@@ -170,9 +172,9 @@ class EWMAForecastLedgerProvider:
         session_date: date,
         verified_artifact: VerifiedArtifact | None = None,
     ) -> None:
-        names = ("scale.parquet", "shape.parquet", "metrics.parquet", "minute-forecasts.parquet")
-        if expected_identity.get("schema_version") != "paper-ewma-ledger-v3":
-            raise ValueError("EWMA ledger requires exact minute-window schema v3.")
+        names = EWMA_FILES
+        if expected_identity.get("schema_version") != "paper-ewma-ledger-v4":
+            raise ValueError("EWMA ledger requires exact minute-window availability schema v4.")
         if verified_artifact is None:
             verify_artifact(directory, identity=expected_identity, names=names)
         else:
@@ -193,11 +195,27 @@ class EWMAForecastLedgerProvider:
             (pd.to_datetime(scale["session_date"]).dt.date == session_date)
             & (scale["symbol"] == symbol)
         ]
-        if rows.empty or samples.empty or not rows["sample_id"].isin(samples["sample_id"]).all():
+        unavailable = pd.read_parquet(
+            directory / "unavailable.parquet",
+            filters=[("session_date", "==", str(session_date)), ("end_token", "==", 24)],
+        )
+        if (
+            samples.empty
+            or not rows["sample_id"].isin(samples["sample_id"]).all()
+            or not unavailable["sample_id"].isin(samples["sample_id"]).all()
+        ):
             raise ValueError("EWMA ledger symbol/session/sample identity mismatch.")
+        if (
+            unavailable["generated_at"].duplicated().any()
+            or not unavailable["status"].eq("EWMA_UNAVAILABLE").all()
+        ):
+            raise ValueError("EWMA ledger has invalid availability identities.")
+        if rows["generated_at"].isin(unavailable["generated_at"]).any():
+            raise ValueError("EWMA request is both available and unavailable.")
         if rows["generated_at"].duplicated().any():
             raise ValueError("EWMA ledger duplicates a minute as-of identity.")
         self.rows = rows.set_index("generated_at")
+        self.unavailable = unavailable.set_index("generated_at")
         self.symbol = symbol
         self.session_date = session_date
         self.market_hash = str(expected_identity["market_sha256"])
@@ -220,10 +238,9 @@ class EWMAForecastLedgerProvider:
         if (
             symbol != self.symbol
             or session_date != self.session_date
-            or generated_at not in self.rows.index
+            or (generated_at not in self.rows.index and generated_at not in self.unavailable.index)
         ):
             raise ValueError("EWMA ledger has no matching instrument/session/as-of request.")
-        row = self.rows.loc[generated_at]
         requested = tuple(pd.Timestamp(value) for value in bucket_timestamps)
         expected = tuple(
             pd.date_range(
@@ -236,6 +253,9 @@ class EWMAForecastLedgerProvider:
         )
         if requested != expected:
             raise ValueError("EWMA ledger exact requested window mismatch.")
+        if generated_at in self.unavailable.index:
+            raise HistoricalForecastUnavailable(str(self.unavailable.loc[generated_at, "reason"]))
+        row = self.rows.loc[generated_at]
         return VolumeForecast(
             symbol=symbol,
             session_date=session_date,

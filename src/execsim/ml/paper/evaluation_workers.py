@@ -18,9 +18,11 @@ import pyarrow.parquet as pq
 
 from execsim.data.paper.manifests import file_sha256, read_json, stable_hash, write_json_atomic
 from execsim.forecasting import HistoricalProfileForecaster
+from execsim.forecasting.historical import HistoricalForecastUnavailable
 from execsim.ml.paper.evaluation_artifacts import (
     forecast_metric_frame,
     publish_frames,
+    validate_base,
     verify_artifact,
 )
 from execsim.ml.paper.lightgbm_data import LightGBMFrames
@@ -30,6 +32,14 @@ NATIVE_THREAD_VARIABLES = (
     "MKL_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
+)
+
+EWMA_FILES = (
+    "scale.parquet",
+    "shape.parquet",
+    "metrics.parquet",
+    "minute-forecasts.parquet",
+    "unavailable.parquet",
 )
 
 
@@ -51,13 +61,13 @@ def ewma_ledger_identity(work: EWMAWork) -> dict[str, Any]:
         "instrument_id": work.instrument_id,
         "market_sha256": file_sha256(work.market_path),
         "base_manifest_sha256": file_sha256(work.base_directory / "manifest.json"),
-        "schema_version": "paper-ewma-ledger-v3",
+        "schema_version": "paper-ewma-ledger-v4",
     }
 
 
 def run_ewma_work(work: EWMAWork) -> Path:
     """Persist one instrument's forecast and exact-horizon TCA baseline evidence."""
-    names = ("scale.parquet", "shape.parquet", "metrics.parquet", "minute-forecasts.parquet")
+    names = EWMA_FILES
     identity = ewma_ledger_identity(work)
     if work.output_directory.exists():
         verify_artifact(work.output_directory, identity=identity, names=names)
@@ -71,11 +81,13 @@ def run_ewma_work(work: EWMAWork) -> Path:
         shape,
         shape.pop("__evaluation_target").to_numpy(),
     )
+    validate_base(base)
     bars = pd.read_parquet(work.market_path)
     provider = HistoricalProfileForecaster(
         bars, estimator="ewma", lookback_sessions=20, data_manifest_hash=identity["market_sha256"]
     )
-    totals = np.empty(len(scale), dtype=float)
+    totals = np.full(len(scale), np.nan, dtype=float)
+    unavailable = []
     token_shapes = []
     minute_ids, ends, generated_times, volume_rows, cutoffs, warning_rows = [], [], [], [], [], []
     normalized_rows, remaining_totals = [], []
@@ -101,12 +113,28 @@ def run_ewma_work(work: EWMAWork) -> Path:
                     request_time, opened + pd.Timedelta(minutes=15 * end_token - 1), freq="min"
                 )
             )
-            forecast = provider.forecast(
-                symbol=str(symbol),
-                session_date=day,
-                generated_at=request_time,
-                bucket_timestamps=minutes,
-            )
+            try:
+                forecast = provider.forecast(
+                    symbol=str(symbol),
+                    session_date=day,
+                    generated_at=request_time,
+                    bucket_timestamps=minutes,
+                )
+            except HistoricalForecastUnavailable as exc:
+                unavailable.append(
+                    {
+                        "sample_id": sample_id,
+                        "instrument_id": work.instrument_id,
+                        "symbol": str(symbol),
+                        "session_date": str(day),
+                        "as_of": int(origin),
+                        "end_token": end_token,
+                        "generated_at": request_time,
+                        "status": "EWMA_UNAVAILABLE",
+                        "reason": str(exc),
+                    }
+                )
+                continue
             minute_ids.append(sample_id)
             ends.append(end_token)
             generated_times.append(request_time)
@@ -119,13 +147,29 @@ def run_ewma_work(work: EWMAWork) -> Path:
                 totals[index] = forecast.expected_remaining_volume
                 token_volumes = np.asarray(forecast.expected_volumes).reshape(-1, 15).sum(axis=1)
                 token_shapes.append(token_volumes / token_volumes.sum())
-    predicted = shape.loc[:, ["case_id", "target_bucket"]].copy()
+    available = np.isfinite(totals)
+    shape_available = shape["case_id"].isin(scale.loc[available, "sample_id"]).to_numpy()
+    predicted = shape.loc[shape_available, ["case_id", "target_bucket"]].copy()
     expected_ids = np.repeat(scale["sample_id"].to_numpy(), 26 - scale["as_of"].to_numpy(dtype=int))
-    if not np.array_equal(predicted["case_id"].to_numpy(), expected_ids):
+    if not np.array_equal(shape["case_id"].to_numpy(), expected_ids):
         raise ValueError("EWMA base shape order differs from scale identity order.")
-    predicted["conditional_share"] = np.concatenate(token_shapes)
+    predicted["conditional_share"] = (
+        np.concatenate(token_shapes) if token_shapes else np.array([], dtype=float)
+    )
+    valid_base = LightGBMFrames(
+        scale.loc[available].reset_index(drop=True),
+        base.scale_target[available],
+        shape.loc[shape_available].reset_index(drop=True),
+        base.shape_target[shape_available],
+    )
     metrics = forecast_metric_frame(
-        base, totals, predicted, fold_id=str(identity["fold_id"]), method="ewma", seed=None
+        valid_base,
+        totals[available],
+        predicted,
+        fold_id=str(identity["fold_id"]),
+        method="ewma",
+        seed=None,
+        allow_empty=True,
     )
     minute_ledger = pd.DataFrame(
         {
@@ -139,14 +183,44 @@ def run_ewma_work(work: EWMAWork) -> Path:
             "expected_remaining_volume": remaining_totals,
         }
     )
+    minute_ledger["generated_at"] = pd.to_datetime(
+        minute_ledger["generated_at"], utc=True
+    ).dt.tz_convert("America/New_York")
+    minute_ledger["end_token"] = minute_ledger["end_token"].astype("int64")
     published_scale = scale.loc[
         :, ["sample_id", "instrument_id", "symbol", "session_date", "as_of"]
     ].copy()
     published_scale["predicted_remaining_volume"] = totals
+    published_scale["status"] = np.where(available, "AVAILABLE", "EWMA_UNAVAILABLE")
+    missing = pd.DataFrame(
+        unavailable,
+        columns=[
+            "sample_id",
+            "instrument_id",
+            "symbol",
+            "session_date",
+            "as_of",
+            "end_token",
+            "generated_at",
+            "status",
+            "reason",
+        ],
+    )
+    missing.insert(0, "fold_id", str(identity["fold_id"]))
+    # Explicit types keep empty and nonempty availability shards compatible.
+    for column in ("sample_id", "instrument_id", "symbol", "session_date", "status", "reason"):
+        missing[column] = missing[column].astype("string")
+    for column in ("as_of", "end_token"):
+        missing[column] = missing[column].astype("int64")
+    missing["generated_at"] = pd.to_datetime(missing["generated_at"], utc=True).dt.tz_convert(
+        "America/New_York"
+    )
     publish_frames(
         work.output_directory,
         identity=identity,
-        frames=dict(zip(names, (published_scale, predicted, metrics, minute_ledger), strict=True)),
+        frames=dict(
+            zip(names, (published_scale, predicted, metrics, minute_ledger, missing), strict=True)
+        ),
     )
     return work.output_directory
 

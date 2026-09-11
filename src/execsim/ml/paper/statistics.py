@@ -93,6 +93,19 @@ def construct_complete_case_differences(
     selected = rows.loc[rows[method_column].isin((baseline, candidate))].copy()
     if selected.duplicated([method_column, *identity_columns]).any():
         raise ValueError("Complete-case ledger contains duplicated method/case rows.")
+    requested = selected
+    if "status" in selected:
+        if not selected["status"].isin(("AVAILABLE", "EWMA_UNAVAILABLE")).all():
+            raise ValueError("Complete-case ledger has unknown availability status.")
+        unavailable = selected["status"].eq("EWMA_UNAVAILABLE")
+        if (
+            not selected.loc[unavailable, method_column].eq("ewma").all()
+            or selected.loc[unavailable, value_column].notna().any()
+        ):
+            raise ValueError("Unavailable cases must be EWMA rows without a metric.")
+        selected = selected.loc[~unavailable]
+    if not np.isfinite(selected[value_column].to_numpy(dtype=float)).all():
+        raise ValueError("Available complete-case metrics must be finite.")
     base = selected.loc[selected[method_column] == baseline, [*identity_columns, value_column]]
     other = selected.loc[selected[method_column] == candidate, [*identity_columns, value_column]]
     paired = base.merge(
@@ -105,11 +118,11 @@ def construct_complete_case_differences(
     paired["difference"] = paired[f"{value_column}_candidate"] - paired[f"{value_column}_baseline"]
     return CompleteCaseResult(
         paired_rows=paired,
-        baseline_rows=len(base),
-        candidate_rows=len(other),
+        baseline_rows=int(requested[method_column].eq(baseline).sum()),
+        candidate_rows=int(requested[method_column].eq(candidate).sum()),
         matched_rows=len(paired),
-        dropped_baseline_rows=len(base) - len(paired),
-        dropped_candidate_rows=len(other) - len(paired),
+        dropped_baseline_rows=int(requested[method_column].eq(baseline).sum()) - len(paired),
+        dropped_candidate_rows=int(requested[method_column].eq(candidate).sum()) - len(paired),
     )
 
 

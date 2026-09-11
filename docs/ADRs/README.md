@@ -29,6 +29,9 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 
 ## Recording a decision
 
+ADR [0023](0023-record-unavailable-historical-forecasts.md) is accepted: record
+method-specific historical forecast unavailability without changing estimators.
+
 ADR [0022](0022-index-history-and-reseal-evaluation.md) is accepted: index historical
 scope once and reseal optimized downstream evaluation without changing fitted models.
 

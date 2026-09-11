@@ -253,9 +253,11 @@ def forecast_metric_frame(
     fold_id: str,
     method: str,
     seed: int | None,
+    allow_empty: bool = False,
 ) -> pd.DataFrame:
     """Compute named case-level errors using vectorized complete keyed alignment."""
-    validate_base(base)
+    if not (allow_empty and all(len(value) == 0 for value in base.as_tuple())):
+        validate_base(base)
     if len(totals) != len(base.scale) or not np.isfinite(totals).all() or np.any(totals < 0):
         raise ValueError("Forecast totals must be finite nonnegative aligned predictions.")
     actual = base.shape.loc[:, ["case_id", "target_bucket"]].copy()

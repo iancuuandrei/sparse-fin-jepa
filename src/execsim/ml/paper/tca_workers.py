@@ -15,7 +15,7 @@ import pandas as pd
 
 from execsim.data.paper.manifests import file_sha256
 from execsim.ml.paper.evaluation_artifacts import VerifiedArtifact, publish_frames, verify_artifact
-from execsim.ml.paper.evaluation_workers import NATIVE_THREAD_VARIABLES
+from execsim.ml.paper.evaluation_workers import EWMA_FILES, NATIVE_THREAD_VARIABLES
 from execsim.ml.paper.forecast_ledger import EWMAForecastLedgerProvider, PaperForecastLedgerProvider
 from execsim.ml.paper.tca import run_historical_tca
 
@@ -59,7 +59,7 @@ def run_tca_work(work: TCAWork) -> Path:
     )
     identity = {
         **work.identity,
-        "schema_version": "paper-tca-date-shard-v2",
+        "schema_version": "paper-tca-date-shard-v3",
         "input_manifest_sha256": file_sha256(work.input_directory / "manifest.json"),
         "training_cutoff": work.training_cutoff.isoformat(),
         "sequence_hash": work.sequence_hash,
@@ -99,12 +99,7 @@ def run_tca_work(work: TCAWork) -> Path:
                 verified_artifact=_verified_ledger(
                     path,
                     expected,
-                    (
-                        "scale.parquet",
-                        "shape.parquet",
-                        "metrics.parquet",
-                        "minute-forecasts.parquet",
-                    ),
+                    (*EWMA_FILES,),
                 ),
             )
         return baselines[key]

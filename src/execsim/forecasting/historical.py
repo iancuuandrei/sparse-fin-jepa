@@ -15,6 +15,10 @@ from execsim.forecasting.models import VolumeForecast
 ProfileEstimator = Literal["mean", "median", "ewma", "previous"]
 
 
+class HistoricalForecastUnavailable(ValueError):
+    """The unchanged historical estimator has no eligible causal observations."""
+
+
 @dataclass(frozen=True, slots=True)
 class _HistoricalMatrix:
     volumes: NDArray[np.float64]
@@ -90,7 +94,9 @@ class HistoricalProfileForecaster:
         history = self._history_matrix(symbol, session_date)
         end = int(np.searchsorted(history.date_ordinals, session_date.toordinal(), side="left"))
         if not end:
-            raise ValueError(f"No prior sessions are available for {symbol} before {session_date}.")
+            raise HistoricalForecastUnavailable(
+                f"No prior sessions are available for {symbol} before {session_date}."
+            )
         try:
             column_indices = [history.bucket_columns[value] for value in expected_times]
         except KeyError:
@@ -103,7 +109,7 @@ class HistoricalProfileForecaster:
         )
         selected_rows = np.flatnonzero(complete)
         if not len(selected_rows):
-            raise ValueError(
+            raise HistoricalForecastUnavailable(
                 "No preceding sessions contain the complete requested forecast window."
             )
         if self.lookback_sessions is not None:
@@ -115,7 +121,9 @@ class HistoricalProfileForecaster:
         totals = totals[positive]
         selected_rows = selected_rows[positive]
         if not len(window):
-            raise ValueError("Historical profile requires at least one positive-volume session.")
+            raise HistoricalForecastUnavailable(
+                "Historical profile requires at least one positive-volume session."
+            )
         shapes = window / totals[:, None]
 
         if self.estimator == "mean":
@@ -172,7 +180,9 @@ class HistoricalProfileForecaster:
             else bars.loc[bars["symbol"].astype(str).str.upper() == cache_symbol]
         )
         if prior.empty:
-            raise ValueError(f"No prior sessions are available for {symbol} before {session_date}.")
+            raise HistoricalForecastUnavailable(
+                f"No prior sessions are available for {symbol} before {session_date}."
+            )
         session_order = (
             prior.groupby("_session_key", sort=False)["timestamp"]
             .min()

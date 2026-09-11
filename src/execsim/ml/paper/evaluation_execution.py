@@ -22,8 +22,8 @@ SCIENTIFIC_PRESERVATION = [
 ARTIFACT_SCHEMAS = {
     "base": "paper-evaluation-base-v2",
     "learned": "paper-forecast-ledger-v2",
-    "ewma": "paper-ewma-ledger-v3",
-    "tca": "paper-tca-date-shard-v2",
+    "ewma": "paper-ewma-ledger-v4",
+    "tca": "paper-tca-date-shard-v3",
 }
 
 

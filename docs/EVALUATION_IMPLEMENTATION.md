@@ -86,7 +86,7 @@ workers inherit one OpenMP/MKL/OpenBLAS/NumExpr thread. The parent environment i
 restored after the pool. Task output paths must be unique. Re-entry verifies prior
 shards and does not republish completed ones. No large frames cross process pipes.
 
-EWMA minute evidence (schema `paper-ewma-ledger-v3`) records the exact end token. Full-session forecast evaluation
+EWMA minute evidence (schema `paper-ewma-ledger-v4`) records the exact end token. Full-session forecast evaluation
 uses end token 26; TCA uses end token 24. These are separate estimator requests:
 truncating a full-session normalized historical profile does not generally equal
 estimating the shorter requested window. The fixture explicitly demonstrates this
@@ -95,6 +95,34 @@ The ledger records every intra-token minute requested by replay, including the
 original normalized shares, expected total, warnings, and cutoff. It does not
 substitute truncation for a new EWMA window. The fixture requires exact public
 forecast equality for all 15 offsets and rejects unavailable or different windows.
+
+### Unavailable history
+
+`HistoricalForecastUnavailable` is a `ValueError` subtype for no prior sessions,
+no complete prior requested windows, or no positive eligible historical volume.
+Ordinary core callers still receive an exception. Paper workers catch only this
+type and atomically publish `unavailable.parquet` with `fold_id`, `sample_id`,
+`instrument_id`, `symbol`, `session_date`, `as_of`, `end_token`, `generated_at`,
+`status=EWMA_UNAVAILABLE`, and `reason`. Availability depends only on prior data.
+Other errors remain fatal. No estimator, target, or minute observation is changed.
+
+The scale ledger retains every requested identity, with an explicit status and
+null prediction for unavailable full-session requests. Shape and metric ledgers
+contain only available full-session cases. Minute ledgers independently preserve
+available exact TCA requests; a missing full-session request cannot exclude a
+valid shorter request. Empty availability and metric artifacts are valid typed
+artifacts, not missing work. Resume verifies all five files and requires v4.
+
+TCA discards any partial simulation when a required EWMA request is unavailable
+and emits an identified unavailable row with no performance metrics. Other methods,
+balanced sides, order quantities, and market eligibility remain unchanged.
+Pairing excludes only explicitly unavailable rows and counts them as dropped;
+non-finite available metrics fail. Zero-overlap comparisons do not run bootstrap.
+
+Reporting retains forecast-unavailability, TCA-unavailability, zero-overlap, and
+all-method coverage appendices. Confirmatory dense/sparse comparisons retain their
+pair-specific sample, independent of EWMA availability. Descriptive all-method
+tables use their declared common-case population. See ADR 0023 for rationale.
 
 `forecast_ledger.PaperForecastLedgerProvider` is IMPLEMENTED in the learned TCA
 provider factory. The factory neither reconstructs model feature frames nor calls

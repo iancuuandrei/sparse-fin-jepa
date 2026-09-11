@@ -5,6 +5,7 @@ import pytest
 
 from execsim.data.paper.manifests import file_sha256
 from execsim.ml.paper.evaluation_execution import (
+    _validate_primary_jepa_source_uniformity,
     seal_evaluation_execution,
     verify_evaluation_execution,
 )
@@ -20,9 +21,65 @@ def frozen_run(tmp_path):
         path.write_text(json.dumps(value))
         return file_sha256(path)
 
+    sequence_universe_hash = "u" * 64
+    normalization_hash = "n" * 64
+    sequence_path = root / "sequences/fold-1/sequence-manifest.json"
+    sequence_path.parent.mkdir(parents=True, exist_ok=True)
+    sequence_path.write_text(json.dumps({"universe_manifest_hash": sequence_universe_hash}))
+    sequence_hash = file_sha256(sequence_path)
+
     manifests = []
     for method, seed in [("raw", None), ("untrained_neural", None), ("dense", 13), ("sparse", 13)]:
         folder = f"lightgbm/fold-1/{method}/{seed or 'shared'}"
+        embedding_hashes = {"train": None, "validation": None}
+        if seed is not None:
+            rep = f"representations/fold-1/{method}/{seed}"
+            weights = write(f"{rep}/final/model.safetensors", "immutable fixture model")
+            checkpoint_hash = write(
+                f"{rep}/final/manifest.json",
+                {
+                    "fold_id": "fold-1",
+                    "geometry": method,
+                    "seed": seed,
+                    "paper_config_hash": "fixture",
+                    "calibrated_rdm_lambda": 10.0,
+                    "code_commit": "jepa-commit",
+                    "sequence_manifest_hash": sequence_hash,
+                    "universe_manifest_hash": sequence_universe_hash,
+                    "normalization_hash": normalization_hash,
+                    "weights_sha256": weights,
+                },
+            )
+            write(f"{rep}/compatibility.json", {"sequence_manifest_hash": sequence_hash})
+            export = f"embeddings/fold-1/{method}/{seed}"
+            files = [
+                {
+                    "partition": part,
+                    "path": f"{part}.parquet",
+                    "sha256": write(f"{export}/{part}.parquet", "immutable fixture embedding"),
+                }
+                for part in ("train", "validation", "test")
+            ]
+            embedding_hashes = {
+                item["partition"]: item["sha256"]
+                for item in files
+                if item["partition"] in {"train", "validation"}
+            }
+            write(
+                f"{export}/manifest.json",
+                {
+                    "fold_id": "fold-1",
+                    "seed": seed,
+                    "geometry": method,
+                    "adaptation": "none",
+                    "checkpoint_hash": weights,
+                    "checkpoint_manifest_hash": checkpoint_hash,
+                    "sequence_manifest_hash": sequence_hash,
+                    "normalization_hash": normalization_hash,
+                    "paper_config_hash": "fixture",
+                    "files": files,
+                },
+            )
         models = [
             {"path": name, "sha256": write(f"{folder}/{name}", name)}
             for name in ("scale.txt", "shape.txt")
@@ -31,45 +88,13 @@ def frozen_run(tmp_path):
             "paper_config_hash": "fixture",
             "method": method,
             "seed": seed,
+            "sequence_manifest_hash": sequence_hash,
+            "embedding_sha256": embedding_hashes,
             "models": models,
             "grid_results_sha256": write(f"{folder}/grid-results.json", {}),
         }
         name = f"{folder}/manifest.json"
         manifests.append({"path": name, "sha256": write(name, manifest)})
-        if seed is None:
-            continue
-        rep = f"representations/fold-1/{method}/{seed}"
-        weights = write(f"{rep}/final/model.safetensors", "immutable fixture model")
-        checkpoint_hash = write(
-            f"{rep}/final/manifest.json",
-            {
-                "fold_id": "fold-1",
-                "geometry": method,
-                "seed": seed,
-                "paper_config_hash": "fixture",
-                "calibrated_rdm_lambda": 10.0,
-                "weights_sha256": weights,
-            },
-        )
-        write(f"{rep}/compatibility.json", {})
-        export = f"embeddings/fold-1/{method}/{seed}"
-        files = [
-            {
-                "partition": part,
-                "path": f"{part}.parquet",
-                "sha256": write(f"{export}/{part}.parquet", "immutable fixture embedding"),
-            }
-            for part in ("train", "validation", "test")
-        ]
-        write(
-            f"{export}/manifest.json",
-            {
-                "checkpoint_hash": weights,
-                "checkpoint_manifest_hash": checkpoint_hash,
-                "files": files,
-            },
-        )
-    write("sequences/fold-1/sequence-manifest.json", {})
     freeze_hash = write(
         "selection/parameter-freeze-v1.json",
         {
@@ -79,6 +104,7 @@ def frozen_run(tmp_path):
             "test_or_tca_used": False,
             "git_commit": "old",
             "git_tree": "old-tree",
+            "representation_source_commit": "jepa-commit",
             "lightgbm_manifests": manifests,
             "rdm_lambda_receipt_sha256": write("selection/rdm-lambda.json", {}),
             "lightgbm_execution_receipt_sha256": write("lightgbm/execution-receipt.json", {}),
@@ -227,3 +253,96 @@ def test_verified_execution_hashes_once_then_detects_changed_files(frozen_run, m
     model.write_text("changed")
     with pytest.raises(ValueError, match="changed"):
         verify_evaluation_execution(config, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("commits", "matches"),
+    [
+        (["jepa"] * 18, None),
+        (["jepa"] * 17, "exactly 18"),
+        (["jepa"] * 17 + [None], "non-empty"),
+        (["jepa"] * 17 + ["other"], "one shared"),
+    ],
+)
+def test_primary_jepa_source_uniformity_is_fail_closed(commits, matches):
+    if matches is None:
+        _validate_primary_jepa_source_uniformity(commits, expected_count=18)
+    else:
+        with pytest.raises(ValueError, match=matches):
+            _validate_primary_jepa_source_uniformity(commits, expected_count=18)
+
+
+def _reseal_fixture(config):
+    return seal_evaluation_execution(
+        config,
+        source_commit="new",
+        source_tree="new-tree",
+        supersession=config.artifact_root / "supersession.json",
+    )
+
+
+def _rewrite_fixture_json(path, payload):
+    path.write_text(json.dumps(payload))
+
+
+def test_reseal_rejects_changed_sequence_manifest_before_publishing(frozen_run):
+    sequence = frozen_run.artifact_root / "sequences/fold-1/sequence-manifest.json"
+    _rewrite_fixture_json(sequence, {"universe_manifest_hash": "u" * 64, "changed": True})
+
+    with pytest.raises(ValueError, match="sequence identity"):
+        _reseal_fixture(frozen_run)
+    assert not (frozen_run.runtime_evaluation_root / "execution.json").exists()
+
+
+def test_reseal_rejects_consistently_swapped_checkpoint_and_embedding(frozen_run):
+    root = frozen_run.artifact_root
+    checkpoint_path = root / "representations/fold-1/dense/13/final/manifest.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    weights_path = root / "representations/fold-1/dense/13/final/model.safetensors"
+    weights_path.write_text("foreign fixture model")
+    checkpoint["weights_sha256"] = file_sha256(weights_path)
+    _rewrite_fixture_json(checkpoint_path, checkpoint)
+
+    export_path = root / "embeddings/fold-1/dense/13/manifest.json"
+    export = json.loads(export_path.read_text())
+    export["checkpoint_hash"] = checkpoint["weights_sha256"]
+    export["checkpoint_manifest_hash"] = file_sha256(checkpoint_path)
+    train = root / "embeddings/fold-1/dense/13/train.parquet"
+    train.write_text("foreign fixture embedding")
+    export["files"][0]["sha256"] = file_sha256(train)
+    _rewrite_fixture_json(export_path, export)
+
+    with pytest.raises(ValueError, match="embedding checksum"):
+        _reseal_fixture(frozen_run)
+    assert not (frozen_run.runtime_evaluation_root / "execution.json").exists()
+
+
+def test_reseal_rejects_changed_train_embedding_even_with_updated_export_manifest(frozen_run):
+    root = frozen_run.artifact_root
+    export_path = root / "embeddings/fold-1/dense/13/manifest.json"
+    export = json.loads(export_path.read_text())
+    train = root / "embeddings/fold-1/dense/13/train.parquet"
+    train.write_text("changed fixture embedding")
+    export["files"][0]["sha256"] = file_sha256(train)
+    _rewrite_fixture_json(export_path, export)
+
+    with pytest.raises(ValueError, match="embedding checksum"):
+        _reseal_fixture(frozen_run)
+    assert not (frozen_run.runtime_evaluation_root / "execution.json").exists()
+
+
+def test_reseal_rejects_foreign_jepa_source_commit_before_publishing(frozen_run):
+    root = frozen_run.artifact_root
+    for method in ("dense", "sparse"):
+        checkpoint_path = root / f"representations/fold-1/{method}/13/final/manifest.json"
+        checkpoint = json.loads(checkpoint_path.read_text())
+        checkpoint["code_commit"] = "foreign-jepa-commit"
+        _rewrite_fixture_json(checkpoint_path, checkpoint)
+        export_path = root / f"embeddings/fold-1/{method}/13/manifest.json"
+        export = json.loads(export_path.read_text())
+        export["checkpoint_manifest_hash"] = file_sha256(checkpoint_path)
+        _rewrite_fixture_json(export_path, export)
+
+    with pytest.raises(ValueError, match="source commit"):
+        _reseal_fixture(frozen_run)
+    assert not (frozen_run.runtime_evaluation_root / "execution.json").exists()

@@ -182,6 +182,23 @@ two cutoffs. It also executes the real preparation/orchestration with the former
 full-corpus loader made unavailable, verifies each emitted date input, and checks
 resume and changed-cutoff rejection. Replay-worker equivalence is tested separately.
 
+Before any TCA worker is launched, the orchestrator resolves each selected
+instrument/session through the existing `resolution-aware-v2` assessor and keeps
+only `tca_window_exact` cases. An early close or an instrument-specific consumed-
+window gap removes that case only; `balanced_sides` receives the surviving
+date-level population, and dates with no surviving cases create no task. A bounded
+preflight then verifies every required learned ledger, EWMA availability ledger,
+fold/cutoff/sequence identity, exact as-of grid, and future-bucket grid. Missing or
+incompatible derived evidence aborts before replay rather than silently changing
+the scientific population. EWMA validation treats the artifact manifest as the
+fold authority (the published scale rows intentionally have no `fold_id` column)
+and scopes both `minute-forecasts.parquet` and `unavailable.parquet` to the
+current session and `end_token == 24` before checking identities and coverage.
+Preflight groups eligible dates by instrument and reuses one bounded read of each
+ledger while validating that instrument, rather than rereading the same files for
+every date. See the existing resolution-quality contract and
+`docs/ADRs/0009-separate-data-quality-by-resolution.md`.
+
 ## Evaluator reseal and isolated output namespace
 
 `execsim ml paper reseal-evaluation` accepts `--evaluation-root` and a required
@@ -244,6 +261,30 @@ interruption, unchanged reuse, changed source, corrupted output, and changed inp
 
 Historical restart remains PLANNED. Existing unit checks
 do not establish completion of these runtime stages. See ADR 0022 for rationale.
+
+Before a resealed TEST execution can consume runtime data, forecast and TCA
+stages resolve the universe and target corpus with `PaperRunConfig.data_path`.
+The runtime universe must have the exact byte hash recorded by every fold's
+sequence manifest, and all sequence manifests must agree on that identity.
+Reseal also checks the complete configured primary JEPA final inventory: every
+manifest must provide a non-empty training `code_commit`, and all coordinates
+must share one commit.  Final-result-freeze retains the same check as defense
+in depth.  For TCA, exact-window eligibility remains independent of ADV
+availability, but every eligible case must have exactly one finite, positive
+causal ADV20 row before worker launch; direct historical replay repeats this
+check and raises rather than silently dropping a case.  These are fail-closed
+identity and derived-evidence checks; they do not open TEST or change the
+frozen estimand.
+
+Reseal cross-links the immutable inventory before publishing `execution.json`.
+Each fold's sequence manifest must be the sequence named by every LightGBM
+coordinate, JEPA checkpoint, compatibility record, and embedding export.  The
+checkpoint universe identity and representation source commit must match the
+parameter freeze; embedding normalization and paper configuration identities
+must match the checkpoint; and hybrid LightGBM manifests must name the exact
+TRAIN and VALIDATION embedding bytes that are present in the export.  A
+complete but cross-coordinate-swapped artifact set is rejected before forecast
+construction.
 
 Learned inference materializes at most 2,048 scale samples and their complete
 future shape rows per wide batch. A compact embedding partition is read once per

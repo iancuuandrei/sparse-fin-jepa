@@ -26,6 +26,8 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0018](0018-stream-historical-embedding-export.md) | Accepted | Stream historical embedding export with bounded memory and atomic failure cleanup |
 | [0019](0019-freeze-observable-capacity-and-block-null.md) | Accepted | Freeze the secondary observable-capacity ladder and block-aware confirmatory null test before TEST |
 | [0020](0020-bound-lightgbm-coordinate-memory.md) | Accepted | Bound LightGBM hybrid features and coordinate lifetime on the qualified host |
+| [0025](0025-fail-closed-evaluation-input-identities.md) | Accepted | Fail closed on required ADV20 evidence and bind relocated evaluation identities before execution |
+| [0026](0026-cross-link-resealed-evaluation-artifacts.md) | Accepted | Cross-link sequence, JEPA, embedding, and frozen LightGBM identities during reseal |
 
 ## Recording a decision
 
@@ -40,6 +42,14 @@ scope once and reseal optimized downstream evaluation without changing fitted mo
 
 ADR [0021](0021-run-independent-lightgbm-folds-on-runpod.md) is accepted: run independent
 LightGBM folds on three RunPod RTX 3090 pods with verified transfer and resumable artifacts.
+
+ADR [0025](0025-fail-closed-evaluation-input-identities.md) is accepted: require
+derived ADV20 evidence, bind relocated runtime universe bytes to every sequence,
+and qualify JEPA source uniformity during reseal.
+
+ADR [0026](0026-cross-link-resealed-evaluation-artifacts.md) is accepted: reject
+ internally consistent but cross-coordinate-swapped immutable artifacts before
+ publishing a resealed execution.
 
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 

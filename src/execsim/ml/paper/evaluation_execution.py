@@ -65,6 +65,24 @@ def _safe_child(root: Path, name: str) -> Path:
     return Path(os.path.abspath(root / name))
 
 
+def _validate_primary_jepa_source_uniformity(
+    code_commits: list[object], *, expected_count: int
+) -> None:
+    """Require the configured primary JEPA matrix to come from one source commit."""
+    if len(code_commits) != expected_count:
+        raise ValueError(
+            "Frozen JEPA primary inventory must contain exactly "
+            f"{expected_count} final manifests; found {len(code_commits)}."
+        )
+    normalized = []
+    for value in code_commits:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Frozen JEPA final manifest is missing a non-empty code_commit.")
+        normalized.append(value.strip())
+    if len(set(normalized)) != 1:
+        raise ValueError("Frozen JEPA primary final manifests must have one shared code_commit.")
+
+
 def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
     """Hash the exact configured model matrix and verify its original checksum links."""
     root = config.artifact_root.resolve()
@@ -100,12 +118,32 @@ def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
         or ready.get("parameter_freeze_sha256") != inventory["selection/parameter-freeze-v1.json"]
     ):
         raise ValueError("Original TEST authorization identity mismatch.")
+    representation_source_commit = freeze.get("representation_source_commit")
+    if (
+        not isinstance(representation_source_commit, str)
+        or not representation_source_commit.strip()
+    ):
+        raise ValueError("Parameter-selection freeze is missing representation source identity.")
+    representation_source_commit = representation_source_commit.strip()
     records = freeze["lightgbm_manifests"]
     recorded = {record["path"]: record["sha256"] for record in records}
     expected_paths = set()
+    primary_jepa_code_commits: list[object] = []
+    configured_primary_count = sum(
+        1
+        for _fold in config.evaluation["folds"]
+        for _geometry in ("dense", "sparse")
+        for _seed in config.representation["seeds"]
+    )
     for fold in config.evaluation["folds"]:
         fold_id = str(fold["id"])
-        bind(root / "sequences" / fold_id / "sequence-manifest.json")
+        sequence_path = root / "sequences" / fold_id / "sequence-manifest.json"
+        sequence = bind(sequence_path)
+        sequence_key = Path(os.path.abspath(sequence_path)).relative_to(root).as_posix()
+        sequence_hash = inventory[sequence_key]
+        sequence_universe_hash = sequence.get("universe_manifest_hash")
+        if not isinstance(sequence_universe_hash, str) or not sequence_universe_hash:
+            raise ValueError("Frozen sequence manifest is missing universe identity.")
         variants: list[tuple[str, int | None]] = [("raw", None), ("untrained_neural", None)]
         variants.extend(
             (geometry, int(seed))
@@ -123,8 +161,9 @@ def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
                 manifest.get("paper_config_hash") != config.config_hash
                 or manifest.get("method") != method
                 or manifest.get("seed") != seed
+                or manifest.get("sequence_manifest_hash") != sequence_hash
             ):
-                raise ValueError("LightGBM coordinate identity mismatch.")
+                raise ValueError("LightGBM coordinate or sequence identity mismatch.")
             if len(manifest["models"]) != 2 or {
                 record["path"] for record in manifest["models"]
             } != {"scale.txt", "shape.txt"}:
@@ -138,6 +177,7 @@ def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
             embedding = root / "embeddings" / fold_id / method / str(seed)
             export = bind(embedding / "manifest.json")
             checkpoint = bind(rep / "final/manifest.json", export["checkpoint_manifest_hash"])
+            primary_jepa_code_commits.append(checkpoint.get("code_commit"))
             if (
                 checkpoint.get("geometry") != method
                 or checkpoint.get("seed") != seed
@@ -147,18 +187,46 @@ def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
                 or export.get("checkpoint_hash") != checkpoint.get("weights_sha256")
             ):
                 raise ValueError("Frozen JEPA/export coordinate identity mismatch.")
+            if checkpoint.get("sequence_manifest_hash") != sequence_hash:
+                raise ValueError("Frozen JEPA checkpoint sequence identity mismatch.")
+            if checkpoint.get("universe_manifest_hash") != sequence_universe_hash:
+                raise ValueError("Frozen JEPA checkpoint universe identity mismatch.")
+            if checkpoint.get("code_commit") != representation_source_commit:
+                raise ValueError("Frozen JEPA checkpoint source commit mismatch.")
+            if export.get("sequence_manifest_hash") != sequence_hash:
+                raise ValueError("Frozen embedding export sequence identity mismatch.")
+            if export.get("normalization_hash") != checkpoint.get("normalization_hash"):
+                raise ValueError("Frozen embedding export normalization identity mismatch.")
+            if export.get("paper_config_hash") != config.config_hash:
+                raise ValueError("Frozen embedding export paper configuration mismatch.")
             bind(rep / "final/model.safetensors", checkpoint["weights_sha256"])
-            bind(rep / "compatibility.json")
+            compatibility = bind(rep / "compatibility.json")
+            if compatibility.get("sequence_manifest_hash") != sequence_hash:
+                raise ValueError("Frozen JEPA compatibility sequence identity mismatch.")
             if len(export["files"]) != 3 or {item["partition"] for item in export["files"]} != {
                 "train",
                 "validation",
                 "test",
             }:
                 raise ValueError("Embedding export partition inventory mismatch.")
+            embedding_hashes: dict[str, str] = {}
             for item in export["files"]:
-                bind(_safe_child(embedding, item["path"]), item["sha256"])
+                partition = item["partition"]
+                path = _safe_child(embedding, item["path"])
+                bind(path, item["sha256"])
+                relative_path = Path(os.path.abspath(path)).relative_to(root).as_posix()
+                embedding_hashes[partition] = inventory[relative_path]
+            recorded_embeddings = manifest.get("embedding_sha256")
+            if not isinstance(recorded_embeddings, dict) or any(
+                recorded_embeddings.get(partition) != embedding_hashes.get(partition)
+                for partition in ("train", "validation")
+            ):
+                raise ValueError("Frozen LightGBM embedding checksum mismatch.")
     if len(recorded) != len(records) or set(recorded) != expected_paths:
         raise ValueError("Frozen LightGBM matrix contains extra or duplicated coordinates.")
+    _validate_primary_jepa_source_uniformity(
+        primary_jepa_code_commits, expected_count=configured_primary_count
+    )
     return dict(sorted(inventory.items()))
 
 

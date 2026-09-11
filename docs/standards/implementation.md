@@ -258,3 +258,28 @@ This standard adopts broadly applicable guidance from these official sources:
 - [GitHub Docs content design principles](https://docs.github.com/en/contributing/writing-for-github-docs/content-design-principles)
 - [GitHub Docs style guide](https://docs.github.com/en/contributing/style-guide-and-content-model/style-guide)
 - [GitHub guidance for repository README files](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes)
+
+### 2026-09-11 — pre-evaluation identity hardening (ADR 0025)
+
+The locked evaluator now treats causal ADV20 as required derived evidence for
+every exact-window eligible instrument/session.  Validation occurs before TCA
+workers and is repeated at the direct replay boundary; missing, duplicate,
+non-finite, or non-positive values fail closed rather than changing the sample.
+Forecast and TCA stages resolve relocated runtime data through the canonical
+`PaperRunConfig.data_path` abstraction.  Before consuming TEST inputs they bind
+the runtime universe bytes to one shared `universe_manifest_hash` recorded by
+every fold sequence manifest.  Reseal now validates the complete configured
+primary JEPA final inventory and requires one non-empty training `code_commit`
+across all coordinates, before publishing a new execution namespace.  These
+checks are identity/provenance safeguards only and do not alter scientific
+configuration, estimands, or model artifacts.  See ADR 0025.
+
+### 2026-09-12 — cross-link resealed evaluation artifacts (ADR 0026)
+
+Reseal must verify the existing identity links between each fold sequence
+manifest, JEPA checkpoint, compatibility record, embedding export, and frozen
+LightGBM coordinate.  Independent file checksums do not prove that a complete
+artifact set was trained from the same sequence, universe, representation
+source, and TRAIN/VALIDATION embedding bytes.  Cross-link checks run before
+`execution.json` publication and preserve all scientific inputs and estimands.
+See ADR 0026.

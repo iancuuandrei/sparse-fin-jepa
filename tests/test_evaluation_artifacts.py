@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from execsim.data.paper.manifests import file_sha256
 from execsim.ml.paper.evaluation_artifacts import (
     evaluation_base,
     forecast_metric_frame,
@@ -208,6 +211,7 @@ def test_forecast_stage_builds_one_base_and_resumes_published_predictions(
         '{"members": [{"instrument_id": "A", "liquidity_group": 1},'
         '{"instrument_id": "B", "liquidity_group": 2}]}'
     )
+    sequence.write_text('{"universe_manifest_hash": "' + file_sha256(universe) + '"}')
     for method in ("raw", "untrained_neural"):
         path = tmp_path / "lightgbm/fold-1" / method / "shared/manifest.json"
         path.parent.mkdir(parents=True)
@@ -220,6 +224,7 @@ def test_forecast_stage_builds_one_base_and_resumes_published_predictions(
         evaluation={"folds": [{"id": "fold-1"}]},
         representation={"seeds": []},
     )
+    config.data_path = lambda name: Path(config.data[name])
     if isolated:
         config.runtime_evaluation_root = tmp_path / "evaluation-executions" / "fixture"
     calls = []
@@ -273,6 +278,59 @@ def test_forecast_stage_builds_one_base_and_resumes_published_predictions(
     assert calls == ["build", "predict", "predict"]
     if isolated:
         assert not (tmp_path / "evaluation-v2").exists()
+
+
+def test_locked_runtime_universe_is_relocated_and_hash_bound(tmp_path):
+    from types import SimpleNamespace
+
+    from execsim.ml.paper.orchestration import _verify_frozen_universe_manifest
+
+    runtime_root = tmp_path / "runtime-data"
+    runtime_universe = runtime_root / "universe.json"
+    runtime_universe.parent.mkdir(parents=True)
+    runtime_universe.write_text('{"members": [{"instrument_id": "A"}]}')
+    artifact_root = tmp_path / "artifacts"
+    sequence = artifact_root / "sequences/fold-1/sequence-manifest.json"
+    sequence.parent.mkdir(parents=True)
+    sequence.write_text('{"universe_manifest_hash": "' + file_sha256(runtime_universe) + '"}')
+    config = SimpleNamespace(
+        artifact_root=artifact_root,
+        data={"universe_manifest": "data/universe.json"},
+        evaluation={"folds": [{"id": "fold-1"}]},
+    )
+    config.data_path = lambda name: runtime_root / Path(*Path(config.data[name]).parts[1:])
+
+    resolved = _verify_frozen_universe_manifest(config)
+    assert resolved == runtime_universe
+    assert not (tmp_path / "repo/data/universe.json").exists()
+
+    runtime_universe.write_text('{"members": [{"instrument_id": "B"}]}')
+    with pytest.raises(ValueError, match="checksum"):
+        _verify_frozen_universe_manifest(config)
+
+
+def test_locked_runtime_universe_requires_one_hash_across_all_folds(tmp_path):
+    from types import SimpleNamespace
+
+    from execsim.ml.paper.orchestration import _verify_frozen_universe_manifest
+
+    runtime_root = tmp_path / "runtime-data"
+    universe = runtime_root / "universe.json"
+    universe.parent.mkdir(parents=True)
+    universe.write_text('{"members": [{"instrument_id": "A"}]}')
+    artifact_root = tmp_path / "artifacts"
+    for fold_id, digest in (("fold-1", file_sha256(universe)), ("fold-2", "0" * 64)):
+        sequence = artifact_root / "sequences" / fold_id / "sequence-manifest.json"
+        sequence.parent.mkdir(parents=True, exist_ok=True)
+        sequence.write_text('{"universe_manifest_hash": "' + digest + '"}')
+    config = SimpleNamespace(
+        artifact_root=artifact_root,
+        data={"universe_manifest": "data/universe.json"},
+        evaluation={"folds": [{"id": "fold-1"}, {"id": "fold-2"}]},
+    )
+    config.data_path = lambda name: runtime_root / Path(*Path(config.data[name]).parts[1:])
+    with pytest.raises(ValueError, match="one universe manifest identity"):
+        _verify_frozen_universe_manifest(config)
 
 
 @pytest.mark.parametrize(

@@ -1397,7 +1397,8 @@ def evaluate_forecasts_stage(
         run_ewma_workers,
     )
 
-    universe = read_json(Path(config.data["universe_manifest"]))
+    universe_path = _verify_frozen_universe_manifest(config)
+    universe = read_json(universe_path)
     liquidity = {
         str(member["instrument_id"]): int(member["liquidity_group"])
         for member in universe["members"]
@@ -1411,7 +1412,7 @@ def evaluate_forecasts_stage(
         ),
     }
     market_inputs = compact_profile_corpus(
-        Path(config.data["target_corpus_root"]),
+        config.data_path("target_corpus_root"),
         evaluation_root(config) / "evaluation-v2" / "profile-corpus",
         identity=execution_identity,
     )
@@ -1855,8 +1856,18 @@ def run_tca_stage(
         instrument_key,
     )
     from execsim.ml.paper.tca import select_liquidity_spaced_instruments
-    from execsim.ml.paper.tca_inputs import prepare_tca_history, read_tca_date
-    from execsim.ml.paper.tca_workers import TCAWork, run_tca_workers
+    from execsim.ml.paper.tca_inputs import (
+        filter_tca_window_exact,
+        prepare_tca_history,
+        read_tca_date,
+        tca_eligible_instrument_ids,
+        validate_tca_adv20,
+    )
+    from execsim.ml.paper.tca_workers import (
+        TCAWork,
+        preflight_tca_ledgers,
+        run_tca_workers,
+    )
 
     execution = {
         "source_commit": _git_head(),
@@ -1875,52 +1886,11 @@ def run_tca_stage(
     market_profiles = {
         key: profile_root / name for key, name in profile_receipt["instruments"].items()
     }
-    universe = pd.DataFrame(read_json(Path(config.data["universe_manifest"]))["members"])
-    instruments = set(
-        select_liquidity_spaced_instruments(universe, size=int(config.tca["universe_size"]))
-    ) | set(
-        select_liquidity_spaced_instruments(
-            universe, size=int(config.tca["sensitivity_universe_size"])
-        )
-    )
-    market = compact_profile_corpus(
-        source or Path(config.data["target_corpus_root"]),
-        evaluation_root(config) / "evaluation-v2" / "tca-market",
-        identity=execution,
-        include_market_bars=True,
-        selected_instruments=tuple(sorted(instruments)),
-    )
-    market_manifest = evaluation_root(config) / "evaluation-v2" / "tca-market" / "manifest.json"
-    if (
-        read_json(market_manifest)["identity"]["source_inventory_sha256"]
-        != profile_identity["source_inventory_sha256"]
-    ):
-        raise ValueError("TCA and forecast ledgers require the same immutable source corpus.")
-    histories = {
-        instrument: prepare_tca_history(
-            market[instrument],
-            evaluation_root(config) / "evaluation-v2" / "tca-history" / instrument_key(instrument),
-            instrument_id=instrument,
-            cutoffs={
-                str(fold["id"]): pd.Timestamp(fold["train"][1]).date()
-                for fold in config.evaluation["folds"]
-            },
-            identity=execution,
-        )
-        for instrument in sorted(instruments)
-    }
-    dates = sorted(
-        {
-            pd.Timestamp(day).date()
-            for history in histories.values()
-            for day in pd.read_parquet(history / "sessions.parquet")["session_date"]
-        }
-    )
-    main_outputs, sensitivity_outputs = [], []
-    for fold in config.evaluation["folds"]:
+
+    def fold_context(fold: dict[str, Any]) -> dict[str, Any]:
+        """Resolve immutable ledger paths and fold bounds once for both passes."""
         fold_id = str(fold["id"])
         start, end = (pd.Timestamp(value).date() for value in fold["test"])
-        sequence = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
         variants = [
             ("raw", None),
             ("untrained_neural", None),
@@ -1959,7 +1929,97 @@ def run_tca_stage(
                 {**execution, "fold_id": fold_id},
             )
             ewma_records[instrument] = (work.output_directory, ewma_ledger_identity(work))
-        cutoff = pd.Timestamp(fold["train"][1]).date()
+        return {
+            "fold_id": fold_id,
+            "start": start,
+            "end": end,
+            "sequence": config.artifact_root / "sequences" / fold_id / "sequence-manifest.json",
+            "ledgers": ledgers,
+            "ewma_records": ewma_records,
+            "cutoff": pd.Timestamp(fold["train"][1]).date(),
+        }
+
+    universe_path = _verify_frozen_universe_manifest(config)
+    universe = pd.DataFrame(read_json(universe_path)["members"])
+    instruments = set(
+        select_liquidity_spaced_instruments(universe, size=int(config.tca["universe_size"]))
+    ) | set(
+        select_liquidity_spaced_instruments(
+            universe, size=int(config.tca["sensitivity_universe_size"])
+        )
+    )
+    market = compact_profile_corpus(
+        source or config.data_path("target_corpus_root"),
+        evaluation_root(config) / "evaluation-v2" / "tca-market",
+        identity=execution,
+        include_market_bars=True,
+        selected_instruments=tuple(sorted(instruments)),
+    )
+    market_manifest = evaluation_root(config) / "evaluation-v2" / "tca-market" / "manifest.json"
+    if (
+        read_json(market_manifest)["identity"]["source_inventory_sha256"]
+        != profile_identity["source_inventory_sha256"]
+    ):
+        raise ValueError("TCA and forecast ledgers require the same immutable source corpus.")
+    histories = {
+        instrument: prepare_tca_history(
+            market[instrument],
+            evaluation_root(config) / "evaluation-v2" / "tca-history" / instrument_key(instrument),
+            instrument_id=instrument,
+            cutoffs={
+                str(fold["id"]): pd.Timestamp(fold["train"][1]).date()
+                for fold in config.evaluation["folds"]
+            },
+            identity=execution,
+        )
+        for instrument in sorted(instruments)
+    }
+    dates = sorted(
+        {
+            pd.Timestamp(day).date()
+            for history in histories.values()
+            for day in pd.read_parquet(history / "sessions.parquet")["session_date"]
+        }
+    )
+    fold_contexts = {str(fold["id"]): fold_context(fold) for fold in config.evaluation["folds"]}
+    # Resolve the scientific population and validate every required ledger before
+    # constructing or launching any expensive date worker.
+    eligible_by_fold: dict[str, dict[date, tuple[str, ...]]] = {}
+    for fold in config.evaluation["folds"]:
+        context = fold_contexts[str(fold["id"])]
+        fold_id = str(context["fold_id"])
+        start = context["start"]
+        end = context["end"]
+        eligible_cases: dict[date, tuple[str, ...]] = {}
+        for day in dates:
+            if not start <= day <= end:
+                continue
+            date_bars, date_adv = read_tca_date(histories, day)
+            eligible = tca_eligible_instrument_ids(date_bars, instruments)
+            if eligible:
+                # Validate required derived evidence before ledger preflight or
+                # construction/launch of any TCA worker.
+                validate_tca_adv20(date_adv, {day: eligible})
+                eligible_cases[day] = eligible
+        preflight_tca_ledgers(
+            ledger_records=context["ledgers"],
+            ewma_records=context["ewma_records"],
+            eligible_cases=eligible_cases,
+            training_cutoff=context["cutoff"],
+            tca_config=config.tca,
+        )
+        eligible_by_fold[fold_id] = eligible_cases
+
+    main_outputs, sensitivity_outputs = [], []
+    for fold in config.evaluation["folds"]:
+        context = fold_contexts[str(fold["id"])]
+        fold_id = str(context["fold_id"])
+        start = context["start"]
+        end = context["end"]
+        sequence = context["sequence"]
+        ledgers = context["ledgers"]
+        ewma_records = context["ewma_records"]
+        cutoff = context["cutoff"]
         profiles = pd.concat(
             [
                 pd.read_parquet(path / "profiles.parquet", filters=[("fold_id", "==", fold_id)])
@@ -1969,9 +2029,16 @@ def run_tca_stage(
         ).drop(columns="fold_id")
         tasks = []
         for day in dates:
-            if not start <= day <= end:
+            if not start <= day <= end or day not in eligible_by_fold[fold_id]:
                 continue
             date_bars, date_adv = read_tca_date(histories, day)
+            eligible_instruments = set(eligible_by_fold[fold_id][day])
+            date_bars = filter_tca_window_exact(date_bars, eligible_instruments)
+            date_adv = date_adv.loc[
+                date_adv["instrument_id"].astype(str).isin(eligible_instruments)
+            ].reset_index(drop=True)
+            if date_bars.empty:
+                continue
             identity = {
                 **execution,
                 "fold_id": fold_id,
@@ -3036,6 +3103,38 @@ def _is_frozen_universe(path: Path, *, config_hash: str) -> bool:
     )
 
 
+def _verify_frozen_universe_manifest(config: PaperRunConfig) -> Path:
+    """Bind relocated runtime universe bytes to every fold's frozen sequence identity.
+
+    The universe controls liquidity groups and therefore the locked evaluation
+    population.  Sequence manifests are immutable upstream evidence; a
+    relocated evaluator must consume exactly the byte-identical manifest they
+    reference, never a similarly named repository-relative file.
+    """
+    universe_path = config.data_path("universe_manifest")
+    if not universe_path.is_file():
+        raise RuntimeError(f"BLOCKED: runtime universe manifest is unavailable: {universe_path}")
+    expected_hashes: list[str] = []
+    for fold in config.evaluation["folds"]:
+        fold_id = str(fold["id"])
+        sequence_path = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
+        if not sequence_path.is_file():
+            raise RuntimeError(f"BLOCKED: frozen sequence manifest is unavailable: {sequence_path}")
+        sequence = read_json(sequence_path)
+        expected = sequence.get("universe_manifest_hash")
+        if not isinstance(expected, str) or not expected:
+            raise ValueError(f"Sequence manifest has no universe identity: {sequence_path}")
+        expected_hashes.append(expected)
+    if not expected_hashes or len(set(expected_hashes)) != 1:
+        raise ValueError("Frozen sequence manifests do not share one universe manifest identity.")
+    actual = file_sha256(universe_path)
+    if actual != expected_hashes[0]:
+        raise ValueError(
+            "Runtime universe manifest checksum does not match the frozen sequence identity."
+        )
+    return universe_path
+
+
 def _as_date(value: object) -> date:
     """Normalize YAML date scalars and ISO strings."""
     if isinstance(value, date):
@@ -3436,11 +3535,21 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
     if not result_files:
         raise RuntimeError("BLOCKED: final historical result bundle is empty.")
     representation_manifests = sorted(representation_root(config).glob("*/*/*/final/manifest.json"))
-    representation_commits = {
-        str(read_json(path).get("code_commit")) for path in representation_manifests
-    }
-    if len(representation_manifests) != 18 or len(representation_commits) != 1:
+    representation_commits = [
+        read_json(path).get("code_commit") for path in representation_manifests
+    ]
+    normalized_representation_commits = [
+        commit.strip()
+        for commit in representation_commits
+        if isinstance(commit, str) and commit.strip()
+    ]
+    if (
+        len(representation_manifests) != 18
+        or len(normalized_representation_commits) != len(representation_manifests)
+        or len(set(normalized_representation_commits)) != 1
+    ):
         raise RuntimeError("BLOCKED: representation source identity is not uniquely frozen.")
+    representation_source_commit = normalized_representation_commits[0]
     lightgbm_manifests = sorted((config.artifact_root / "lightgbm").glob("*/*/*/manifest.json"))
     if len(lightgbm_manifests) != 24:
         raise RuntimeError("BLOCKED: final result freeze requires 24 LightGBM manifests.")
@@ -3448,7 +3557,7 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
         "schema_version": "paper-final-result-freeze-v1",
         "status": "FINAL-RESULTS-FROZEN",
         "frozen_at_utc": datetime.now(UTC).isoformat(),
-        "representation_source_commit": representation_commits.pop(),
+        "representation_source_commit": representation_source_commit,
         "downstream_evaluation_commit": _git_head(),
         "downstream_evaluation_tree": _git_tree(),
         "paper_config_hash": config.config_hash,

@@ -14,9 +14,10 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
     frames = []
     for index, day in enumerate(pd.bdate_range("2024-01-02", periods=35)):
         for instrument in ("A", "B", "unused"):
+            periods = 210 if day.date() == date(2024, 2, 8) else 390
             stamps = pd.date_range(
                 day + pd.Timedelta(hours=9, minutes=30),
-                periods=390,
+                periods=periods,
                 freq="min",
                 tz="America/New_York",
             )
@@ -26,7 +27,7 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
                         "instrument_id": instrument,
                         "symbol": instrument,
                         "timestamp": stamps,
-                        "volume": 1000.0 + index * (np.arange(390) % 15 + 1),
+                        "volume": 1000.0 + index * (np.arange(periods) % 15 + 1),
                         "open": 100.0,
                         "high": 101.0,
                         "low": 99.0,
@@ -133,7 +134,7 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
     )
     sequence = root / "sequences/fold-1/sequence-manifest.json"
     sequence.parent.mkdir(parents=True)
-    sequence.write_text("{}")
+    sequence.write_text(json.dumps({"universe_manifest_hash": file_sha256(universe)}))
     execution = {
         "source_commit": "fixture",
         "source_tree": "fixture",
@@ -160,6 +161,7 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
             ]
         },
     )
+    config.data_path = lambda name: Path(config.data[name])
     base = root / "evaluation-v2/bases/fold-1"
     base.mkdir(parents=True)
     (base / "manifest.json").write_text("{}")
@@ -205,6 +207,11 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
         return [task.output_directory for task in tasks]
 
     monkeypatch.setattr("execsim.ml.paper.tca_workers.run_tca_workers", workers)
+    # This fixture isolates corpus/date slicing; ledger preflight has its own
+    # fail-closed regression tests and is not populated by this small harness.
+    monkeypatch.setattr("execsim.ml.paper.tca_workers.preflight_tca_ledgers", lambda **kwargs: None)
     result = orchestration.run_tca_stage(config, full_run_cli_enabled=True, runtime_approval=None)
     assert result["status"] == "SOFTWARE READY"
-    assert seen == [date(2024, 2, 7), date(2024, 2, 8), date(2024, 2, 9)]
+    # The production orchestrator must exclude the early-close date before
+    # constructing a worker task; valid dates remain unchanged.
+    assert seen == [date(2024, 2, 7), date(2024, 2, 9)]

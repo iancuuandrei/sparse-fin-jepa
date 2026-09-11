@@ -72,10 +72,16 @@ def _validate_learned_case(
     fold_id: str,
     training_cutoff: date,
     origins: tuple[int, ...],
+    scale_frame: pd.DataFrame | None = None,
+    shape_frame: pd.DataFrame | None = None,
 ) -> None:
     """Verify every learned ledger row and future bucket needed by TCA."""
-    scale = pd.read_parquet(
-        directory / "scale.parquet", filters=[("instrument_id", "==", instrument_id)]
+    scale = (
+        scale_frame.copy()
+        if scale_frame is not None
+        else pd.read_parquet(
+            directory / "scale.parquet", filters=[("instrument_id", "==", instrument_id)]
+        )
     )
     required = {
         "sample_id",
@@ -106,8 +112,15 @@ def _validate_learned_case(
     if not (pd.to_datetime(scale["training_cutoff"]).dt.date == training_cutoff).all():
         raise ValueError("TCA preflight found a learned ledger cutoff mismatch.")
     sample_ids = scale["sample_id"].astype(str).tolist()
-    shape = pd.read_parquet(directory / "shape.parquet", filters=[("case_id", "in", sample_ids)])
     shape_required = {"case_id", "target_bucket", "conditional_share"}
+    if shape_frame is not None and shape_required.difference(shape_frame.columns):
+        missing = shape_required.difference(shape_frame.columns)
+        raise ValueError(f"TCA learned shape is missing columns: {sorted(missing)}")
+    shape = (
+        shape_frame.loc[shape_frame["case_id"].astype(str).isin(sample_ids)].copy()
+        if shape_frame is not None
+        else pd.read_parquet(directory / "shape.parquet", filters=[("case_id", "in", sample_ids)])
+    )
     if missing := shape_required.difference(shape.columns):
         raise ValueError(f"TCA learned shape is missing columns: {sorted(missing)}")
     if shape.empty or shape[["case_id", "target_bucket"]].astype(str).duplicated().any():
@@ -132,10 +145,18 @@ def _validate_ewma_case(
     session_date: date,
     fold_id: str,
     origins: tuple[int, ...],
+    scale_frame: pd.DataFrame | None = None,
+    available_frame: pd.DataFrame | None = None,
+    unavailable_frame: pd.DataFrame | None = None,
 ) -> None:
     """Verify every exact EWMA minute request is available or explicitly unavailable."""
-    scale = pd.read_parquet(directory / "scale.parquet")
-    required = {"sample_id", "instrument_id", "symbol", "fold_id", "session_date", "as_of"}
+    del fold_id  # The artifact manifest is the authoritative fold identity.
+    scale = (
+        scale_frame.copy()
+        if scale_frame is not None
+        else pd.read_parquet(directory / "scale.parquet")
+    )
+    required = {"sample_id", "instrument_id", "symbol", "session_date", "as_of"}
     if missing := required.difference(scale.columns):
         raise ValueError(f"TCA EWMA scale is missing columns: {sorted(missing)}")
     scale_dates = pd.to_datetime(scale["session_date"], errors="coerce")
@@ -149,8 +170,6 @@ def _validate_ewma_case(
         raise ValueError("TCA preflight found missing or duplicate EWMA as-of rows.")
     if not set(origins).issubset(set(scale["as_of"].astype(int))):
         raise ValueError("TCA preflight found an incomplete EWMA as-of grid.")
-    if not scale["fold_id"].astype(str).eq(fold_id).all():
-        raise ValueError("TCA preflight found an EWMA ledger fold mismatch.")
     if scale["symbol"].astype(str).nunique() != 1:
         raise ValueError("TCA preflight found an EWMA symbol identity mismatch.")
     opened = pd.Timestamp.combine(session_date, time(9, 30)).tz_localize("America/New_York")
@@ -165,15 +184,39 @@ def _validate_ewma_case(
         if int(row.as_of) in origins
         for offset in range(15)
     }
-    available = pd.read_parquet(
-        directory / "minute-forecasts.parquet", columns=["sample_id", "generated_at", "end_token"]
+    available = (
+        available_frame.copy()
+        if available_frame is not None
+        else pd.read_parquet(
+            directory / "minute-forecasts.parquet",
+            columns=["sample_id", "generated_at", "end_token"],
+        )
     )
+    available_required = {"sample_id", "generated_at", "end_token"}
+    if missing := available_required.difference(available.columns):
+        raise ValueError(f"TCA EWMA minute forecasts are missing columns: {sorted(missing)}")
     available = available.loc[available["end_token"].eq(24)].copy()
-    unavailable = pd.read_parquet(
-        directory / "unavailable.parquet",
-        columns=["sample_id", "generated_at", "end_token", "status"],
+    unavailable = (
+        unavailable_frame.copy()
+        if unavailable_frame is not None
+        else pd.read_parquet(directory / "unavailable.parquet")
     )
-    unavailable = unavailable.loc[unavailable["end_token"].eq(24)].copy()
+    unavailable_required = {"sample_id", "generated_at", "end_token", "status", "session_date"}
+    if missing := unavailable_required.difference(unavailable.columns):
+        raise ValueError(f"TCA EWMA unavailable ledger is missing columns: {sorted(missing)}")
+    unavailable_dates = pd.to_datetime(unavailable["session_date"], errors="coerce")
+    if unavailable_dates.isna().any():
+        raise ValueError("TCA preflight found invalid EWMA unavailable session dates.")
+    unavailable = unavailable.loc[
+        unavailable["end_token"].eq(24) & unavailable_dates.dt.date.eq(session_date)
+    ].copy()
+    if not available.empty:
+        available_dates = pd.to_datetime(available["generated_at"], errors="coerce")
+        if available_dates.isna().any() or available_dates.dt.tz is None:
+            raise ValueError("TCA preflight found invalid EWMA generated-at timestamps.")
+        available = available.loc[
+            available_dates.dt.tz_convert("America/New_York").dt.date.eq(session_date)
+        ].copy()
     available_generated = pd.to_datetime(available["generated_at"], errors="coerce")
     unavailable_generated = pd.to_datetime(unavailable["generated_at"], errors="coerce")
     if available_generated.isna().any() or unavailable_generated.isna().any():
@@ -215,10 +258,31 @@ def preflight_tca_ledgers(
     origins = _tca_as_of_origins(tca_config)
     if not ledger_records:
         raise ValueError("TCA preflight requires learned forecast ledger records.")
+
+    # Keep one bounded in-memory view per instrument while validating all of its
+    # eligible dates.  The ledgers are immutable and checksum-bound below, so
+    # rereading them for every date would add latency without adding assurance.
+    eligible_by_instrument: dict[str, list[date]] = {}
+    for session_date, instruments in sorted(eligible_cases.items()):
+        for instrument_id in sorted(set(instruments)):
+            eligible_by_instrument.setdefault(str(instrument_id), []).append(session_date)
+
     for _, _, directory, identity in ledger_records:
         verify_artifact(directory, identity=identity, names=LEARNED_LEDGER_FILES)
-        for session_date, instruments in sorted(eligible_cases.items()):
-            for instrument_id in instruments:
+        for instrument_id, session_dates in eligible_by_instrument.items():
+            scale = pd.read_parquet(
+                directory / "scale.parquet", filters=[("instrument_id", "==", instrument_id)]
+            )
+            # Avoid an empty ``in`` predicate (which some Arrow versions reject)
+            # while still letting the validator issue the authoritative error.
+            if "sample_id" in scale.columns and not scale.empty:
+                sample_ids = scale["sample_id"].astype(str).drop_duplicates().tolist()
+                shape = pd.read_parquet(
+                    directory / "shape.parquet", filters=[("case_id", "in", sample_ids)]
+                )
+            else:
+                shape = pd.DataFrame(columns=["case_id", "target_bucket", "conditional_share"])
+            for session_date in session_dates:
                 _validate_learned_case(
                     directory,
                     instrument_id=instrument_id,
@@ -226,22 +290,35 @@ def preflight_tca_ledgers(
                     fold_id=str(identity["fold_id"]),
                     training_cutoff=training_cutoff,
                     origins=origins,
+                    scale_frame=scale,
+                    shape_frame=shape,
                 )
+
     verified_ewma: set[Path] = set()
-    for session_date, instruments in sorted(eligible_cases.items()):
-        for instrument_id in instruments:
-            if instrument_id not in ewma_records:
-                raise ValueError("TCA preflight is missing an EWMA ledger record.")
-            directory, identity = ewma_records[instrument_id]
-            if directory.resolve() not in verified_ewma:
-                verify_artifact(directory, identity=identity, names=EWMA_FILES)
-                verified_ewma.add(directory.resolve())
+    for instrument_id, session_dates in eligible_by_instrument.items():
+        if instrument_id not in ewma_records:
+            raise ValueError("TCA preflight is missing an EWMA ledger record.")
+        directory, identity = ewma_records[instrument_id]
+        resolved = directory.resolve()
+        if resolved not in verified_ewma:
+            verify_artifact(directory, identity=identity, names=EWMA_FILES)
+            verified_ewma.add(resolved)
+        scale = pd.read_parquet(directory / "scale.parquet")
+        available = pd.read_parquet(
+            directory / "minute-forecasts.parquet",
+            columns=["sample_id", "generated_at", "end_token"],
+        )
+        unavailable = pd.read_parquet(directory / "unavailable.parquet")
+        for session_date in session_dates:
             _validate_ewma_case(
                 directory,
                 instrument_id=instrument_id,
                 session_date=session_date,
                 fold_id=str(identity["fold_id"]),
                 origins=origins,
+                scale_frame=scale,
+                available_frame=available,
+                unavailable_frame=unavailable,
             )
 
 

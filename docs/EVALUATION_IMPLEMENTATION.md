@@ -190,7 +190,13 @@ date-level population, and dates with no surviving cases create no task. A bound
 preflight then verifies every required learned ledger, EWMA availability ledger,
 fold/cutoff/sequence identity, exact as-of grid, and future-bucket grid. Missing or
 incompatible derived evidence aborts before replay rather than silently changing
-the scientific population. See the existing resolution-quality contract and
+the scientific population. EWMA validation treats the artifact manifest as the
+fold authority (the published scale rows intentionally have no `fold_id` column)
+and scopes both `minute-forecasts.parquet` and `unavailable.parquet` to the
+current session and `end_token == 24` before checking identities and coverage.
+Preflight groups eligible dates by instrument and reuses one bounded read of each
+ledger while validating that instrument, rather than rereading the same files for
+every date. See the existing resolution-quality contract and
 `docs/ADRs/0009-separate-data-quality-by-resolution.md`.
 
 ## Evaluator reseal and isolated output namespace

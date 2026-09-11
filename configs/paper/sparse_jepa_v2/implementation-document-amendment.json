@@ -35,7 +35,7 @@
     },
     "docs/standards/implementation.md": {
       "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
-      "current_sha256": "399de24cde922fba11ea45724a086158e4fdce92bbff710d190fea7faef50b82",
+      "current_sha256": "d3a50218c7b40c8fc9538b039aeb7055bdae2d15df70d351e0aa54744b3c4c35",
       "edits": [
         {
           "start": 23,
@@ -54,6 +54,12 @@
           "end": 275,
           "original": "",
           "replacement": "\n### 2026-09-11 — pre-evaluation identity hardening (ADR 0025)\n\nThe locked evaluator now treats causal ADV20 as required derived evidence for\nevery exact-window eligible instrument/session.  Validation occurs before TCA\nworkers and is repeated at the direct replay boundary; missing, duplicate,\nnon-finite, or non-positive values fail closed rather than changing the sample.\nForecast and TCA stages resolve relocated runtime data through the canonical\n`PaperRunConfig.data_path` abstraction.  Before consuming TEST inputs they bind\nthe runtime universe bytes to one shared `universe_manifest_hash` recorded by\nevery fold sequence manifest.  Reseal now validates the complete configured\nprimary JEPA final inventory and requires one non-empty training `code_commit`\nacross all coordinates, before publishing a new execution namespace.  These\nchecks are identity/provenance safeguards only and do not alter scientific\nconfiguration, estimands, or model artifacts.  See ADR 0025.\n"
+        },
+        {
+          "start": 275,
+          "end": 285,
+          "original": "",
+          "replacement": "\n### 2026-09-12 — cross-link resealed evaluation artifacts (ADR 0026)\n\nReseal must verify the existing identity links between each fold sequence\nmanifest, JEPA checkpoint, compatibility record, embedding export, and frozen\nLightGBM coordinate.  Independent file checksums do not prove that a complete\nartifact set was trained from the same sequence, universe, representation\nsource, and TRAIN/VALIDATION embedding bytes.  Cross-link checks run before\n`execution.json` publication and preserve all scientific inputs and estimands.\nSee ADR 0026.\n"
         }
       ]
     },

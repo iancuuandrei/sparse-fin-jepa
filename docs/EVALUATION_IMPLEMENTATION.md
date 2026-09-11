@@ -276,6 +276,16 @@ check and raises rather than silently dropping a case.  These are fail-closed
 identity and derived-evidence checks; they do not open TEST or change the
 frozen estimand.
 
+Reseal cross-links the immutable inventory before publishing `execution.json`.
+Each fold's sequence manifest must be the sequence named by every LightGBM
+coordinate, JEPA checkpoint, compatibility record, and embedding export.  The
+checkpoint universe identity and representation source commit must match the
+parameter freeze; embedding normalization and paper configuration identities
+must match the checkpoint; and hybrid LightGBM manifests must name the exact
+TRAIN and VALIDATION embedding bytes that are present in the export.  A
+complete but cross-coordinate-swapped artifact set is rejected before forecast
+construction.
+
 Learned inference materializes at most 2,048 scale samples and their complete
 future shape rows per wide batch. A compact embedding partition is read once per
 coordinate and attached by exact sample ID to each batch, rather than expanded

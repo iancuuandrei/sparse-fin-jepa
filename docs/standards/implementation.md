@@ -273,3 +273,13 @@ primary JEPA final inventory and requires one non-empty training `code_commit`
 across all coordinates, before publishing a new execution namespace.  These
 checks are identity/provenance safeguards only and do not alter scientific
 configuration, estimands, or model artifacts.  See ADR 0025.
+
+### 2026-09-12 — cross-link resealed evaluation artifacts (ADR 0026)
+
+Reseal must verify the existing identity links between each fold sequence
+manifest, JEPA checkpoint, compatibility record, embedding export, and frozen
+LightGBM coordinate.  Independent file checksums do not prove that a complete
+artifact set was trained from the same sequence, universe, representation
+source, and TRAIN/VALIDATION embedding bytes.  Cross-link checks run before
+`execution.json` publication and preserve all scientific inputs and estimands.
+See ADR 0026.

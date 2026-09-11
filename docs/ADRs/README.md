@@ -27,6 +27,7 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0019](0019-freeze-observable-capacity-and-block-null.md) | Accepted | Freeze the secondary observable-capacity ladder and block-aware confirmatory null test before TEST |
 | [0020](0020-bound-lightgbm-coordinate-memory.md) | Accepted | Bound LightGBM hybrid features and coordinate lifetime on the qualified host |
 | [0025](0025-fail-closed-evaluation-input-identities.md) | Accepted | Fail closed on required ADV20 evidence and bind relocated evaluation identities before execution |
+| [0026](0026-cross-link-resealed-evaluation-artifacts.md) | Accepted | Cross-link sequence, JEPA, embedding, and frozen LightGBM identities during reseal |
 
 ## Recording a decision
 
@@ -45,6 +46,10 @@ LightGBM folds on three RunPod RTX 3090 pods with verified transfer and resumabl
 ADR [0025](0025-fail-closed-evaluation-input-identities.md) is accepted: require
 derived ADV20 evidence, bind relocated runtime universe bytes to every sequence,
 and qualify JEPA source uniformity during reseal.
+
+ADR [0026](0026-cross-link-resealed-evaluation-artifacts.md) is accepted: reject
+ internally consistent but cross-coordinate-swapped immutable artifacts before
+ publishing a resealed execution.
 
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 

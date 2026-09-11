@@ -3,17 +3,93 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from execsim.data.paper.manifests import read_json
+from execsim.data.paper.manifests import file_sha256, read_json, write_json_atomic
 from execsim.ml.paper.features import append_embedding, build_raw_feature_frame
 from execsim.ml.sequences.dataset import extract_window
 from execsim.ml.sequences.manifests import read_sequence_record
-from execsim.ml.sequences.schemas import SequenceSample
+from execsim.ml.sequences.schemas import SequenceRecord, SequenceSample
 from execsim.ml.sequences.streaming import _sample_from_row
+
+
+@dataclass(frozen=True, slots=True)
+class LightGBMFrames:
+    """One immutable common scale/shape frame set for a fold partition."""
+
+    scale: pd.DataFrame
+    scale_target: np.ndarray
+    shape: pd.DataFrame
+    shape_target: np.ndarray
+
+    def as_tuple(self) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame, np.ndarray]:
+        """Expose the established adapter boundary without copying frame blocks."""
+        return self.scale, self.scale_target, self.shape, self.shape_target
+
+
+def cached_lightgbm_base_frames(
+    sequence_manifest_path: Path,
+    *,
+    partition: str,
+    liquidity_groups: dict[str, int],
+    cache_directory: Path,
+    source_commit: str,
+    config_hash: str,
+) -> LightGBMFrames:
+    """Publish and reuse checksummed TRAIN/VALIDATION cores without rereading sessions."""
+    if partition not in {"train", "validation"}:
+        raise ValueError("Training base cache accepts TRAIN/VALIDATION only.")
+    identity = {
+        "schema": "lightgbm-base-cache-v1",
+        "sequence_manifest_sha256": file_sha256(sequence_manifest_path),
+        "partition": partition,
+        "liquidity_groups": liquidity_groups,
+        "source_commit": source_commit,
+        "config_hash": config_hash,
+    }
+    if cache_directory.exists():
+        receipt = read_json(cache_directory / "manifest.json")
+        if receipt["identity"] != identity:
+            raise ValueError("LightGBM base cache identity mismatch.")
+        for name in ("scale.parquet", "shape.parquet", "scale.npy", "shape.npy"):
+            if file_sha256(cache_directory / name) != receipt["files"][name]:
+                raise ValueError(f"LightGBM base cache checksum mismatch: {name}")
+        return LightGBMFrames(
+            pd.read_parquet(cache_directory / "scale.parquet"),
+            np.load(cache_directory / "scale.npy", allow_pickle=False),
+            pd.read_parquet(cache_directory / "shape.parquet"),
+            np.load(cache_directory / "shape.npy", allow_pickle=False),
+        )
+    base = build_lightgbm_base_frames(
+        sequence_manifest_path, partition=partition, liquidity_groups=liquidity_groups
+    )
+    cache_directory.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".base-", dir=cache_directory.parent) as temporary:
+        staging = Path(temporary) / "complete"
+        staging.mkdir()
+        base.scale.to_parquet(staging / "scale.parquet", index=False)
+        base.shape.to_parquet(staging / "shape.parquet", index=False)
+        np.save(staging / "scale.npy", base.scale_target, allow_pickle=False)
+        np.save(staging / "shape.npy", base.shape_target, allow_pickle=False)
+        write_json_atomic(
+            staging / "manifest.json",
+            {
+                "identity": identity,
+                "files": {
+                    name: file_sha256(staging / name)
+                    for name in ("scale.parquet", "shape.parquet", "scale.npy", "shape.npy")
+                },
+            },
+        )
+        os.replace(staging, cache_directory)
+    return base
 
 
 def build_lightgbm_frames(
@@ -23,7 +99,24 @@ def build_lightgbm_frames(
     liquidity_groups: dict[str, int],
     embedding_path: Path | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame, np.ndarray]:
-    """Build one scale row/case and one shape row/valid future token."""
+    """Compatibility builder for one complete raw or hybrid frame set."""
+    base = build_lightgbm_base_frames(
+        sequence_manifest_path,
+        partition=partition,
+        liquidity_groups=liquidity_groups,
+    )
+    if embedding_path is not None:
+        base = attach_lightgbm_embeddings(base, embedding_path=embedding_path)
+    return base.as_tuple()
+
+
+def build_lightgbm_base_frames(
+    sequence_manifest_path: Path,
+    *,
+    partition: str,
+    liquidity_groups: dict[str, int],
+) -> LightGBMFrames:
+    """Build common raw rows, targets, weights, and identities exactly once."""
     manifest = read_json(sequence_manifest_path)
     root = sequence_manifest_path.parent
     sequence_paths = {
@@ -37,18 +130,11 @@ def build_lightgbm_frames(
         for value in manifest["index_files"]
         if f"indexes/{partition}/" in str(value).replace("\\", "/")
     ]
-    embedding_by_sample: dict[str, np.ndarray] = {}
-    if embedding_path is not None:
-        embeddings = pd.read_parquet(embedding_path)
-        if embeddings["sample_id"].duplicated().any():
-            raise ValueError("Embedding corpus duplicates sample identity.")
-        embedding_by_sample = {
-            str(row.sample_id): np.asarray(row.embedding, dtype=float)
-            for row in embeddings.itertuples(index=False)
-        }
-    scale_frames = []
+    scale_frames: list[pd.DataFrame] = []
+    scale_chunks: list[pd.DataFrame] = []
     scale_targets = []
-    shape_frames = []
+    shape_frames: list[pd.DataFrame] = []
+    shape_chunks: list[pd.DataFrame] = []
     shape_targets = []
     samples = [
         _sample_from_row(row)
@@ -60,8 +146,21 @@ def build_lightgbm_frames(
         if partition == "train"
         else {sample.sample_id: 1.0 for sample in samples}
     )
+
+    @lru_cache(maxsize=512)
+    def cached_record(session_id: str) -> SequenceRecord:
+        return read_sequence_record(sequence_paths[session_id])
+
+    def flush_frames(*, force: bool = False) -> None:
+        if scale_frames and (force or len(scale_frames) >= 1_024):
+            scale_chunks.append(pd.concat(scale_frames, ignore_index=True))
+            scale_frames.clear()
+        if shape_frames and (force or len(shape_frames) >= 1_024):
+            shape_chunks.append(pd.concat(shape_frames, ignore_index=True))
+            shape_frames.clear()
+
     for sample in samples:
-        record = read_sequence_record(sequence_paths[sample.session_id])
+        record = cached_record(sample.session_id)
         window = extract_window(record, sample)
         timestamp = pd.Timestamp(sample.as_of_ns, tz="UTC").tz_convert("America/New_York")
         metadata = pd.DataFrame(
@@ -89,11 +188,6 @@ def build_lightgbm_frames(
         raw.insert(5, "training_cutoff", sample.training_cutoff)
         raw.insert(6, "market_information_as_of", sample.market_information_as_of)
         raw.insert(7, "feature_history_end", sample.feature_history_end)
-        if embedding_path is not None:
-            try:
-                raw = append_embedding(raw, embedding_by_sample[sample.sample_id][None, :])
-            except KeyError as exc:
-                raise ValueError(f"Missing embedding for sample {sample.sample_id}") from exc
         future = record.raw_volume[sample.as_of_token :]
         total = float(future.sum())
         baseline_remaining = float(record.causal_baseline_volume[sample.as_of_token :].sum())
@@ -121,14 +215,60 @@ def build_lightgbm_frames(
         repeated["sample_weight"] = repeated["shape_row_weight"]
         shape_frames.append(repeated)
         shape_targets.extend((future / total).tolist())
-    if not scale_frames or not shape_frames:
+        flush_frames()
+    flush_frames(force=True)
+    if not scale_chunks or not shape_chunks:
         raise ValueError(f"No valid LightGBM rows were produced for {partition}.")
-    return (
-        pd.concat(scale_frames, ignore_index=True),
-        np.asarray(scale_targets, dtype=float),
-        pd.concat(shape_frames, ignore_index=True),
-        np.asarray(shape_targets, dtype=float),
+    return LightGBMFrames(
+        scale=pd.concat(scale_chunks, ignore_index=True),
+        scale_target=np.asarray(scale_targets, dtype=float),
+        shape=pd.concat(shape_chunks, ignore_index=True),
+        shape_target=np.asarray(shape_targets, dtype=float),
     )
+
+
+def attach_lightgbm_embeddings(base: LightGBMFrames, *, embedding_path: Path) -> LightGBMFrames:
+    """Attach one frozen representation by exact sample identity for one coordinate."""
+    embeddings = pd.read_parquet(embedding_path, columns=["sample_id", "embedding"])
+    return attach_lightgbm_embedding_frame(base, embeddings=embeddings)
+
+
+def attach_lightgbm_embedding_frame(
+    base: LightGBMFrames, *, embeddings: pd.DataFrame
+) -> LightGBMFrames:
+    """Attach a verified compact embedding slice without rereading its source file."""
+    embedding_ids = pd.Index(embeddings["sample_id"].astype(str))
+    if embedding_ids.has_duplicates:
+        raise ValueError("Embedding corpus duplicates sample identity.")
+    values = np.stack(
+        [np.asarray(value, dtype=np.float32) for value in embeddings["embedding"]], axis=0
+    )
+    if values.shape != (len(embeddings), 644) or not np.isfinite(values).all():
+        raise ValueError("Embedding corpus must contain finite 644-value rows.")
+
+    scale_ids = pd.Index(base.scale["sample_id"].astype(str))
+    if scale_ids.has_duplicates:
+        raise ValueError("LightGBM scale base duplicates sample identity.")
+    scale_positions = embedding_ids.get_indexer(scale_ids)
+    if np.any(scale_positions < 0):
+        missing = scale_ids[scale_positions < 0][0]
+        raise ValueError(f"Missing embedding for sample {missing}")
+    shape_positions = scale_ids.get_indexer(base.shape["sample_id"].astype(str))
+    if np.any(shape_positions < 0):
+        raise ValueError("LightGBM shape rows lack matching scale sample identity.")
+
+    scale = append_embedding(base.scale, values[scale_positions])
+    shape = append_embedding(base.shape, values[scale_positions][shape_positions])
+    # Preserve the original feature order, including LightGBM's column sampling order.
+    for frame, raw in ((scale, base.scale), (shape, base.shape)):
+        columns = list(raw.columns)
+        offset = columns.index("baseline_remaining_volume")
+        columns[offset:offset] = [f"embedding_{index:03d}" for index in range(644)]
+        if frame is scale:
+            scale = frame.loc[:, columns]
+        else:
+            shape = frame.loc[:, columns]
+    return LightGBMFrames(scale, base.scale_target, shape, base.shape_target)
 
 
 def _shape_origin_probabilities(samples: list[SequenceSample]) -> dict[str, float]:

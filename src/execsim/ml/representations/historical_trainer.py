@@ -86,6 +86,10 @@ class HistoricalTrainingInterrupted(RuntimeError):
     """Signal a deliberate, test-only interruption after a durable periodic checkpoint."""
 
 
+class HistoricalTrainingRejected(RuntimeError):
+    """Signal that no validation checkpoint satisfied the frozen collapse gate."""
+
+
 def train_historical_representation(
     manifest_path: Path,
     *,
@@ -185,6 +189,9 @@ def train_historical_representation(
     best_state: dict[str, Any] | None = None
     latest_state: dict[str, Any] | None = None
     best_diagnostics: dict[str, float] = {}
+    latest_validation_loss = float("inf")
+    latest_diagnostics: dict[str, float] = {}
+    latest_gate_failures: tuple[str, ...] = ()
     stale = 0
     if resume_from is not None:
         load_checkpoint(model, resume_from / "weights", expected=compatibility)
@@ -286,6 +293,9 @@ def train_historical_representation(
         resume_batch_index = 0
         validation_loss, diagnostics = _validate(model, validation_data, options, device)
         failures = gate(diagnostics)
+        latest_validation_loss = validation_loss
+        latest_diagnostics = diagnostics
+        latest_gate_failures = failures
         latest_state = _cpu_state(model)
         if not failures and validation_loss < best_loss:
             best_loss = validation_loss
@@ -300,7 +310,31 @@ def train_historical_representation(
     if latest_state is None:
         raise RuntimeError("Historical trainer executed no optimization steps.")
     if best_state is None:
-        raise RuntimeError("No validation checkpoint passed the required collapse gates.")
+        output_root.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(
+            output_root / "training-failure.json",
+            {
+                "schema_version": "historical-training-rejection-v1",
+                "status": "REJECTED_BY_COLLAPSE_GATE",
+                "fold_id": identity.fold_id,
+                "geometry": representation.geometry,
+                "seed": representation.seed,
+                "rdm_lambda": calibrated_lambda,
+                "paper_config_hash": identity.config_hash,
+                "sequence_manifest_hash": sequence_hash,
+                "training_config_hash": training_hash,
+                "code_commit": identity.code_commit,
+                "epochs": epochs_run,
+                "global_steps": global_step,
+                "collapse_gate_name": gate_name,
+                "collapse_gate_failures": latest_gate_failures,
+                "latest_validation_loss": latest_validation_loss,
+                "latest_diagnostics": latest_diagnostics,
+            },
+        )
+        raise HistoricalTrainingRejected(
+            "No validation checkpoint passed the required collapse gates."
+        )
     output_root.mkdir(parents=True, exist_ok=True)
     write_json_atomic(output_root / "compatibility.json", asdict(compatibility))
     latest_model = PredictiveRepresentationModel(representation)

@@ -6,14 +6,22 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 import torch
 
 from execsim.data.paper.manifests import read_json
 from execsim.data.paper.validation import expected_xnys_minutes
 from execsim.data.scenarios import ScenarioConfig, generate_scenario
-from execsim.ml.sequences.builder import build_session_sequence
-from execsim.ml.sequences.corpus import build_fold_sequence_corpus
+from execsim.ml.sequences.builder import _baseline, build_session_sequence
+from execsim.ml.sequences.corpus import (
+    _adjust_for_market_information,
+    _build_member_records,
+    _seasonal_frame,
+    _seasonal_frame_from_token_cache,
+    _token_cache,
+    build_fold_sequence_corpus_from_root,
+)
 from execsim.ml.sequences.dataset import extract_window
 from execsim.ml.sequences.index import (
     build_sample_index,
@@ -88,6 +96,140 @@ def test_sequence_is_one_fixed_session_with_causal_complete_grid(tmp_path) -> No
             source_sha256="a" * 64,
             cutoff="2024-01-02",
         )
+
+
+def test_prior_session_restatement_uses_current_causal_action_knowledge() -> None:
+    session = _bars()
+    actions = pd.DataFrame(
+        {
+            "instrument_id": ["asset-1"],
+            "effective_date": [date(2024, 1, 2)],
+            "factor": [0.5],
+            "available_at": [pd.Timestamp("2024-01-04T00:00:00Z")],
+        }
+    )
+    before_known = _adjust_for_market_information(
+        session,
+        actions,
+        instrument_id="asset-1",
+        market_information_as_of=pd.Timestamp("2024-01-03T14:30:00Z"),
+    )
+    after_known = _adjust_for_market_information(
+        session,
+        actions,
+        instrument_id="asset-1",
+        market_information_as_of=pd.Timestamp("2024-01-05T14:30:00Z"),
+    )
+
+    assert np.allclose(before_known["close"], session["close"])
+    assert np.allclose(after_known["close"], session["close"] / 0.5)
+    assert np.allclose(after_known["volume"], session["volume"] * 0.5)
+
+
+def test_cached_seasonal_tokens_preserve_point_in_time_split_restatement() -> None:
+    session = _bars()
+    history = [(date(2024, 1, 3), session)]
+    actions = pd.DataFrame(
+        {
+            "instrument_id": ["asset-1"],
+            "effective_date": [date(2024, 1, 2)],
+            "factor": [0.5],
+            "available_at": [pd.Timestamp("2024-01-04T00:00:00Z")],
+        }
+    )
+    information_time = pd.Timestamp("2024-01-05T14:30:00Z")
+    adjusted = _adjust_for_market_information(
+        session,
+        actions,
+        instrument_id="asset-1",
+        market_information_as_of=information_time,
+    )
+    expected = _seasonal_frame([(date(2024, 1, 3), adjusted)], quality_protocol="exact-minute-v1")
+
+    actual = _seasonal_frame_from_token_cache(
+        history,
+        _token_cache(history, quality_protocol="exact-minute-v1"),
+        corporate_actions=actions,
+        instrument_id="asset-1",
+        market_information_as_of=information_time,
+    )
+
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_vectorized_seasonal_baseline_matches_pandas_adjusted_ewma() -> None:
+    dates = pd.date_range("2024-01-02", periods=7, freq="B").date
+    rows = [
+        {
+            "session_date": session_date,
+            "bucket_index": bucket,
+            "volume": 100.0 + day * 10 + bucket,
+            "dollar_volume": 1_000.0 + day * 20 + 2 * bucket,
+            "trade_count": 10.0 + day + bucket / 10,
+        }
+        for day, session_date in enumerate(dates)
+        for bucket in range(26)
+    ]
+    seasonal = pd.DataFrame(rows)
+
+    result = _baseline(seasonal, cutoff=str(dates[-1]))
+
+    for column, actual in (
+        ("volume", result.volume_profile),
+        ("dollar_volume", result.dollar_profile),
+        ("trade_count", result.trade_profile),
+    ):
+        expected = np.asarray(
+            [
+                seasonal.loc[seasonal["bucket_index"] == bucket, column]
+                .ewm(span=20, adjust=True)
+                .mean()
+                .iloc[-1]
+                for bucket in range(26)
+            ]
+        )
+        assert np.allclose(actual, expected, rtol=1e-13, atol=1e-13)
+    assert result.adv20 == pytest.approx(seasonal.groupby("session_date")["volume"].sum().mean())
+
+
+def test_record_cutoff_uses_latest_causal_spy_date_across_long_stock_gap() -> None:
+    import exchange_calendars as xcals
+
+    calendar = xcals.get_calendar("XNYS")
+    dates = [
+        pd.Timestamp(value).date()
+        for value in calendar.sessions_in_range("2023-10-02", "2023-11-15")[:22]
+    ]
+    spy_sessions = [
+        (session_date, _paper_session("benchmark-spy", "SPY", session_date, 0))
+        for session_date in dates
+    ]
+    stock_sessions = [
+        (dates[0], _paper_session("asset-gap", "GAP", dates[0], 1)),
+        (dates[-1], _paper_session("asset-gap", "GAP", dates[-1], 1)),
+    ]
+    exclusions: list[dict[str, str]] = []
+
+    records, exclusions, _ = _build_member_records(
+        {"instrument_id": "asset-gap", "formation_symbol": "GAP"},
+        stock_sessions,
+        member_exclusions=exclusions,
+        corporate_actions=pd.DataFrame(),
+        fold_id="fold-1",
+        cutoff=date(2023, 12, 29),
+        spy_sessions=spy_sessions,
+        spy_dates=dates,
+        spy_by_date=dict(spy_sessions),
+        spy_token_cache=_token_cache(spy_sessions, quality_protocol="exact-minute-v1"),
+        data_classification="synthetic_fixture",
+        quality_protocol="exact-minute-v1",
+        symbol_history=(),
+        spy_instrument_id="benchmark-spy",
+    )
+
+    assert len(records) == 1
+    assert records[0][1].cutoff == dates[-2].isoformat()
+    assert exclusions[0]["session_date"] == dates[0].isoformat()
 
 
 def test_normalizer_uses_persisted_training_statistics_and_zero_padding(tmp_path) -> None:
@@ -193,11 +335,15 @@ def test_multisession_multifold_corpus_builder_includes_spy_and_records_corrupti
             "end": "2025-12-31",
         },
     )
+    corpus_root = tmp_path / "raw"
+    corpus_root.mkdir()
+    for instrument_id, frame in bars.groupby("instrument_id", sort=True):
+        frame.to_parquet(corpus_root / f"{instrument_id}-fixture.response", index=False)
     manifests = []
     for fold_id in ("fold-1", "fold-2"):
         manifests.append(
-            build_fold_sequence_corpus(
-                bars,
+            build_fold_sequence_corpus_from_root(
+                corpus_root,
                 universe_members=members,
                 corporate_actions=actions,
                 fold_id=fold_id,
@@ -217,9 +363,17 @@ def test_multisession_multifold_corpus_builder_includes_spy_and_records_corrupti
         partition="train",
         seed=13,
     )
+    index_cache = next((tmp_path / "sequences" / "fold-1" / ".index-cache").glob("train-*.parquet"))
+    cached_train = PaperSequenceDataset(
+        tmp_path / "sequences" / "fold-1" / "sequence-manifest.json",
+        partition="train",
+        seed=13,
+    )
 
     assert len(dates) == 40
     assert len(manifests) == 2
+    assert index_cache.with_suffix(".json").is_file()
+    assert len(cached_train) == len(train)
     assert first_payload["quality_protocol"] == "resolution-aware-v2"
     assert len(train) == 2 * first_payload["partition_counts"]["train"]
     assert any(item["instrument_id"] == "asset-3" for item in first_payload["exclusions"])
@@ -380,9 +534,12 @@ def _run_fixture_pipeline(
             geometry=geometry,
             adaptation="none",
             device="cpu",
-            batch_size=256,
+            batch_size=2,
         )
         assert read_json(embedding_manifest)["rows"] > 0
+        for partition in ("train", "validation", "test"):
+            parquet = embedding_root / f"partition={partition}" / "embeddings.parquet"
+            assert pq.ParquetFile(parquet).metadata.num_row_groups > 1
         frozen = PredictiveRepresentationModel(representation)
         load_checkpoint(frozen, checkpoint_root / "final", expected=compatibility)
 
@@ -400,7 +557,7 @@ def _run_fixture_pipeline(
                 device="cpu",
             )
 
-        capacity, observable = evaluate_frozen_capacity_streaming(
+        capacity, observable, dated = evaluate_frozen_capacity_streaming(
             frozen,
             fixture_loader("train"),
             fixture_loader("validation"),
@@ -409,14 +566,33 @@ def _run_fixture_pipeline(
             seed=13,
             options=FrozenProbeOptions(ridge_alphas=(1.0,), mlp_epochs=1),
         )
-        observable_by_horizon = {int(item["horizon"]): item for item in observable}
+        assert len(observable) == 12
+        assert dated
+        assert all(len(str(item["sample_identity_sha256"])) == 64 for item in dated)
+        assert all(int(item["row_count"]) > 0 for item in dated)
+        assert {str(item["probe_capacity"]) for item in observable} == {
+            "affine_ridge",
+            "mlp_64",
+            "mlp_256",
+        }
+        assert all(float(item["observable_volume_probe_mae"]) >= 0 for item in observable)
+        assert all(float(item["observable_volume_probe_rmse"]) >= 0 for item in observable)
+        assert all(int(item["observable_parameter_count"]) > 0 for item in observable)
+        assert all(int(item["observable_approximate_macs"]) > 0 for item in observable)
+        assert all(float(item["observable_inference_seconds"]) >= 0 for item in observable)
+        assert all(int(item["observable_test_rows"]) > 0 for item in observable)
+        observable_by_capacity_horizon = {
+            (str(item["probe_capacity"]), int(item["horizon"])): item for item in observable
+        }
         for row in capacity:
             accessibility_rows.append(
                 {
                     "geometry": geometry,
                     "seed": 13,
                     **row,
-                    **observable_by_horizon[int(row["horizon"])],
+                    **observable_by_capacity_horizon[
+                        (str(row["probe_capacity"]), int(row["horizon"]))
+                    ],
                     "zero_fraction": 0.75 if geometry == "sparse" else 0.0,
                     "mean_active_dimensions": 32.0 if geometry == "sparse" else 128.0,
                 }
@@ -478,7 +654,7 @@ def _run_fixture_pipeline(
             training = append_untrained_neural_control_frames(training, fold_seed=13)
             validation = append_untrained_neural_control_frames(validation, fold_seed=13)
         fitted = LightGBMVolumeModel(
-            LightGBMConfig(n_estimators=8, min_child_samples=2, num_threads=1)
+            LightGBMConfig(n_estimators=8, min_child_samples=2)
         ).fit_frames(*training, categorical_features=("symbol",), validation=validation)
         frame_variants[method] = (validation, fitted)
 
@@ -624,8 +800,41 @@ def _run_fixture_pipeline(
             ]
         ),
         "representation_accessibility": pd.DataFrame(accessibility_rows),
-        "forecasting": pd.DataFrame(forecast_rows),
-        "execution": pd.DataFrame(
+        "jepa_representation_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
+                "zero_fraction": [0.75],
+                "mean_active_dimensions": [32.0],
+            }
+        ),
+        "observable_financial_accessibility": pd.DataFrame(accessibility_rows).assign(
+            observable_volume_probe_mae=0.1,
+            observable_volume_probe_rmse=0.2,
+            observable_parameter_count=1,
+            observable_approximate_macs=1,
+            observable_inference_seconds=0.01,
+            observable_test_rows=1,
+        ),
+        "forecast_performance": pd.DataFrame(forecast_rows).assign(seed=13, matched_cases=1),
+        "forecast_by_asof": pd.DataFrame(forecast_rows).assign(seed=13, matched_cases=1),
+        "lightgbm_selected_parameters": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "method": ["sparse"],
+                "seed": [13],
+                "scale_num_leaves": [15],
+                "scale_min_child_samples": [50],
+                "scale_reg_lambda": [1.0],
+                "scale_best_iteration": [1],
+                "shape_num_leaves": [15],
+                "shape_min_child_samples": [50],
+                "shape_reg_lambda": [1.0],
+                "shape_best_iteration": [1],
+            }
+        ),
+        "tca_execution": pd.DataFrame(
             {
                 "method": ["sparse"],
                 "comparison_baseline": ["raw"],
@@ -638,6 +847,36 @@ def _run_fixture_pipeline(
                 "ci_lower": [inference.confidence_interval[0]],
                 "ci_upper": [inference.confidence_interval[1]],
             }
+        ),
+        "confirmatory_statistics": pd.DataFrame(
+            {
+                "contrast_id": [1],
+                "stage": ["representation"],
+                "candidate": ["sparse"],
+                "baseline": ["dense"],
+                "endpoint": ["affine_normalized_latent_error"],
+                "mean_difference": [-1.0],
+                "median_difference": [-1.0],
+                "ci_lower": [-1.0],
+                "ci_upper": [-1.0],
+                "paired_dates": [6],
+                "date_win_rate": [1.0],
+                "standardized_effect": [-1.0],
+                "raw_p_value": [0.01],
+                "holm_adjusted_p_value": [0.05],
+            }
+        ),
+        "support_regime_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
+                "zero_fraction": [0.75],
+                "mean_active_dimensions": [32.0],
+            }
+        ),
+        "appendix_sensitivities": pd.DataFrame(
+            {"analysis": ["block_length"], "block_length_dates": [5]}
         ),
     }
     bundle = write_historical_paper_bundle(

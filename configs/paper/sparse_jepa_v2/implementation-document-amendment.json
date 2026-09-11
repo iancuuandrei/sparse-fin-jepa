@@ -1,0 +1,67 @@
+{
+  "schema_version": "paper-implementation-document-amendment-v1",
+  "scientific_changes": false,
+  "design_freeze_sha256": "eea790c79c16e69ee3997c8c964e7716049c379e1cbb248b2602acd2e19b8d27",
+  "documents": {
+    "docs/DATA_LEAKAGE_CONTRACT.md": {
+      "frozen_sha256": "ccd7afea574c80096f2a6a05d44fabdbbf609792daafb0a6fe9297e662eaf83d",
+      "current_sha256": "fffb87b6cc6f4c815800e8031a6a4b9e727089353d4431f65711b3be6a4e2c33",
+      "edits": [
+        {
+          "start": 22,
+          "end": 29,
+          "original": "",
+          "replacement": "- `HistoricalProfileForecaster` indexes history once per symbol or pooled scope. Its\n  internal read-only matrix may contain later sessions; binary search selects only\n  dates strictly before the requested session before inspecting window completeness.\n  Stable earliest-timestamp row order is preserved, including pooled ties. Requested\n  buckets must all be finite; the last configured number of complete rows is selected\n  before zero-total rows are removed. Mean, median, previous, and finite-window EWMA\n  mathematics, warnings, and cutoffs are unchanged. There is no per-date prefix cache.\n"
+        }
+      ]
+    },
+    "docs/SPECIFICATIONS.md": {
+      "frozen_sha256": "3b58864b0455e0a68d142223228dcb8804547316f4a849721de8b7d63b1cc014",
+      "current_sha256": "e97fc17943cd5ba34113c57e313b72ff2db96c1b3f92b4af29721aaa296eef4d",
+      "edits": [
+        {
+          "start": 25,
+          "end": 26,
+          "original": "`DecisionContext.observations` contains timestamps strictly earlier than `current_timestamp`. Its forecast must be generated no later than the decision and cover exactly the declared future timestamps. Historical profiles use complete sessions whose dates precede the target session. A historical provider may cache its causally filtered session-by-bucket matrix only by symbol scope and target date; it derives each requested window from that matrix. Adaptive MPC receives only elapsed observations and a point-in-time forecast.\n",
+          "replacement": "`DecisionContext.observations` contains timestamps strictly earlier than `current_timestamp`. Its forecast must be generated no later than the decision and cover exactly the declared future timestamps. Historical profiles use complete sessions whose dates precede the target session. A historical provider caches one immutable session-by-bucket matrix per symbol or pooled scope and binary-searches the strict date cutoff before selecting complete windows. It never caches date-prefix matrices. Adaptive MPC receives only elapsed observations and a point-in-time forecast.\n"
+        },
+        {
+          "start": 99,
+          "end": 102,
+          "original": "",
+          "replacement": "The [optimized evaluator artifact contract](EVALUATION_IMPLEMENTATION.md) specifies\ncompact derived bases, atomic publication, identity checks, and vectorized metrics.\n\n"
+        }
+      ]
+    },
+    "docs/standards/implementation.md": {
+      "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
+      "current_sha256": "0ff65e8092c02a3f70b9fadd39683214303a5ad7197758062b0c3651faa28e24",
+      "edits": [
+        {
+          "start": 23,
+          "end": 24,
+          "original": "| Performance architecture | Cache causally filtered historical matrices and reuse exact-horizon OSQP setups through `OptimalExecutionWorkspace` | Profiling identified repeated forecast reconstruction as dominant; exact-horizon reuse preserves the original integer schedule |\n",
+          "replacement": "| Performance architecture | Index one immutable historical matrix per symbol or pooled scope; binary-search the strict date cutoff; reuse exact-horizon OSQP setups through `OptimalExecutionWorkspace` | Repeated date-prefix pivots duplicate work and memory; scope indexes preserve finite-window estimators and exact-horizon reuse preserves the original integer schedule |\n"
+        },
+        {
+          "start": 43,
+          "end": 46,
+          "original": "",
+          "replacement": "| Historical forecast availability | Record unavailable exact EWMA requests and method-specific TCA cases; retain other methods and report paired coverage | Missing eligible history is not a fabricated zero forecast or a reason to remove an instrument globally; see ADR 0023 |\n| Result timestamp storage | Merge timestamp fields at the finest input precision with identical timezones and safe casts; keep other types strict | Arrow storage-unit differences must neither abort compatible results nor truncate instants; see ADR 0024 |\n| Evaluation derived state | Build one compact base per fold and publish learned predictions with checksum-bound atomic manifests; reuse completed predictions within the new evaluation identity | Reconstructing raw rows or rerunning identical frozen predictions adds work without information; incomplete artifacts must never be treated as completed stages |\n"
+        }
+      ]
+    },
+    "repo_manifest.yaml": {
+      "frozen_sha256": "ba17e716f73b8ef82c1e3c0309911572ec8ca2662725d023b1c48a4a393a1d4f",
+      "current_sha256": "2ff93f83a50c91a6fd467699f9a31f3dba1759256eeb315b2bccb39ed7683da5",
+      "edits": [
+        {
+          "start": 83,
+          "end": 84,
+          "original": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n",
+          "replacement": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n"
+        }
+      ]
+    }
+  }
+}

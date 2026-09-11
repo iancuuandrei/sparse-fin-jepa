@@ -35,6 +35,8 @@ def build_session_sequence(
     training_cutoff: str | None = None,
     data_classification: str = "historical",
     quality_protocol: str = "exact-minute-v1",
+    precomputed_tokens: pd.DataFrame | None = None,
+    precomputed_spy_tokens: pd.DataFrame | None = None,
 ) -> SequenceRecord:
     """Aggregate one quality-valid session into 26 causal feature tokens."""
     required = {"timestamp", "open", "high", "low", "close", "volume", "trade_count", "vwap"}
@@ -52,11 +54,21 @@ def build_session_sequence(
     timestamps = pd.to_datetime(ordered["timestamp"])
     if timestamps.dt.tz is None or timestamps.duplicated().any():
         raise ValueError("Sequence timestamps must be unique and timezone-aware.")
-    tokens = _tokenize_session(ordered, quality_protocol=quality_protocol, label="paper")
+    tokens = (
+        precomputed_tokens
+        if precomputed_tokens is not None
+        else _tokenize_session(ordered, quality_protocol=quality_protocol, label="paper")
+    )
     spy = None
     if spy_bars is not None:
         ordered_spy = spy_bars.sort_values("timestamp", kind="stable").reset_index(drop=True)
-        spy = _tokenize_session(ordered_spy, quality_protocol=quality_protocol, label="SPY paper")
+        spy = (
+            precomputed_spy_tokens
+            if precomputed_spy_tokens is not None
+            else _tokenize_session(
+                ordered_spy, quality_protocol=quality_protocol, label="SPY paper"
+            )
+        )
         if not pd.to_datetime(spy["timestamp"]).equals(pd.to_datetime(tokens["timestamp"])):
             raise ValueError("SPY and instrument token intervals must align exactly.")
     baseline = _baseline(seasonal, cutoff)
@@ -196,16 +208,19 @@ def _baseline(seasonal: pd.DataFrame | None, cutoff: str | None = None) -> _Seas
     ordered_dates = sorted(session_dates.unique())[-20:]
     history = seasonal.loc[session_dates.isin(ordered_dates)]
     history = history.sort_values(["session_date", "bucket_index"], kind="stable")
+    expected_buckets = np.tile(np.arange(TOKEN_COUNT), len(ordered_dates))
+    observed_buckets = pd.to_numeric(history["bucket_index"], errors="coerce").to_numpy()
+    if len(history) != len(ordered_dates) * TOKEN_COUNT or not np.array_equal(
+        observed_buckets, expected_buckets
+    ):
+        raise ValueError("Seasonal baselines require exactly 26 ordered buckets per session.")
+    alpha = 2.0 / 21.0
+    weights = np.power(1.0 - alpha, np.arange(len(ordered_dates) - 1, -1, -1))
+    weights /= weights.sum()
 
     def ewma_profile(column: str) -> np.ndarray:
-        values = []
-        for bucket_index in range(TOKEN_COUNT):
-            bucket = history.loc[history["bucket_index"] == bucket_index, column]
-            if bucket.empty:
-                values.append(float("nan"))
-            else:
-                values.append(float(bucket.ewm(span=20, adjust=True).mean().iloc[-1]))
-        return np.asarray(values)
+        values = pd.to_numeric(history[column], errors="coerce").to_numpy(dtype=float)
+        return weights @ values.reshape(len(ordered_dates), TOKEN_COUNT)
 
     volume = ewma_profile("volume")
     dollar = ewma_profile("dollar_volume")
@@ -214,5 +229,6 @@ def _baseline(seasonal: pd.DataFrame | None, cutoff: str | None = None) -> _Seas
         np.isfinite(value).all() and (value >= 0).all() for value in (volume, dollar, trades)
     ):
         raise ValueError("Seasonal baselines require all 26 finite non-negative buckets.")
-    daily = history.groupby("session_date")["volume"].sum()
-    return _SeasonalBaseline(volume, dollar, trades, float(daily.mean()))
+    daily_volume = pd.to_numeric(history["volume"], errors="coerce").to_numpy(dtype=float)
+    adv20 = float(daily_volume.reshape(len(ordered_dates), TOKEN_COUNT).sum(axis=1).mean())
+    return _SeasonalBaseline(volume, dollar, trades, adv20)

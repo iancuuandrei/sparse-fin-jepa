@@ -41,6 +41,22 @@ The runner loads a dataset manifest and schemas, validates folds, instantiates a
 
 Artifacts record model/preprocessing, schema and source/split hashes, cutoff/ranges, seed, dependencies, package/Git versions, metrics, downstream TCA, creation time, and checksum. Loading rejects incompatible feature/target schema, horizon, bucket size, timezone, or package contract.
 
+Paper LightGBM execution is operational configuration, separate from the
+scientific candidate grid. `LightGBMExecutionOptions` selects CPU or the Windows
+OpenCL `gpu` backend, explicit OpenCL platform and device IDs, GPU accumulation
+precision, and thread count. CPU is the default. GPU requests must identify the
+platform and device explicitly, and the same options apply to every scale and
+shape fit across the eight-point grid. GPU execution omits LightGBM's CPU-only
+`deterministic` and `force_col_wise` controls.
+
+Native model manifests, grid results, and the stage execution receipt store the
+complete execution identity. Loading or resuming rejects missing or different
+identity, including CPU/GPU and OpenCL-device mismatches. The stage receipt also
+records that GPU execution has no CPU deterministic guarantee. Select
+`gpu_use_dp` and thread count using repeated, same-seed synthetic runs and a
+synthetic runtime benchmark before historical fitting; do not use historical
+validation accuracy for this operational qualification.
+
 Promotion requires predefined leakage, forecast-quality, calibration, stability, and downstream economic gates. Better statistical error alone is insufficient.
 
 ## Metrics

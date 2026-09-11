@@ -23,7 +23,7 @@ Concrete registries reject unknown names. Oracle VWAP is `EVALUATION_ONLY` and r
 
 ## Information and time contract
 
-`DecisionContext.observations` contains timestamps strictly earlier than `current_timestamp`. Its forecast must be generated no later than the decision and cover exactly the declared future timestamps. Historical profiles use complete sessions whose dates precede the target session. A historical provider may cache its causally filtered session-by-bucket matrix only by symbol scope and target date; it derives each requested window from that matrix. Adaptive MPC receives only elapsed observations and a point-in-time forecast.
+`DecisionContext.observations` contains timestamps strictly earlier than `current_timestamp`. Its forecast must be generated no later than the decision and cover exactly the declared future timestamps. Historical profiles use complete sessions whose dates precede the target session. A historical provider caches one immutable session-by-bucket matrix per symbol or pooled scope and binary-searches the strict date cutoff before selecting complete windows. It never caches date-prefix matrices. Adaptive MPC receives only elapsed observations and a point-in-time forecast.
 
 [The data leakage contract](DATA_LEAKAGE_CONTRACT.md) defines static and dynamic sample semantics, feature availability, chronological split ordering, embargo, and prohibited inputs.
 
@@ -96,6 +96,9 @@ The CLI provides these command groups:
 Commands return zero on success. Validation returns one for invalid data. Contract errors fail with a concise parser error. `--json` emits machine-readable simulation output.
 
 ## Determinism and compatibility
+
+The [optimized evaluator artifact contract](EVALUATION_IMPLEMENTATION.md) specifies
+compact derived bases, atomic publication, identity checks, and vectorized metrics.
 
 Stable ordering, explicit seeds, canonical JSON hashing, checksummed sources and models, exact integer reconciliation, and named numerical tolerances make substantive outputs reproducible. Git-tracked normative text uses SHA-256 after CRLF and bare CR are canonicalized to LF, so checkout line-ending conversion cannot change protocol identity. Design freezes, sidecars, provider responses, receipts, manifests, fitted models, and empirical artifacts use byte-exact hashes. Build timestamps, Git commits, dependency versions, and timing telemetry are provenance, not model inputs. Artifact loading fails closed on checksum or feature schema, target schema, bucket size, or timezone mismatch.
 

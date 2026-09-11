@@ -1,0 +1,6 @@
+# Keep exact-byte scientific identities stable on Windows checkouts.
+configs/paper/**/*.json text eol=lf
+scripts/*.sh text eol=lf
+data/manifests/paper_universe_v2.json text eol=crlf
+CORPUS_QUALITY_REPORT.md text eol=crlf
+V2_FORMATION_QUALITY_REPORT.md text eol=crlf

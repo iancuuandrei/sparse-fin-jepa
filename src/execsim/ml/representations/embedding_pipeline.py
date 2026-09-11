@@ -55,50 +55,69 @@ def export_embedding_corpus(
             num_workers=num_workers,
             device=device,
         )
-        rows = []
-        for batch in loader:
-            context = batch["context"].to(device, non_blocking=device.startswith("cuda"))
-            mask = batch["context_mask"].to(device, non_blocking=device.startswith("cuda"))
-            horizon_mask = batch["target_mask"].to(device, non_blocking=device.startswith("cuda"))
-            embeddings = export_frozen_embedding_batch(model, context, mask, horizon_mask)
-            for index, values in enumerate(embeddings):
-                rows.append(
-                    {
-                        "sample_id": batch["sample_id"][index],
-                        "session_id": batch["session_id"][index],
-                        "instrument_id": batch["instrument_id"][index],
-                        "symbol": batch["symbol"][index],
-                        "session_date": batch["session_date"][index],
-                        "as_of_ns": int(batch["as_of_ns"][index]),
-                        "fold_id": checkpoint.fold_id,
-                        "partition": partition,
-                        "seed": seed,
-                        "geometry": geometry,
-                        "adaptation": adaptation,
-                        "checkpoint_hash": checkpoint.weights_sha256,
-                        "sequence_hash": batch["sequence_hash"][index],
-                        "cutoff": batch["cutoff"][index],
-                        "training_cutoff": batch["training_cutoff"][index],
-                        "market_information_as_of": batch["market_information_as_of"][index],
-                        "feature_history_end": batch["feature_history_end"][index],
-                        "embedding": values.tolist(),
-                    }
-                )
-        if not rows:
-            raise ValueError(f"Embedding export found no rows for {partition}.")
         destination = output_root / f"partition={partition}" / "embeddings.parquet"
         destination.parent.mkdir(parents=True)
-        table = pa.Table.from_pylist(rows)
-        pq.write_table(table, destination, compression="zstd")
+        writer: pq.ParquetWriter | None = None
+        partition_rows = 0
+        try:
+            for batch in loader:
+                context = batch["context"].to(device, non_blocking=device.startswith("cuda"))
+                mask = batch["context_mask"].to(device, non_blocking=device.startswith("cuda"))
+                horizon_mask = batch["target_mask"].to(
+                    device, non_blocking=device.startswith("cuda")
+                )
+                embeddings = export_frozen_embedding_batch(model, context, mask, horizon_mask)
+                batch_rows = []
+                for index, values in enumerate(embeddings):
+                    batch_rows.append(
+                        {
+                            "sample_id": batch["sample_id"][index],
+                            "session_id": batch["session_id"][index],
+                            "instrument_id": batch["instrument_id"][index],
+                            "symbol": batch["symbol"][index],
+                            "session_date": batch["session_date"][index],
+                            "as_of_ns": int(batch["as_of_ns"][index]),
+                            "fold_id": checkpoint.fold_id,
+                            "partition": partition,
+                            "seed": seed,
+                            "geometry": geometry,
+                            "adaptation": adaptation,
+                            "checkpoint_hash": checkpoint.weights_sha256,
+                            "sequence_hash": batch["sequence_hash"][index],
+                            "cutoff": batch["cutoff"][index],
+                            "training_cutoff": batch["training_cutoff"][index],
+                            "market_information_as_of": batch["market_information_as_of"][index],
+                            "feature_history_end": batch["feature_history_end"][index],
+                            "embedding": values.tolist(),
+                        }
+                    )
+                table = pa.Table.from_pylist(
+                    batch_rows,
+                    schema=None if writer is None else writer.schema,
+                )
+                if writer is None:
+                    writer = pq.ParquetWriter(destination, table.schema, compression="zstd")
+                writer.write_table(table)
+                partition_rows += len(batch_rows)
+        except BaseException:
+            if writer is not None:
+                writer.close()
+            destination.unlink(missing_ok=True)
+            raise
+        else:
+            if writer is not None:
+                writer.close()
+        if partition_rows == 0:
+            raise ValueError(f"Embedding export found no rows for {partition}.")
         files.append(
             {
                 "partition": partition,
                 "path": str(destination.relative_to(output_root)).replace("\\", "/"),
-                "rows": len(rows),
+                "rows": partition_rows,
                 "sha256": file_sha256(destination),
             }
         )
-        total_rows += len(rows)
+        total_rows += partition_rows
     payload = {
         "schema_version": "paper-embedding-corpus-v2",
         "fold_id": checkpoint.fold_id,

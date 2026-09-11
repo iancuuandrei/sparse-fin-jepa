@@ -16,8 +16,30 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0008](0008-redirect-paper-to-representation-accessibility.md) | Accepted | Redirect the paper to representation accessibility |
 | [0009](0009-separate-data-quality-by-resolution.md) | Accepted | Separate formation, representation, and execution data quality by resolution |
 | [0010](0010-separate-runtime-approval-from-scientific-config.md) | Accepted | Separate runtime stage approval from scientifically frozen configuration |
+| [0011](0011-source-split-actions-with-conservative-availability.md) | Accepted | Source split actions with conservative provider-process-date availability |
+| [0012](0012-isolate-historical-sequence-members.md) | Accepted | Isolate historical sequence members in deterministic spawn-safe processes |
+| [0013](0013-use-latest-causal-input-cutoff.md) | Accepted | Record the latest date used by any causal seasonal input |
+| [0014](0014-cache-manifest-keyed-sequence-indexes.md) | Accepted | Cache sequence indexes by exact manifest identity |
+| [0015](0015-complete-rdm-sweep-after-candidate-rejection.md) | Accepted | Complete the frozen RDM sweep after a candidate-level gate rejection |
+| [0016](0016-separate-lightgbm-opencl-execution-identity.md) | Accepted | Separate LightGBM OpenCL runtime selection from the scientific grid and bind it to artifacts |
+| [0017](0017-bound-historical-lightgbm-frame-construction.md) | Accepted | Bound historical LightGBM frame construction without changing rows or targets |
+| [0018](0018-stream-historical-embedding-export.md) | Accepted | Stream historical embedding export with bounded memory and atomic failure cleanup |
+| [0019](0019-freeze-observable-capacity-and-block-null.md) | Accepted | Freeze the secondary observable-capacity ladder and block-aware confirmatory null test before TEST |
+| [0020](0020-bound-lightgbm-coordinate-memory.md) | Accepted | Bound LightGBM hybrid features and coordinate lifetime on the qualified host |
 
 ## Recording a decision
+
+ADR [0024](0024-promote-result-timestamp-precision.md) is accepted: promote only
+timestamp precision during result merging, preserving instants and strict timezones.
+
+ADR [0023](0023-record-unavailable-historical-forecasts.md) is accepted: record
+method-specific historical forecast unavailability without changing estimators.
+
+ADR [0022](0022-index-history-and-reseal-evaluation.md) is accepted: index historical
+scope once and reseal optimized downstream evaluation without changing fitted models.
+
+ADR [0021](0021-run-independent-lightgbm-folds-on-runpod.md) is accepted: run independent
+LightGBM folds on three RunPod RTX 3090 pods with verified transfer and resumable artifacts.
 
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 

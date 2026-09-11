@@ -62,6 +62,27 @@ class PaperRunConfig:
     sections: dict[str, dict[str, Any]]
     config_hash: str
     design_freeze: dict[str, Any]
+    runtime_artifact_root: Path | None = None
+    runtime_data_root: Path | None = None
+    runtime_cache_root: Path | None = None
+    runtime_report_root: Path | None = None
+    runtime_sequence_root: Path | None = None
+    runtime_embedding_root: Path | None = None
+    runtime_output_root: Path | None = None
+    runtime_evaluation_root: Path | None = None
+    runtime_representation_root: Path | None = None
+
+    @property
+    def sequence_root(self) -> Path:
+        return self.runtime_sequence_root or self.artifact_root / "sequences"
+
+    @property
+    def embedding_root(self) -> Path:
+        return self.runtime_embedding_root or self.artifact_root / "embeddings"
+
+    @property
+    def lightgbm_root(self) -> Path:
+        return self.runtime_output_root or self.artifact_root / "lightgbm"
 
     @property
     def data(self) -> dict[str, Any]:
@@ -105,11 +126,57 @@ class PaperRunConfig:
 
     @property
     def artifact_root(self) -> Path:
-        return Path(self.data["artifact_root"])
+        return self.runtime_artifact_root or Path(self.data["artifact_root"])
 
     @property
     def report_root(self) -> Path:
-        return Path(self.data["report_root"])
+        return self.runtime_report_root or Path(self.data["report_root"])
+
+    @property
+    def cache_root(self) -> Path:
+        """Return the runtime-only cache root outside the scientific configuration."""
+        return self.runtime_cache_root or Path(".runtime")
+
+    def data_path(self, name: str) -> Path:
+        """Resolve one configured data path below an optional portable data root."""
+        configured = Path(str(self.data[name]))
+        if self.runtime_data_root is None:
+            return configured
+        parts = configured.parts
+        relative = Path(*parts[1:]) if parts and parts[0].lower() == "data" else configured
+        if relative.is_absolute():
+            raise ValueError(f"Cannot relocate absolute configured data path: {configured}")
+        return self.runtime_data_root / relative
+
+    def with_runtime_roots(
+        self,
+        *,
+        artifact_root: Path | None = None,
+        data_root: Path | None = None,
+        cache_root: Path | None = None,
+        report_root: Path | None = None,
+        sequence_root: Path | None = None,
+        embedding_root: Path | None = None,
+        output_root: Path | None = None,
+        evaluation_root: Path | None = None,
+        representation_root: Path | None = None,
+    ) -> PaperRunConfig:
+        """Apply operational path relocation without changing the canonical config hash."""
+        return PaperRunConfig(
+            root=self.root,
+            sections=self.sections,
+            config_hash=self.config_hash,
+            design_freeze=self.design_freeze,
+            runtime_artifact_root=artifact_root,
+            runtime_data_root=data_root,
+            runtime_cache_root=cache_root,
+            runtime_report_root=report_root,
+            runtime_sequence_root=sequence_root,
+            runtime_embedding_root=embedding_root,
+            runtime_output_root=output_root,
+            runtime_evaluation_root=evaluation_root,
+            runtime_representation_root=representation_root,
+        )
 
     def authorization_granted(
         self,
@@ -147,7 +214,9 @@ class PaperRunConfig:
 
 def load_runtime_approval(path: Path, config: PaperRunConfig) -> PaperRuntimeApproval:
     """Load a strict runtime approval bound to the current protocol/config identity."""
-    approval_root = config.root.resolve().parents[2] / ".runtime" / "paper-approvals"
+    approval_root = (
+        config.runtime_cache_root or config.root.resolve().parents[2] / ".runtime"
+    ) / "paper-approvals"
     try:
         resolved = path.resolve(strict=True)
         resolved.relative_to(approval_root.resolve())
@@ -278,7 +347,9 @@ def _validate_design_freeze(
         or _portable_document_sha256(repository_root / relative) != expected
     ]
     if mismatches:
-        raise ValueError(f"Paper design freeze normative document mismatch: {sorted(mismatches)}")
+        _validate_implementation_document_amendment(
+            root, repository_root, freeze_path, documents, mismatches
+        )
     specification = str(freeze.get("source_specification", ""))
     if (
         documents.get(specification) != freeze.get("source_specification_sha256")
@@ -292,6 +363,58 @@ def _portable_document_sha256(path: Path) -> str:
     raw = path.read_bytes()
     normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     return hashlib.sha256(normalized).hexdigest()
+
+
+def _validate_implementation_document_amendment(
+    root: Path,
+    repository_root: Path,
+    freeze_path: Path,
+    documents: dict[str, Any],
+    mismatches: list[str],
+) -> None:
+    """Reconstruct frozen document bytes from explicitly reviewed implementation edits.
+
+    The original design receipt is never regenerated. No scientific specification
+    or YAML is eligible for this documentary compatibility bridge.
+    """
+    allowed = {
+        "docs/DATA_LEAKAGE_CONTRACT.md",
+        "docs/SPECIFICATIONS.md",
+        "docs/standards/implementation.md",
+        "repo_manifest.yaml",
+    }
+    path = root / "implementation-document-amendment.json"
+    failure = f"Paper design freeze normative document mismatch: {sorted(mismatches)}"
+    if not path.is_file() or not set(mismatches).issubset(allowed):
+        raise ValueError(failure)
+    amendment = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        amendment.get("schema_version") != "paper-implementation-document-amendment-v1"
+        or amendment.get("design_freeze_sha256") != file_sha256(freeze_path)
+        or amendment.get("scientific_changes") is not False
+        or set(amendment.get("documents", {})) != set(mismatches)
+    ):
+        raise ValueError(failure)
+    for relative in mismatches:
+        record = amendment["documents"][relative]
+        current = (repository_root / relative).read_text(encoding="utf-8")
+        if record.get("frozen_sha256") != documents[relative] or hashlib.sha256(
+            current.encode()
+        ).hexdigest() != record.get("current_sha256"):
+            raise ValueError(failure)
+        lines = current.splitlines(keepends=True)
+        edits = record.get("edits", [])
+        last_start = len(lines) + 1
+        for edit in reversed(edits):
+            start, end = edit["start"], edit["end"]
+            if not 0 <= start <= end <= len(lines) or end > last_start:
+                raise ValueError(failure)
+            if "".join(lines[start:end]) != edit["replacement"]:
+                raise ValueError(failure)
+            lines[start:end] = edit["original"].splitlines(keepends=True)
+            last_start = start
+        if hashlib.sha256("".join(lines).encode()).hexdigest() != documents[relative]:
+            raise ValueError(failure)
 
 
 def _validate_archived_v1_receipts(freeze_path: Path) -> None:

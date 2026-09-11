@@ -1,5 +1,11 @@
 # Sparse-JEPA paper implementation report
 
+The RunPod execution correction is specified in [ADR 0021](ADRs/0021-run-independent-lightgbm-folds-on-runpod.md)
+and [the executable deployment procedure](RUNPOD_EXECUTION.md). The local LightGBM attempt
+was interrupted gracefully at 0/24. Pod provisioning, Ubuntu setup, RTX 3090 qualification
+and historical fitting on this downstream revision are NOT RUN. Upstream JEPA and embedding
+artifacts remain unchanged; TEST remains closed.
+
 Privileged stage execution follows the separate [paper runtime authorization specification](PAPER_RUNTIME_AUTHORIZATION.md). Runtime approval is external to the six scientifically frozen YAML files and requires a matching command-line opt-in; this operational mechanism does not alter the sparse-jepa-v2 protocol hash.
 
 This report records the active `sparse-jepa-v2` corpus-protocol correction and
@@ -7,6 +13,26 @@ the inherited v1 paper software. It distinguishes executable software evidence
 from formation data, target data, historical training, and empirical evidence.
 It makes no claim about representation quality, forecast accuracy, execution
 cost, or economic value.
+
+## 2026-09-08 pre-lock execution addendum
+
+The authorized v2 target corpus, fold-safe sequences, common-RDM selection at
+`lambda = 10`, 18 primary JEPA checkpoints, and 18 embedding exports are now
+complete. The consolidated embedding audit reports 18 of 18 valid coordinates,
+including structural and provenance validation of TRAIN, VALIDATION, and sealed
+TEST partitions. No TEST effectiveness metric has been inspected.
+
+The Windows OpenCL LightGBM 4.7.0 build and NVIDIA RTX 5050 qualification pass.
+The first historical TRAIN+VALIDATION attempt completed
+`fold-1/raw/shared`, then failed before the second coordinate when the process
+could not allocate a 1.16 GiB pandas consolidation block. The failure exposed
+an operational memory-lifetime defect: completed coordinate frames remained
+reachable while the next coordinate was built, and native FP32 context and
+embedding values were promoted to FP64. ADR 0020 records the pre-lock
+correction. The first model is preserved as superseded evidence and cannot be
+reused under the corrected downstream source identity. Historical LightGBM
+matrix status remains **INCOMPLETE**; parameter freeze, locked TEST evaluation,
+historical TCA, and confirmatory inference remain **NOT RUN**.
 
 ## Status
 

@@ -12,21 +12,34 @@ import pandas as pd
 import pytest
 import yaml
 
-from execsim.cli import main
+import execsim.ml.models.lightgbm_adapter as lightgbm_adapter
+from execsim.cli import build_parser, main
+from execsim.data.paper.identity import resolve_provider_symbol
 from execsim.data.paper.manifests import file_sha256, write_json_atomic
-from execsim.ml.models.lightgbm_adapter import LightGBMConfig, LightGBMVolumeModel
+from execsim.ml.models.lightgbm_adapter import (
+    LightGBMConfig,
+    LightGBMExecutionOptions,
+    LightGBMVolumeModel,
+    _parameters,
+)
 from execsim.ml.models.random_projection import projection_hash, random_projection_matrix
 from execsim.ml.paper.benchmark import estimate_manifest_resources, predictor_capacity_smoke
 from execsim.ml.paper.configs import load_paper_config, load_runtime_approval
 from execsim.ml.paper.features import (
     append_embedding,
+    append_untrained_neural_control_frames,
     build_raw_feature_frame,
     build_untrained_neural_control,
 )
 from execsim.ml.paper.forecast_provider import PaperLightGBMForecastProvider
 from execsim.ml.paper.orchestration import (
     _formation_artifacts_ready,
+    _freeze_representation_parameters,
+    _has_frozen_v2_formation_evidence,
+    _paper_symbol_intervals,
     _require_parameter_freeze,
+    _require_representation_parameter_freeze,
+    _stream_embedding_diagnostics,
     run_authorized_stages,
 )
 from execsim.ml.paper.provenance import build_run_provenance
@@ -37,12 +50,16 @@ from execsim.ml.paper.regimes import (
     label_unusual_sessions,
 )
 from execsim.ml.paper.reports import (
+    HISTORICAL_FIGURE_NAMES,
+    HISTORICAL_TABLE_NAMES,
     TABLE_NAMES,
     write_historical_paper_bundle,
     write_paper_bundle,
 )
 from execsim.ml.paper.statistics import (
+    build_confirmatory_inference,
     construct_complete_case_differences,
+    construct_seed_matched_differences,
     holm_adjust_pvalues,
     moving_block_bootstrap,
     paper_forecast_metrics,
@@ -54,6 +71,10 @@ from execsim.ml.paper.tca import (
     mean_seed_forecast,
     realized_volume_oracle_cost,
     select_liquidity_spaced_instruments,
+)
+from execsim.ml.representations.diagnostics import (
+    representation_diagnostics,
+    support_transition_diagnostics,
 )
 from execsim.orders import ParentOrder
 from execsim.policies import AdaptiveMPCPolicy, ExecutionConstraints
@@ -68,7 +89,7 @@ def test_lightgbm_raw_and_hybrid_fixture_and_random_placebo(tmp_path: Path) -> N
     remaining = np.exp(raw[:, 0] + 10)
     shape = np.exp(raw[:, :4])
     shape /= shape.sum(axis=1, keepdims=True)
-    config = LightGBMConfig(n_estimators=8, min_child_samples=2, num_threads=1)
+    config = LightGBMConfig(n_estimators=8, min_child_samples=2)
 
     for features in (raw, hybrid):
         model = LightGBMVolumeModel(config).fit(features[:30], remaining[:30], shape[:30])
@@ -88,9 +109,103 @@ def test_lightgbm_raw_and_hybrid_fixture_and_random_placebo(tmp_path: Path) -> N
     restored, metadata = LightGBMVolumeModel.load_native(artifact)
     restored_total, restored_shape = restored.predict(hybrid[30:])
     assert metadata["fold_id"] == "fold-1"
+    assert metadata["lightgbm_execution"] == LightGBMExecutionOptions().identity()
+    assert restored.execution == LightGBMExecutionOptions()
     assert np.allclose(restored_total, total)
     assert np.allclose(restored_shape, shares)
     assert projection_hash(projection) == projection_hash(random_projection_matrix(12, seed=13))
+
+    requested_gpu = LightGBMExecutionOptions(
+        device_type="gpu", gpu_platform_id=1, gpu_device_id=0, num_threads=8
+    )
+    with pytest.raises(ValueError, match="execution identity mismatch"):
+        LightGBMVolumeModel.load_native(artifact, expected_execution=requested_gpu)
+
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["lightgbm_execution"] = requested_gpu.identity()
+    write_json_atomic(manifest_path, manifest)
+    with pytest.raises(ValueError, match="execution identity mismatch"):
+        LightGBMVolumeModel.load_native(artifact, expected_execution=LightGBMExecutionOptions())
+    with pytest.raises(ValueError, match="execution identity mismatch"):
+        LightGBMVolumeModel.load_native(
+            artifact,
+            expected_execution=replace(requested_gpu, gpu_device_id=1),
+        )
+
+
+def test_lightgbm_execution_parameters_are_backend_specific() -> None:
+    config = LightGBMConfig()
+    cpu = _parameters(config, LightGBMExecutionOptions(num_threads=4))
+    gpu = _parameters(
+        config,
+        LightGBMExecutionOptions(
+            device_type="gpu",
+            gpu_platform_id=2,
+            gpu_device_id=1,
+            gpu_use_dp=True,
+            num_threads=8,
+        ),
+    )
+
+    assert "device_type" not in cpu
+    assert "gpu_platform_id" not in cpu
+    assert cpu["deterministic"] is True
+    assert cpu["force_col_wise"] is True
+    assert cpu["n_jobs"] == 4
+    assert gpu["device_type"] == "gpu"
+    assert gpu["gpu_platform_id"] == 2
+    assert gpu["gpu_device_id"] == 1
+    assert gpu["gpu_use_dp"] is True
+    assert gpu["n_jobs"] == 8
+    assert "deterministic" not in gpu
+    assert "force_col_wise" not in gpu
+
+
+def test_lightgbm_gpu_execution_requires_explicit_non_negative_device_ids() -> None:
+    with pytest.raises(ValueError, match="explicit gpu_platform_id"):
+        LightGBMExecutionOptions(device_type="gpu")
+    with pytest.raises(ValueError, match="non-negative"):
+        LightGBMExecutionOptions(device_type="gpu", gpu_platform_id=-1, gpu_device_id=0)
+    with pytest.raises(ValueError, match="GPU-only"):
+        LightGBMExecutionOptions(gpu_use_dp=True)
+
+
+def test_lightgbm_grid_propagates_one_execution_identity_to_all_candidates(monkeypatch) -> None:
+    observed: list[LightGBMExecutionOptions] = []
+
+    class FakeVolumeModel:
+        def __init__(self, config, *, execution) -> None:
+            self.config = config
+            self.scale_config = config
+            self.shape_config = config
+            self.execution = execution
+            self.scale_model = object()
+            self.shape_model = object()
+            observed.append(execution)
+
+        def fit_frames(self, *args, **kwargs):
+            return self
+
+        def predict_frames(self, scale, shape, *, group_columns):
+            predicted = shape.loc[:, [*group_columns, "target_bucket"]].copy()
+            predicted["conditional_share"] = 0.5
+            return np.ones(len(scale)), predicted
+
+    monkeypatch.setattr(lightgbm_adapter, "LightGBMVolumeModel", FakeVolumeModel)
+    scale = pd.DataFrame({"baseline_remaining_volume": [1.0], "x": [0.0]})
+    shape = pd.DataFrame({"case_id": [0, 0], "target_bucket": [0, 1], "x": [0.0, 0.0]})
+    frames = (scale, np.ones(1), shape, np.array([0.5, 0.5]))
+    execution = LightGBMExecutionOptions(
+        device_type="gpu", gpu_platform_id=1, gpu_device_id=0, num_threads=8
+    )
+
+    _, results = lightgbm_adapter.run_lightgbm_grid(
+        frames, frames, categorical_features=(), execution=execution
+    )
+
+    assert len(results) == 8
+    assert observed == [execution] * 8
 
 
 def test_lightgbm_uses_pandas_categories_and_long_shape_valid_horizons() -> None:
@@ -106,9 +221,9 @@ def test_lightgbm_uses_pandas_categories_and_long_shape_valid_horizons() -> None
     shape["case_id"] = np.repeat(np.arange(16), 3)
     shape["target_bucket"] = np.tile(np.arange(3), 16)
     shares = np.tile([0.2, 0.3, 0.5], 16)
-    model = LightGBMVolumeModel(
-        LightGBMConfig(n_estimators=8, min_child_samples=2, num_threads=1)
-    ).fit_frames(scale, total, shape, shares, categorical_features=("symbol",))
+    model = LightGBMVolumeModel(LightGBMConfig(n_estimators=8, min_child_samples=2)).fit_frames(
+        scale, total, shape, shares, categorical_features=("symbol",)
+    )
     prediction_shape = shape.iloc[:6].copy()
     prediction_shape["target_valid"] = [True, True, True, True, False, False]
     predicted_total, predicted = model.predict_frames(
@@ -330,6 +445,7 @@ def test_block_bootstrap_and_synthetic_report_bundle(tmp_path: Path) -> None:
 
     assert result.paired_dates == 12
     assert result.mean_difference < 0
+    assert 0 < result.raw_p_value <= 1
     assert forecast_metrics["log_remaining_volume_mae"] > 0
     assert forecast_metrics["conditional_curve_wasserstein"] > 0
     assert (output / "PAPER_OUTLINE.md").is_file()
@@ -368,6 +484,111 @@ def test_statistics_intersect_exact_complete_cases_before_date_averaging() -> No
     assert result.paired_rows["difference"].iloc[0] == -2
 
 
+def test_statistics_pair_each_candidate_seed_with_shared_or_same_seed_baseline() -> None:
+    rows = pd.DataFrame(
+        {
+            "method": ["raw", "raw", "sparse", "sparse", "sparse", "sparse"],
+            "seed": [None, None, 13, 13, 29, 29],
+            "fold_id": ["fold-1"] * 6,
+            "sample_id": ["a", "b", "a", "b", "a", "b"],
+            "error": [2.0, 4.0, 1.0, 3.0, 1.5, 3.5],
+        }
+    )
+    result = construct_seed_matched_differences(
+        rows,
+        baseline="raw",
+        candidate="sparse",
+        value_column="error",
+        identity_columns=("fold_id", "sample_id"),
+    )
+    assert result.matched_rows == 4
+    assert set(result.paired_rows["pair_seed"]) == {13, 29}
+    assert result.paired_rows.groupby("pair_seed")["difference"].mean().to_dict() == {
+        13: -1.0,
+        29: -0.5,
+    }
+
+
+def test_confirmatory_inference_preserves_five_test_family_and_seed_pairing() -> None:
+    dates = ("2024-04-01", "2024-04-02")
+    representation = pd.DataFrame(
+        [
+            {
+                "fold_id": "fold-1",
+                "date": day,
+                "geometry": geometry,
+                "seed": seed,
+                "horizon": 1,
+                "probe_capacity": "affine_ridge",
+                "sample_identity_sha256": "a" * 64,
+                "normalized_latent_error": value,
+            }
+            for day in dates
+            for seed in (13, 29)
+            for geometry, value in (("dense", 1.0), ("sparse", 0.8))
+        ]
+    )
+    forecast = pd.DataFrame(
+        [
+            {
+                "fold_id": "fold-1",
+                "session_date": day,
+                "instrument_id": "asset-a",
+                "sample_id": f"{day}-sample",
+                "as_of_token": 4,
+                "method": method,
+                "seed": seed,
+                "log_remaining_volume_absolute_error": scale,
+                "conditional_curve_wasserstein": shape,
+            }
+            for day in dates
+            for method, seed, scale, shape in (
+                ("raw", None, 1.2, 1.1),
+                ("dense", 13, 1.0, 0.9),
+                ("dense", 29, 1.0, 0.9),
+                ("sparse", 13, 0.8, 0.7),
+                ("sparse", 29, 0.8, 0.7),
+            )
+        ]
+    )
+    definitions = (
+        {
+            "stage": "representation",
+            "candidate": "sparse",
+            "baseline": "dense",
+            "endpoint": "affine_normalized_latent_error",
+        },
+        *(
+            {
+                "stage": "forecasting",
+                "candidate": "sparse",
+                "baseline": baseline,
+                "endpoint": endpoint,
+            }
+            for baseline, endpoint in (
+                ("dense", "log_remaining_volume_mae"),
+                ("dense", "conditional_curve_error"),
+                ("raw", "log_remaining_volume_mae"),
+                ("raw", "conditional_curve_error"),
+            )
+        ),
+    )
+    overall, seeds, sensitivity = build_confirmatory_inference(
+        representation,
+        forecast,
+        definitions=definitions,
+        block_length=1,
+        sensitivity_block_lengths=(2,),
+        repetitions=99,
+        confidence=0.95,
+    )
+    assert len(overall) == 5
+    assert len(seeds) == 10
+    assert len(sensitivity) == 10
+    assert set(overall["contrast_id"]) == {1, 2, 3, 4, 5}
+    assert np.isfinite(overall["holm_adjusted_p_value"]).all()
+
+
 def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_path: Path) -> None:
     tables = {
         "dataset_folds_exclusions": pd.DataFrame(
@@ -386,21 +607,66 @@ def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_pat
                 "zero_baseline": [1.0],
                 "train_mean_baseline": [0.9],
                 "persistence_baseline": [0.8],
-                "observable_volume_probe_mae": [0.15],
-                "observable_volume_probe_rmse": [0.2],
+            }
+        ),
+        "jepa_representation_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
                 "zero_fraction": [0.75],
                 "mean_active_dimensions": [32.0],
             }
         ),
-        "forecasting": pd.DataFrame(
+        "observable_financial_accessibility": pd.DataFrame(
+            {
+                "geometry": ["sparse"],
+                "seed": [13],
+                "horizon": [1],
+                "probe_capacity": ["affine_ridge"],
+                "observable_volume_probe_mae": [0.15],
+                "observable_volume_probe_rmse": [0.2],
+                "observable_parameter_count": [1_028],
+                "observable_approximate_macs": [1_024],
+                "observable_inference_seconds": [0.01],
+                "observable_test_rows": [100],
+            }
+        ),
+        "forecast_performance": pd.DataFrame(
             {
                 "method": ["raw"],
+                "seed": [None],
+                "log_remaining_volume_mae": [0.2],
+                "conditional_curve_error": [0.1],
+                "matched_cases": [4],
+            }
+        ),
+        "forecast_by_asof": pd.DataFrame(
+            {
+                "method": ["raw"],
+                "seed": [None],
                 "as_of_token": [4],
                 "log_remaining_volume_mae": [0.2],
                 "conditional_curve_error": [0.1],
+                "matched_cases": [4],
             }
         ),
-        "execution": pd.DataFrame(
+        "lightgbm_selected_parameters": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "method": ["raw"],
+                "seed": [None],
+                "scale_num_leaves": [15],
+                "scale_min_child_samples": [50],
+                "scale_reg_lambda": [1.0],
+                "scale_best_iteration": [10],
+                "shape_num_leaves": [31],
+                "shape_min_child_samples": [50],
+                "shape_reg_lambda": [10.0],
+                "shape_best_iteration": [12],
+            }
+        ),
+        "tca_execution": pd.DataFrame(
             {
                 "method": ["raw"],
                 "comparison_baseline": ["raw"],
@@ -414,6 +680,36 @@ def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_pat
                 "ci_upper": [-0.05],
             }
         ),
+        "confirmatory_statistics": pd.DataFrame(
+            {
+                "contrast_id": [1],
+                "stage": ["representation"],
+                "candidate": ["sparse"],
+                "baseline": ["dense"],
+                "endpoint": ["affine_normalized_latent_error"],
+                "mean_difference": [-0.1],
+                "median_difference": [-0.1],
+                "ci_lower": [-0.2],
+                "ci_upper": [-0.05],
+                "paired_dates": [10],
+                "date_win_rate": [0.8],
+                "standardized_effect": [-0.5],
+                "raw_p_value": [0.01],
+                "holm_adjusted_p_value": [0.05],
+            }
+        ),
+        "support_regime_diagnostics": pd.DataFrame(
+            {
+                "fold_id": ["fold-1"],
+                "geometry": ["sparse"],
+                "seed": [13],
+                "zero_fraction": [0.75],
+                "mean_active_dimensions": [32.0],
+            }
+        ),
+        "appendix_sensitivities": pd.DataFrame(
+            {"analysis": ["confirmatory_block_length"], "block_length_dates": [5]}
+        ),
     }
     output = write_historical_paper_bundle(
         tmp_path,
@@ -424,12 +720,13 @@ def test_historical_report_requires_named_schemas_and_measured_intervals(tmp_pat
     )
 
     assert (output / "REPORT.md").is_file()
-    assert len(list((output / "figures").glob("*.png"))) == 4
+    assert len(list((output / "tables").glob("*.parquet"))) == len(HISTORICAL_TABLE_NAMES)
+    assert len(list((output / "figures").glob("*.png"))) == len(HISTORICAL_FIGURE_NAMES)
     with pytest.raises(ValueError, match="Historical table"):
         write_historical_paper_bundle(
             tmp_path,
             paper_run_id="broken",
-            tables={**tables, "forecasting": pd.DataFrame({"value": [1]})},
+            tables={**tables, "forecast_by_asof": pd.DataFrame({"value": [1]})},
             provenance={"data_classification": "synthetic_fixture"},
             historical_schema_fixture=True,
         )
@@ -441,6 +738,18 @@ def test_holm_adjustment_is_monotone_in_sorted_pvalues() -> None:
     ordered = np.argsort(values, kind="stable")
     assert np.all(np.diff(adjusted[ordered]) >= 0)
     assert np.all((0 <= adjusted) & (adjusted <= 1))
+
+
+def test_block_bootstrap_null_pvalue_uses_fold_safe_centered_blocks() -> None:
+    rows = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=20, freq="D"),
+            "fold_id": ["fold-1"] * 10 + ["fold-2"] * 10,
+            "difference": [-1.0] * 20,
+        }
+    )
+    result = moving_block_bootstrap(rows, block_length=5, repetitions=999, seed=13)
+    assert result.raw_p_value == pytest.approx(0.001)
 
 
 def test_protocol_freeze_is_complete_and_checksum_bound() -> None:
@@ -464,6 +773,7 @@ def test_locked_test_parameter_freeze_requires_the_exact_model_matrix(
     sections = {**loaded.sections, "data": {**loaded.data, "artifact_root": str(tmp_path)}}
     config = replace(loaded, sections=sections)
     monkeypatch.setattr("execsim.ml.paper.orchestration._git_head", lambda: "f" * 40)
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_tree", lambda: "e" * 40)
     selection = tmp_path / "selection" / "rdm-lambda.json"
     write_json_atomic(
         selection,
@@ -511,10 +821,14 @@ def test_locked_test_parameter_freeze_requires_the_exact_model_matrix(
             write_json_atomic(artifact, {"method": method, "seed": seed})
             records.append({"path": relative.as_posix(), "sha256": file_sha256(artifact)})
     freeze = tmp_path / "selection" / "parameter-freeze-v1.json"
+    execution_receipt = tmp_path / "lightgbm" / "execution-receipt.json"
+    write_json_atomic(execution_receipt, {"device_type": "gpu"})
     payload = {
         "status": "PARAMETERS_FROZEN",
         "git_commit": "f" * 40,
+        "git_tree": "e" * 40,
         "paper_config_hash": config.config_hash,
+        "lightgbm_execution_receipt_sha256": file_sha256(execution_receipt),
         "rdm_lambda_receipt_sha256": file_sha256(selection),
         "selected_rdm_lambda": 1.0,
         "lightgbm_manifests": records,
@@ -526,6 +840,51 @@ def test_locked_test_parameter_freeze_requires_the_exact_model_matrix(
     write_json_atomic(freeze, {**payload, "lightgbm_manifests": records[:-1]})
     with pytest.raises(ValueError, match="incomplete or duplicated"):
         _require_parameter_freeze(config)
+
+
+def test_representation_parameter_freeze_binds_source_and_rdm_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loaded = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    sections = {**loaded.sections, "data": {**loaded.data, "artifact_root": str(tmp_path)}}
+    config = replace(loaded, sections=sections)
+    selection = tmp_path / "selection" / "rdm-lambda.json"
+    write_json_atomic(
+        selection,
+        {
+            "schema_version": "paper-rdm-lambda-selection-v1",
+            "selection_partition": "fold-1/validation",
+            "seed": 13,
+            "paper_config_hash": config.config_hash,
+            "selected_rdm_lambda": 1.0,
+            "candidates": [
+                {
+                    "rdm_lambda": value,
+                    "geometry": geometry,
+                    "fold_id": "fold-1",
+                    "seed": 13,
+                    "observable_probe_error": {0.1: 0.5, 1.0: 0.2, 10.0: 0.8}[value],
+                    "collapse_gate_status": "PASS",
+                    "checkpoint_hash": f"{geometry}-{value}",
+                }
+                for value in (0.1, 1.0, 10.0)
+                for geometry in ("dense", "sparse")
+            ],
+            "test_or_tca_used": False,
+        },
+    )
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_head", lambda: "a" * 40)
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_tree", lambda: "b" * 40)
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_tracked_worktree_clean", lambda: True)
+
+    frozen = _freeze_representation_parameters(config)
+    assert frozen["status"] == "REPRESENTATION_PARAMETERS_FROZEN"
+    assert frozen["test_or_tca_used"] is False
+    assert _require_representation_parameter_freeze(config)["git_commit"] == "a" * 40
+
+    monkeypatch.setattr("execsim.ml.paper.orchestration._git_head", lambda: "c" * 40)
+    with pytest.raises(ValueError, match="incompatible"):
+        _require_representation_parameter_freeze(config)
 
 
 def test_manifest_resource_estimate_is_derived_and_fail_closed(tmp_path: Path) -> None:
@@ -625,15 +984,35 @@ def test_lightgbm_raw_hybrid_and_untrained_placebo_share_the_causal_context() ->
         context, mask, np.ones((3, 4), dtype=bool), fold_seed=13
     )
     repeated, repeated_hash = build_untrained_neural_control(
-        context, mask, np.ones((3, 4), dtype=bool), fold_seed=13
+        context, mask, np.ones((3, 4), dtype=bool), fold_seed=13, batch_size=2
     )
     hybrid = append_embedding(raw, neural_values)
 
     assert raw.shape[1] == 162
+    assert raw.filter(like="context_t").dtypes.eq(np.dtype("float32")).all()
     assert neural_values.shape == (3, 644)
-    assert np.array_equal(neural_values, repeated)
+    assert neural_values.dtype == np.float32
+    # BLAS kernels may accumulate a different final FP32 bit when the batch is split.
+    np.testing.assert_allclose(neural_values, repeated, rtol=1e-6, atol=1e-6)
     assert network_hash == repeated_hash and len(network_hash) == 64
     assert hybrid.shape[1] == raw.shape[1] + 644
+    assert hybrid.filter(like="embedding_").dtypes.eq(np.dtype("float32")).all()
+
+    scale = raw.copy()
+    scale.insert(0, "sample_id", ["a", "b", "c"])
+    scale["as_of"] = [4, 5, 6]
+    shape = scale.iloc[[2, 0, 2]].reset_index(drop=True)
+    augmented_scale, _, augmented_shape, _ = append_untrained_neural_control_frames(
+        (scale, np.ones(3), shape, np.ones(3)), fold_seed=13
+    )
+    embedding_columns = list(augmented_scale.filter(like="embedding_").columns)
+    expected = augmented_scale.set_index("sample_id").loc[["c", "a", "c"], embedding_columns]
+    assert np.array_equal(augmented_shape.loc[:, embedding_columns].to_numpy(), expected.to_numpy())
+
+    with pytest.raises(ValueError, match="batch_size"):
+        build_untrained_neural_control(
+            context, mask, np.ones((3, 4), dtype=bool), fold_seed=13, batch_size=0
+        )
 
 
 def test_paper_cli_dry_run_does_not_enable_expensive_operations(capsys) -> None:
@@ -657,6 +1036,34 @@ def test_paper_cli_dry_run_does_not_enable_expensive_operations(capsys) -> None:
     assert main(["ml", "paper", "train-volume-model", "--synthetic-fixture"]) == 0
     volume_output = capsys.readouterr().out
     assert '"shape_row_sums"' in volume_output
+
+
+def test_train_volume_model_cli_scopes_opencl_execution_arguments() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "ml",
+            "paper",
+            "train-volume-model",
+            "--lightgbm-device",
+            "gpu",
+            "--lightgbm-gpu-platform-id",
+            "1",
+            "--lightgbm-gpu-device-id",
+            "0",
+            "--lightgbm-gpu-use-dp",
+            "--lightgbm-num-threads",
+            "8",
+        ]
+    )
+
+    assert args.lightgbm_device == "gpu"
+    assert args.lightgbm_gpu_platform_id == 1
+    assert args.lightgbm_gpu_device_id == 0
+    assert args.lightgbm_gpu_use_dp is True
+    assert args.lightgbm_num_threads == 8
+    with pytest.raises(SystemExit):
+        parser.parse_args(["ml", "paper", "plan", "--lightgbm-device", "gpu"])
 
 
 def test_all_paper_cli_commands_have_executable_synthetic_fixtures(tmp_path: Path, capsys) -> None:
@@ -826,8 +1233,11 @@ def test_runtime_approval_for_another_identity_is_denied(
         load_runtime_approval(approval_path, config)
 
 
-def test_v2_run_uses_frozen_daily_formation_state_without_v1_key() -> None:
+def test_v2_run_uses_frozen_daily_formation_state_without_v1_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    monkeypatch.setattr("execsim.ml.paper.orchestration._has_parquet_corpus", lambda _: False)
 
     result = run_authorized_stages(
         config,
@@ -843,7 +1253,43 @@ def test_v2_run_uses_frozen_daily_formation_state_without_v1_key() -> None:
     assert result == {"build_universe": "reused", "download_data": "DATA NOT ACQUIRED"}
 
 
-def test_cli_v2_run_reaches_target_gate_without_authorization(capsys) -> None:
+def test_frozen_v2_universe_resolves_separately_sourced_spy_identity(
+    tmp_path: Path,
+) -> None:
+    config = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    universe = json.loads(Path(config.data["universe_manifest"]).read_text(encoding="utf-8"))
+    ticker_history = tmp_path / "ticker-history.parquet"
+    pd.DataFrame(
+        [
+            {
+                "instrument_id": config.data["spy_instrument_id"],
+                "symbol": "SPY",
+                "start": "1993-01-29",
+                "end": "9999-12-31",
+                "source": "test-fixture",
+            }
+        ]
+    ).to_parquet(ticker_history, index=False)
+    sections = {name: dict(values) for name, values in config.sections.items()}
+    sections["data"]["ticker_history"] = str(ticker_history)
+    config = replace(config, sections=sections)
+
+    assert not any(
+        row["instrument_id"] == config.data["spy_instrument_id"]
+        for row in universe["symbol_history"]
+    )
+    intervals = _paper_symbol_intervals(config, universe)
+
+    assert (
+        resolve_provider_symbol(intervals, str(config.data["spy_instrument_id"]), date(2024, 1, 2))
+        == "SPY"
+    )
+
+
+def test_cli_v2_run_reaches_target_gate_without_authorization(
+    capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("execsim.ml.paper.orchestration._has_parquet_corpus", lambda _: False)
     assert (
         main(
             [
@@ -859,6 +1305,31 @@ def test_cli_v2_run_reaches_target_gate_without_authorization(capsys) -> None:
 
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"build_universe": "reused", "download_data": "DATA NOT ACQUIRED"}
+
+
+def test_v2_run_does_not_validate_a_partially_acquired_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    monkeypatch.setattr("execsim.ml.paper.orchestration._has_parquet_corpus", lambda _: True)
+    monkeypatch.setattr(
+        "execsim.ml.paper.orchestration._audit_acquisition_period",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("BLOCKED: target acquisition receipt set is incomplete")
+        ),
+    )
+
+    result = run_authorized_stages(
+        config,
+        network_cli_enabled=False,
+        training_cli_enabled=False,
+        full_run_cli_enabled=False,
+    )
+
+    assert result == {
+        "build_universe": "reused",
+        "download_data": "DATA ACQUISITION INCOMPLETE",
+    }
 
 
 def test_formation_readiness_dispatches_by_protocol(tmp_path: Path, monkeypatch) -> None:
@@ -888,3 +1359,81 @@ def test_formation_readiness_dispatches_by_protocol(tmp_path: Path, monkeypatch)
     observed.clear()
     assert _formation_artifacts_ready(v2)
     assert observed == []
+
+
+def test_frozen_v2_formation_evidence_reuses_preapproval_receipts(tmp_path: Path) -> None:
+    loaded = load_paper_config(Path("configs/paper/sparse_jepa_v2"))
+    daily = tmp_path / "daily.parquet"
+    receipt = tmp_path / "daily-receipt.json"
+    universe = tmp_path / "universe.json"
+    daily.write_bytes(b"frozen daily corpus")
+    receipt.write_bytes(b"frozen preapproval receipt")
+    write_json_atomic(
+        universe,
+        {
+            "status": "complete",
+            "paper_config_hash": loaded.config_hash,
+            "members": [{"instrument_id": f"asset-{index}"} for index in range(100)],
+        },
+    )
+    evidence = {
+        "status": "COMPLETE",
+        "daily_corpus_sha256": file_sha256(daily),
+        "daily_receipt_sha256": file_sha256(receipt),
+        "universe_manifest_sha256": file_sha256(universe),
+    }
+    config = replace(
+        loaded,
+        sections={
+            **loaded.sections,
+            "data": {
+                **loaded.data,
+                "formation_daily_corpus": str(daily),
+                "formation_daily_receipt": str(receipt),
+                "universe_manifest": str(universe),
+            },
+        },
+        design_freeze={**loaded.design_freeze, "formation_evidence": evidence},
+    )
+
+    assert _has_frozen_v2_formation_evidence(config)
+    receipt.write_bytes(b"changed receipt")
+    assert not _has_frozen_v2_formation_evidence(config)
+
+
+def test_streamed_embedding_diagnostics_match_in_memory_estimator(tmp_path: Path) -> None:
+    rng = np.random.default_rng(47)
+    latents = np.maximum(rng.normal(size=(6, 128)), 0.0)
+    embeddings = [np.concatenate((row, np.zeros(516))) for row in latents]
+    path = tmp_path / "embeddings.parquet"
+    pd.DataFrame(
+        {"sample_id": [f"sample-{index}" for index in range(6)], "embedding": embeddings}
+    ).to_parquet(path, index=False, row_group_size=2)
+    states = pd.DataFrame(
+        {
+            "sample_id": [f"sample-{index}" for index in range(6)],
+            "session_id": ["session-a"] * 3 + ["session-b"] * 3,
+            "instrument_id": ["asset-a"] * 3 + ["asset-b"] * 3,
+            "session_date": ["2025-01-02"] * 3 + ["2025-01-03"] * 3,
+            "as_of_token": [4, 5, 6, 4, 5, 6],
+            "regime": ["ordinary", "ordinary", "unusual"] * 2,
+        }
+    )
+
+    streamed, transitions, counts = _stream_embedding_diagnostics(path, states, batch_size=2)
+    expected = representation_diagnostics(latents)
+
+    assert streamed == pytest.approx(expected, rel=1e-10, abs=1e-10)
+    assert transitions["mean_consecutive_support_jaccard"] == pytest.approx(
+        np.mean(
+            [
+                support_transition_diagnostics(latents[:3], states["regime"].to_numpy()[:3])[
+                    "mean_consecutive_support_jaccard"
+                ],
+                support_transition_diagnostics(latents[3:], states["regime"].to_numpy()[3:])[
+                    "mean_consecutive_support_jaccard"
+                ],
+            ]
+        )
+    )
+    assert counts == {"ordinary": 4, "unusual": 2}

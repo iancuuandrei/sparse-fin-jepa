@@ -249,6 +249,15 @@ def test_v2_target_validation_accepts_token_valid_gaps_and_checks_session_symbol
     assert accepted["quality_protocol"] == "resolution-aware-v2"
     assert accepted["valid_sessions"] == 2
 
+    corpus_root = tmp_path / "target-root"
+    corpus_root.mkdir()
+    for instrument_id, frame in corpus.groupby("instrument_id", sort=True):
+        frame.to_parquet(corpus_root / f"{instrument_id}-fixture.response", index=False)
+    streamed = validate_data_stage(config, corpus_root)
+    assert streamed["valid"] is True
+    assert streamed["valid_sessions"] == accepted["valid_sessions"]
+    assert streamed["session_quality"] == accepted["session_quality"]
+
     incompatible = corpus.copy()
     incompatible.loc[incompatible["instrument_id"] == "id-aapl", "symbol"] = "META"
     incompatible.to_parquet(corpus_path, index=False)

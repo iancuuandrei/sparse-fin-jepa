@@ -270,6 +270,7 @@ def run_historical_tca(
 ) -> pd.DataFrame:
     """Run matched 10:30-15:30 deterministic MPC cases with only provider variation."""
     from execsim.costs import CostParameter, LinearTemporaryImpactModel
+    from execsim.forecasting.historical import HistoricalForecastUnavailable
     from execsim.orders import ParentOrder
     from execsim.policies import ExecutionConstraints
     from execsim.simulator import simulate_policy
@@ -360,14 +361,21 @@ def run_historical_tca(
             )
             for method in required_methods:
                 factory = providers[method]
-                result = simulate_policy(
-                    parent_order=parent_order,
-                    bars=instrument_bars,
-                    policy=paper_policy(),
-                    constraints=constraints,
-                    cost_model=cost_model,
-                    forecast_provider=factory(instrument_id, session_date),
-                )
+                unavailable_reason = ""
+                try:
+                    result = simulate_policy(
+                        parent_order=parent_order,
+                        bars=instrument_bars,
+                        policy=paper_policy(),
+                        constraints=constraints,
+                        cost_model=cost_model,
+                        forecast_provider=factory(instrument_id, session_date),
+                    )
+                except HistoricalForecastUnavailable as exc:
+                    if method != "ewma":
+                        raise
+                    unavailable_reason = str(exc)
+                    result = None
                 rows.append(
                     {
                         "method": method,
@@ -383,17 +391,32 @@ def run_historical_tca(
                         "hard_participation": hard_participation,
                         "risk_aversion": risk_aversion,
                         "tracking_penalty": tracking_penalty,
-                        "total_modeled_execution_cost": result.summary.total_modeled_execution_cost,
+                        "status": "EWMA_UNAVAILABLE" if result is None else "AVAILABLE",
+                        "unavailable_reason": unavailable_reason,
+                        "total_modeled_execution_cost": result.summary.total_modeled_execution_cost
+                        if result is not None
+                        else np.nan,
                         "absolute_modeled_impact_cost": (
                             result.summary.modeled_temporary_impact_cost
+                            if result is not None
+                            else np.nan
                         ),
                         "oracle_modeled_impact_cost": oracle_cost,
                         "normalized_allocation_regret": (
-                            result.summary.modeled_temporary_impact_cost - oracle_cost
+                            (
+                                result.summary.modeled_temporary_impact_cost
+                                if result is not None
+                                else np.nan
+                            )
+                            - oracle_cost
                         )
                         / max(oracle_cost, 1e-12),
-                        "implementation_shortfall_bps": result.summary.implementation_shortfall_bps,
-                        "completion_rate": result.summary.completion_rate,
+                        "implementation_shortfall_bps": result.summary.implementation_shortfall_bps
+                        if result is not None
+                        else np.nan,
+                        "completion_rate": result.summary.completion_rate
+                        if result is not None
+                        else np.nan,
                     }
                 )
     output = pd.DataFrame(rows)

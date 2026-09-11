@@ -1855,8 +1855,17 @@ def run_tca_stage(
         instrument_key,
     )
     from execsim.ml.paper.tca import select_liquidity_spaced_instruments
-    from execsim.ml.paper.tca_inputs import prepare_tca_history, read_tca_date
-    from execsim.ml.paper.tca_workers import TCAWork, run_tca_workers
+    from execsim.ml.paper.tca_inputs import (
+        filter_tca_window_exact,
+        prepare_tca_history,
+        read_tca_date,
+        tca_eligible_instrument_ids,
+    )
+    from execsim.ml.paper.tca_workers import (
+        TCAWork,
+        preflight_tca_ledgers,
+        run_tca_workers,
+    )
 
     execution = {
         "source_commit": _git_head(),
@@ -1916,6 +1925,67 @@ def run_tca_stage(
             for day in pd.read_parquet(history / "sessions.parquet")["session_date"]
         }
     )
+    # Resolve the scientific population and validate every required ledger before
+    # constructing or launching any expensive date worker.
+    eligible_by_fold: dict[str, dict[date, tuple[str, ...]]] = {}
+    for fold in config.evaluation["folds"]:
+        fold_id = str(fold["id"])
+        start, end = (pd.Timestamp(value).date() for value in fold["test"])
+        variants = [
+            ("raw", None),
+            ("untrained_neural", None),
+            *(
+                (geometry, int(seed))
+                for geometry in ("dense", "sparse")
+                for seed in config.representation["seeds"]
+            ),
+        ]
+        ledgers = tuple(
+            (
+                method,
+                seed,
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / method
+                / str(seed or "shared"),
+                _learned_ledger_identity(config, fold_id, method, seed),
+            )
+            for method, seed in variants
+        )
+        ewma_records = {}
+        for instrument in sorted(instruments):
+            work = EWMAWork(
+                evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
+                market_profiles[instrument],
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / "ewma"
+                / instrument_key(instrument),
+                instrument,
+                {**execution, "fold_id": fold_id},
+            )
+            ewma_records[instrument] = (work.output_directory, ewma_ledger_identity(work))
+        eligible_cases: dict[date, tuple[str, ...]] = {}
+        for day in dates:
+            if not start <= day <= end:
+                continue
+            date_bars, _ = read_tca_date(histories, day)
+            eligible = tca_eligible_instrument_ids(date_bars, instruments)
+            if eligible:
+                eligible_cases[day] = eligible
+        preflight_tca_ledgers(
+            ledger_records=ledgers,
+            ewma_records=ewma_records,
+            eligible_cases=eligible_cases,
+            training_cutoff=pd.Timestamp(fold["train"][1]).date(),
+            tca_config=config.tca,
+        )
+        eligible_by_fold[fold_id] = eligible_cases
+
     main_outputs, sensitivity_outputs = [], []
     for fold in config.evaluation["folds"]:
         fold_id = str(fold["id"])
@@ -1969,9 +2039,16 @@ def run_tca_stage(
         ).drop(columns="fold_id")
         tasks = []
         for day in dates:
-            if not start <= day <= end:
+            if not start <= day <= end or day not in eligible_by_fold[fold_id]:
                 continue
             date_bars, date_adv = read_tca_date(histories, day)
+            eligible_instruments = set(eligible_by_fold[fold_id][day])
+            date_bars = filter_tca_window_exact(date_bars, eligible_instruments)
+            date_adv = date_adv.loc[
+                date_adv["instrument_id"].astype(str).isin(eligible_instruments)
+            ].reset_index(drop=True)
+            if date_bars.empty:
+                continue
             identity = {
                 **execution,
                 "fold_id": fold_id,

@@ -271,6 +271,7 @@ def run_historical_tca(
     """Run matched 10:30-15:30 deterministic MPC cases with only provider variation."""
     from execsim.costs import CostParameter, LinearTemporaryImpactModel
     from execsim.forecasting.historical import HistoricalForecastUnavailable
+    from execsim.ml.paper.tca_inputs import filter_tca_window_exact
     from execsim.orders import ParentOrder
     from execsim.policies import ExecutionConstraints
     from execsim.simulator import simulate_policy
@@ -296,7 +297,7 @@ def run_historical_tca(
     required_adv = {"instrument_id", "session_date", "adv20"}
     if missing := required_adv.difference(adv20.columns):
         raise ValueError(f"ADV20 input missing columns: {sorted(missing)}")
-    selected = bars.loc[bars["instrument_id"].astype(str).isin(instruments)].copy()
+    selected = filter_tca_window_exact(bars, instruments)
     selected["session_date"] = (
         pd.to_datetime(selected["timestamp"]).dt.tz_convert("America/New_York").dt.date
     )

@@ -182,6 +182,17 @@ two cutoffs. It also executes the real preparation/orchestration with the former
 full-corpus loader made unavailable, verifies each emitted date input, and checks
 resume and changed-cutoff rejection. Replay-worker equivalence is tested separately.
 
+Before any TCA worker is launched, the orchestrator resolves each selected
+instrument/session through the existing `resolution-aware-v2` assessor and keeps
+only `tca_window_exact` cases. An early close or an instrument-specific consumed-
+window gap removes that case only; `balanced_sides` receives the surviving
+date-level population, and dates with no surviving cases create no task. A bounded
+preflight then verifies every required learned ledger, EWMA availability ledger,
+fold/cutoff/sequence identity, exact as-of grid, and future-bucket grid. Missing or
+incompatible derived evidence aborts before replay rather than silently changing
+the scientific population. See the existing resolution-quality contract and
+`docs/ADRs/0009-separate-data-quality-by-resolution.md`.
+
 ## Evaluator reseal and isolated output namespace
 
 `execsim ml paper reseal-evaluation` accepts `--evaluation-root` and a required

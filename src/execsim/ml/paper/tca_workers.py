@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ from execsim.ml.paper.forecast_ledger import EWMAForecastLedgerProvider, PaperFo
 from execsim.ml.paper.tca import run_historical_tca
 
 _VERIFIED_LEDGERS: dict[Path, VerifiedArtifact] = {}
+
+LEARNED_LEDGER_FILES = ("scale.parquet", "shape.parquet", "metrics.parquet")
 
 
 def _verified_ledger(
@@ -48,6 +51,198 @@ class TCAWork:
     sequence_hash: str
     tca_config: dict[str, Any]
     identity: dict[str, Any]
+
+
+def _tca_as_of_origins(tca_config: Mapping[str, Any]) -> tuple[int, ...]:
+    """Return the 15-minute origins consumed by the locked TCA window."""
+    start = time.fromisoformat(str(tca_config["window"][0]))
+    end = time.fromisoformat(str(tca_config["window"][1]))
+    start_offset = (start.hour * 60 + start.minute) - (9 * 60 + 30)
+    end_offset = (end.hour * 60 + end.minute) - (9 * 60 + 30)
+    if start_offset < 0 or end_offset <= start_offset or start_offset % 15 or end_offset % 15:
+        raise ValueError("TCA window must align to the 15-minute sequence grid.")
+    return tuple(range(start_offset // 15, end_offset // 15))
+
+
+def _validate_learned_case(
+    directory: Path,
+    *,
+    instrument_id: str,
+    session_date: date,
+    fold_id: str,
+    training_cutoff: date,
+    origins: tuple[int, ...],
+) -> None:
+    """Verify every learned ledger row and future bucket needed by TCA."""
+    scale = pd.read_parquet(
+        directory / "scale.parquet", filters=[("instrument_id", "==", instrument_id)]
+    )
+    required = {
+        "sample_id",
+        "fold_id",
+        "instrument_id",
+        "symbol",
+        "session_date",
+        "as_of",
+        "training_cutoff",
+    }
+    if missing := required.difference(scale.columns):
+        raise ValueError(f"TCA learned scale is missing columns: {sorted(missing)}")
+    scale_dates = pd.to_datetime(scale["session_date"], errors="coerce")
+    cutoff_dates = pd.to_datetime(scale["training_cutoff"], errors="coerce")
+    if scale_dates.isna().any() or cutoff_dates.isna().any():
+        raise ValueError("TCA preflight found invalid learned date identities.")
+    scale = scale.loc[scale_dates.dt.date == session_date].copy()
+    if scale.empty or scale["sample_id"].duplicated().any() or scale["as_of"].duplicated().any():
+        raise ValueError("TCA preflight found missing or duplicate learned as-of rows.")
+    if not scale["instrument_id"].astype(str).eq(instrument_id).all():
+        raise ValueError("TCA preflight found a learned instrument identity mismatch.")
+    if scale["symbol"].astype(str).nunique() != 1:
+        raise ValueError("TCA preflight found an ambiguous learned symbol identity.")
+    if not set(origins).issubset(set(scale["as_of"].astype(int))):
+        raise ValueError("TCA preflight found an incomplete learned as-of grid.")
+    if not scale["fold_id"].astype(str).eq(fold_id).all():
+        raise ValueError("TCA preflight found a learned ledger fold mismatch.")
+    if not (pd.to_datetime(scale["training_cutoff"]).dt.date == training_cutoff).all():
+        raise ValueError("TCA preflight found a learned ledger cutoff mismatch.")
+    sample_ids = scale["sample_id"].astype(str).tolist()
+    shape = pd.read_parquet(directory / "shape.parquet", filters=[("case_id", "in", sample_ids)])
+    shape_required = {"case_id", "target_bucket", "conditional_share"}
+    if missing := shape_required.difference(shape.columns):
+        raise ValueError(f"TCA learned shape is missing columns: {sorted(missing)}")
+    if shape.empty or shape[["case_id", "target_bucket"]].astype(str).duplicated().any():
+        raise ValueError("TCA preflight found missing or duplicate learned shape rows.")
+    for row in scale.itertuples(index=False):
+        sample_shape = shape.loc[shape["case_id"].astype(str) == str(row.sample_id)]
+        expected = np.arange(int(row.as_of), 26)
+        shares = sample_shape["conditional_share"].to_numpy(dtype=float)
+        if (
+            not np.array_equal(np.sort(sample_shape["target_bucket"].to_numpy(dtype=int)), expected)
+            or not np.isfinite(shares).all()
+            or (shares < 0).any()
+            or not np.isclose(shares.sum(), 1)
+        ):
+            raise ValueError("TCA preflight found an incomplete learned future-bucket grid.")
+
+
+def _validate_ewma_case(
+    directory: Path,
+    *,
+    instrument_id: str,
+    session_date: date,
+    fold_id: str,
+    origins: tuple[int, ...],
+) -> None:
+    """Verify every exact EWMA minute request is available or explicitly unavailable."""
+    scale = pd.read_parquet(directory / "scale.parquet")
+    required = {"sample_id", "instrument_id", "symbol", "fold_id", "session_date", "as_of"}
+    if missing := required.difference(scale.columns):
+        raise ValueError(f"TCA EWMA scale is missing columns: {sorted(missing)}")
+    scale_dates = pd.to_datetime(scale["session_date"], errors="coerce")
+    if scale_dates.isna().any():
+        raise ValueError("TCA preflight found invalid EWMA session-date identities.")
+    scale = scale.loc[
+        (scale["instrument_id"].astype(str) == instrument_id)
+        & (scale_dates.dt.date == session_date)
+    ]
+    if scale.empty or scale["sample_id"].duplicated().any() or scale["as_of"].duplicated().any():
+        raise ValueError("TCA preflight found missing or duplicate EWMA as-of rows.")
+    if not set(origins).issubset(set(scale["as_of"].astype(int))):
+        raise ValueError("TCA preflight found an incomplete EWMA as-of grid.")
+    if not scale["fold_id"].astype(str).eq(fold_id).all():
+        raise ValueError("TCA preflight found an EWMA ledger fold mismatch.")
+    if scale["symbol"].astype(str).nunique() != 1:
+        raise ValueError("TCA preflight found an EWMA symbol identity mismatch.")
+    opened = pd.Timestamp.combine(session_date, time(9, 30)).tz_localize("America/New_York")
+    expected = {
+        opened + pd.Timedelta(minutes=15 * origin + offset)
+        for origin in origins
+        for offset in range(15)
+    }
+    expected_sample_ids = {
+        opened + pd.Timedelta(minutes=15 * int(row.as_of) + offset): str(row.sample_id)
+        for row in scale.itertuples(index=False)
+        if int(row.as_of) in origins
+        for offset in range(15)
+    }
+    available = pd.read_parquet(
+        directory / "minute-forecasts.parquet", columns=["sample_id", "generated_at", "end_token"]
+    )
+    available = available.loc[available["end_token"].eq(24)].copy()
+    unavailable = pd.read_parquet(
+        directory / "unavailable.parquet",
+        columns=["sample_id", "generated_at", "end_token", "status"],
+    )
+    unavailable = unavailable.loc[unavailable["end_token"].eq(24)].copy()
+    available_generated = pd.to_datetime(available["generated_at"], errors="coerce")
+    unavailable_generated = pd.to_datetime(unavailable["generated_at"], errors="coerce")
+    if available_generated.isna().any() or unavailable_generated.isna().any():
+        raise ValueError("TCA preflight found invalid EWMA generated-at timestamps.")
+    if available_generated.duplicated().any() or unavailable_generated.duplicated().any():
+        raise ValueError("TCA preflight found duplicate EWMA minute requests.")
+    available_times = set(available_generated)
+    unavailable_times = set(unavailable_generated)
+    if available_times & unavailable_times or not expected.issubset(
+        available_times | unavailable_times
+    ):
+        raise ValueError("TCA preflight found missing or conflicting EWMA minute requests.")
+    sample_ids = set(scale["sample_id"].astype(str))
+    if not set(available["sample_id"].astype(str)).issubset(sample_ids) or not set(
+        unavailable["sample_id"].astype(str)
+    ).issubset(sample_ids):
+        raise ValueError("TCA preflight found an EWMA sample identity mismatch.")
+    if not unavailable["status"].eq("EWMA_UNAVAILABLE").all():
+        raise ValueError("TCA preflight found an invalid EWMA availability status.")
+    for frame in (available, unavailable):
+        for row in frame.itertuples(index=False):
+            generated_at = pd.Timestamp(row.generated_at)
+            expected_sample = expected_sample_ids.get(generated_at)
+            if expected_sample is not None and str(row.sample_id) != expected_sample:
+                raise ValueError("TCA preflight found an EWMA as-of/sample identity mismatch.")
+
+
+def preflight_tca_ledgers(
+    *,
+    ledger_records: tuple[tuple[str, int | None, Path, dict[str, Any]], ...],
+    ewma_records: Mapping[str, tuple[Path, dict[str, Any]]],
+    eligible_cases: Mapping[date, tuple[str, ...]],
+    training_cutoff: date,
+    tca_config: Mapping[str, Any],
+) -> None:
+    """Fail closed on derived-artifact gaps before any replay worker starts."""
+    if not eligible_cases:
+        return
+    origins = _tca_as_of_origins(tca_config)
+    if not ledger_records:
+        raise ValueError("TCA preflight requires learned forecast ledger records.")
+    for _, _, directory, identity in ledger_records:
+        verify_artifact(directory, identity=identity, names=LEARNED_LEDGER_FILES)
+        for session_date, instruments in sorted(eligible_cases.items()):
+            for instrument_id in instruments:
+                _validate_learned_case(
+                    directory,
+                    instrument_id=instrument_id,
+                    session_date=session_date,
+                    fold_id=str(identity["fold_id"]),
+                    training_cutoff=training_cutoff,
+                    origins=origins,
+                )
+    verified_ewma: set[Path] = set()
+    for session_date, instruments in sorted(eligible_cases.items()):
+        for instrument_id in instruments:
+            if instrument_id not in ewma_records:
+                raise ValueError("TCA preflight is missing an EWMA ledger record.")
+            directory, identity = ewma_records[instrument_id]
+            if directory.resolve() not in verified_ewma:
+                verify_artifact(directory, identity=identity, names=EWMA_FILES)
+                verified_ewma.add(directory.resolve())
+            _validate_ewma_case(
+                directory,
+                instrument_id=instrument_id,
+                session_date=session_date,
+                fold_id=str(identity["fold_id"]),
+                origins=origins,
+            )
 
 
 def run_tca_work(work: TCAWork) -> Path:

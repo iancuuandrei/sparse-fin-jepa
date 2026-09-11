@@ -10,9 +10,82 @@ import numpy as np
 import pandas as pd
 
 from execsim.data.paper.manifests import file_sha256
+from execsim.data.paper.resolution_quality import assess_session_resolution_quality
 from execsim.ml.paper.evaluation_artifacts import publish_frames, verify_artifact
 
 HISTORY_FILES = ("bars.parquet", "adv.parquet", "profiles.parquet", "sessions.parquet")
+
+
+def filter_tca_window_exact(
+    bars: pd.DataFrame, selected_instruments: tuple[str, ...] | set[str]
+) -> pd.DataFrame:
+    """Retain only selected instrument-sessions with an exact 10:30-15:29 grid.
+
+    The resolution-quality assessor is the authoritative contract. This function
+    never fills, interpolates, or infers a missing minute from a calendar.
+    """
+    required = {"instrument_id", "timestamp"}
+    missing = required.difference(bars.columns)
+    if missing:
+        raise ValueError(f"TCA population input missing columns: {sorted(missing)}")
+    if bars.empty:
+        return bars.copy()
+    selected = (
+        bars.loc[
+            bars["instrument_id"].astype(str).isin({str(value) for value in selected_instruments})
+        ]
+        .copy()
+        .reset_index(drop=True)
+    )
+    if selected.empty:
+        return selected
+    selected["__tca_session_date"] = None
+    eligible: set[tuple[object, str]] = set()
+    # Parse and assess each instrument independently. A malformed timezone in
+    # one instrument must not suppress a valid instrument from the same date.
+    for instrument_id, instrument_group in selected.groupby("instrument_id", sort=True):
+        local_dates = []
+        valid_timestamps = True
+        for value in instrument_group["timestamp"]:
+            try:
+                timestamp = pd.Timestamp(value)
+            except (TypeError, ValueError):
+                valid_timestamps = False
+                break
+            if (
+                pd.isna(timestamp)
+                or timestamp.tzinfo is None
+                or str(timestamp.tz) != "America/New_York"
+            ):
+                valid_timestamps = False
+                break
+            local_dates.append(timestamp.tz_convert("America/New_York").date())
+        if not valid_timestamps:
+            continue
+        selected.loc[instrument_group.index, "__tca_session_date"] = local_dates
+        dated_group = instrument_group.assign(__tca_session_date=local_dates)
+        for session_date, group in dated_group.groupby("__tca_session_date", sort=True):
+            try:
+                quality = assess_session_resolution_quality(
+                    group.drop(columns="__tca_session_date")
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if quality.tca_window_exact:
+                eligible.add((session_date, str(instrument_id)))
+    keys = pd.MultiIndex.from_arrays(
+        [selected["__tca_session_date"], selected["instrument_id"].astype(str)]
+    )
+    keep = keys.isin(eligible)
+    return selected.loc[keep].drop(columns="__tca_session_date").reset_index(drop=True)
+
+
+def tca_eligible_instrument_ids(
+    bars: pd.DataFrame, selected_instruments: tuple[str, ...] | set[str]
+) -> tuple[str, ...]:
+    """Return the selected instruments that have at least one exact TCA session."""
+    filtered = filter_tca_window_exact(bars, selected_instruments)
+    return tuple(sorted(filtered["instrument_id"].astype(str).unique()))
 
 
 def prepare_tca_history(

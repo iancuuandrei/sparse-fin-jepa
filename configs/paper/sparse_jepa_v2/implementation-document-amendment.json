@@ -35,7 +35,7 @@
     },
     "docs/standards/implementation.md": {
       "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
-      "current_sha256": "0ff65e8092c02a3f70b9fadd39683214303a5ad7197758062b0c3651faa28e24",
+      "current_sha256": "399de24cde922fba11ea45724a086158e4fdce92bbff710d190fea7faef50b82",
       "edits": [
         {
           "start": 23,
@@ -48,6 +48,12 @@
           "end": 46,
           "original": "",
           "replacement": "| Historical forecast availability | Record unavailable exact EWMA requests and method-specific TCA cases; retain other methods and report paired coverage | Missing eligible history is not a fabricated zero forecast or a reason to remove an instrument globally; see ADR 0023 |\n| Result timestamp storage | Merge timestamp fields at the finest input precision with identical timezones and safe casts; keep other types strict | Arrow storage-unit differences must neither abort compatible results nor truncate instants; see ADR 0024 |\n| Evaluation derived state | Build one compact base per fold and publish learned predictions with checksum-bound atomic manifests; reuse completed predictions within the new evaluation identity | Reconstructing raw rows or rerunning identical frozen predictions adds work without information; incomplete artifacts must never be treated as completed stages |\n"
+        },
+        {
+          "start": 260,
+          "end": 275,
+          "original": "",
+          "replacement": "\n### 2026-09-11 — pre-evaluation identity hardening (ADR 0025)\n\nThe locked evaluator now treats causal ADV20 as required derived evidence for\nevery exact-window eligible instrument/session.  Validation occurs before TCA\nworkers and is repeated at the direct replay boundary; missing, duplicate,\nnon-finite, or non-positive values fail closed rather than changing the sample.\nForecast and TCA stages resolve relocated runtime data through the canonical\n`PaperRunConfig.data_path` abstraction.  Before consuming TEST inputs they bind\nthe runtime universe bytes to one shared `universe_manifest_hash` recorded by\nevery fold sequence manifest.  Reseal now validates the complete configured\nprimary JEPA final inventory and requires one non-empty training `code_commit`\nacross all coordinates, before publishing a new execution namespace.  These\nchecks are identity/provenance safeguards only and do not alter scientific\nconfiguration, estimands, or model artifacts.  See ADR 0025.\n"
         }
       ]
     },

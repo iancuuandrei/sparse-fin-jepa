@@ -65,6 +65,24 @@ def _safe_child(root: Path, name: str) -> Path:
     return Path(os.path.abspath(root / name))
 
 
+def _validate_primary_jepa_source_uniformity(
+    code_commits: list[object], *, expected_count: int
+) -> None:
+    """Require the configured primary JEPA matrix to come from one source commit."""
+    if len(code_commits) != expected_count:
+        raise ValueError(
+            "Frozen JEPA primary inventory must contain exactly "
+            f"{expected_count} final manifests; found {len(code_commits)}."
+        )
+    normalized = []
+    for value in code_commits:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Frozen JEPA final manifest is missing a non-empty code_commit.")
+        normalized.append(value.strip())
+    if len(set(normalized)) != 1:
+        raise ValueError("Frozen JEPA primary final manifests must have one shared code_commit.")
+
+
 def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
     """Hash the exact configured model matrix and verify its original checksum links."""
     root = config.artifact_root.resolve()
@@ -103,6 +121,13 @@ def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
     records = freeze["lightgbm_manifests"]
     recorded = {record["path"]: record["sha256"] for record in records}
     expected_paths = set()
+    primary_jepa_code_commits: list[object] = []
+    configured_primary_count = sum(
+        1
+        for _fold in config.evaluation["folds"]
+        for _geometry in ("dense", "sparse")
+        for _seed in config.representation["seeds"]
+    )
     for fold in config.evaluation["folds"]:
         fold_id = str(fold["id"])
         bind(root / "sequences" / fold_id / "sequence-manifest.json")
@@ -138,6 +163,7 @@ def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
             embedding = root / "embeddings" / fold_id / method / str(seed)
             export = bind(embedding / "manifest.json")
             checkpoint = bind(rep / "final/manifest.json", export["checkpoint_manifest_hash"])
+            primary_jepa_code_commits.append(checkpoint.get("code_commit"))
             if (
                 checkpoint.get("geometry") != method
                 or checkpoint.get("seed") != seed
@@ -159,6 +185,9 @@ def frozen_inventory(config: PaperRunConfig) -> dict[str, str]:
                 bind(_safe_child(embedding, item["path"]), item["sha256"])
     if len(recorded) != len(records) or set(recorded) != expected_paths:
         raise ValueError("Frozen LightGBM matrix contains extra or duplicated coordinates.")
+    _validate_primary_jepa_source_uniformity(
+        primary_jepa_code_commits, expected_count=configured_primary_count
+    )
     return dict(sorted(inventory.items()))
 
 

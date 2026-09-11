@@ -37,15 +37,17 @@ def _run_with_fake_replay(
     bars: pd.DataFrame,
     calls: list[str],
     provider_calls: list[tuple[str, date]] | None = None,
+    adv: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     universe = pd.DataFrame({"rank": [1, 2], "instrument_id": ["A", "B"]})
-    adv = pd.DataFrame(
-        {
-            "instrument_id": ["A", "B"],
-            "session_date": [date(2024, 11, 27)] * 2,
-            "adv20": [100_000.0, 100_000.0],
-        }
-    )
+    if adv is None:
+        adv = pd.DataFrame(
+            {
+                "instrument_id": ["A", "B"],
+                "session_date": [date(2024, 11, 27)] * 2,
+                "adv20": [100_000.0, 100_000.0],
+            }
+        )
 
     def fake_simulate_policy(**kwargs):
         calls.append(kwargs["parent_order"].symbol)
@@ -97,6 +99,54 @@ def test_full_session_with_exact_tca_grid_is_scheduled(monkeypatch):
     result = _run_with_fake_replay(monkeypatch, bars, calls)
     assert calls == ["A"]
     assert set(result["instrument_id"]) == {"A"}
+
+
+def test_missing_adv_for_one_eligible_case_fails_before_any_replay(monkeypatch):
+    bars = pd.concat([_session("A"), _session("B")], ignore_index=True)
+    calls: list[str] = []
+    provider_calls: list[tuple[str, date]] = []
+    adv = pd.DataFrame(
+        {
+            "instrument_id": ["A"],
+            "session_date": [date(2024, 11, 27)],
+            "adv20": [100_000.0],
+        }
+    )
+    with pytest.raises(ValueError, match="ADV20 required"):
+        _run_with_fake_replay(monkeypatch, bars, calls, provider_calls, adv)
+    assert calls == []
+    assert provider_calls == []
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, 0.0, -1.0])
+def test_nonpositive_or_nonfinite_adv_for_eligible_case_fails_closed(monkeypatch, value):
+    bars = pd.concat([_session("A"), _session("B")], ignore_index=True)
+    calls: list[str] = []
+    adv = pd.DataFrame(
+        {
+            "instrument_id": ["A", "B"],
+            "session_date": [date(2024, 11, 27)] * 2,
+            "adv20": [100_000.0, value],
+        }
+    )
+    with pytest.raises(ValueError, match="finite and positive"):
+        _run_with_fake_replay(monkeypatch, bars, calls, adv=adv)
+    assert calls == []
+
+
+def test_duplicate_adv_for_eligible_case_fails_closed(monkeypatch):
+    bars = pd.concat([_session("A"), _session("B")], ignore_index=True)
+    calls: list[str] = []
+    adv = pd.DataFrame(
+        {
+            "instrument_id": ["A", "B", "B"],
+            "session_date": [date(2024, 11, 27)] * 3,
+            "adv20": [100_000.0, 100_000.0, 100_000.0],
+        }
+    )
+    with pytest.raises(ValueError, match="exactly one row"):
+        _run_with_fake_replay(monkeypatch, bars, calls, adv=adv)
+    assert calls == []
 
 
 @pytest.mark.parametrize(

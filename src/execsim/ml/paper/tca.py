@@ -271,7 +271,7 @@ def run_historical_tca(
     """Run matched 10:30-15:30 deterministic MPC cases with only provider variation."""
     from execsim.costs import CostParameter, LinearTemporaryImpactModel
     from execsim.forecasting.historical import HistoricalForecastUnavailable
-    from execsim.ml.paper.tca_inputs import filter_tca_window_exact
+    from execsim.ml.paper.tca_inputs import filter_tca_window_exact, validate_tca_adv20
     from execsim.orders import ParentOrder
     from execsim.policies import ExecutionConstraints
     from execsim.simulator import simulate_policy
@@ -297,10 +297,19 @@ def run_historical_tca(
     required_adv = {"instrument_id", "session_date", "adv20"}
     if missing := required_adv.difference(adv20.columns):
         raise ValueError(f"ADV20 input missing columns: {sorted(missing)}")
+    adv_session_dates = pd.to_datetime(adv20["session_date"], errors="coerce").dt.date
     selected = filter_tca_window_exact(bars, instruments)
     selected["session_date"] = (
         pd.to_datetime(selected["timestamp"]).dt.tz_convert("America/New_York").dt.date
     )
+    # Validate the complete exact-window population before invoking any provider
+    # or replay.  ADV availability is derived evidence, not a population filter.
+    eligible_cases = {
+        session_date: tuple(sorted(date_bars["instrument_id"].astype(str).unique()))
+        for session_date, date_bars in selected.groupby("session_date", sort=True)
+    }
+    validate_tca_adv20(adv20, eligible_cases)
+
     rows = []
     for session_date, date_bars in selected.groupby("session_date", sort=True):
         available = tuple(sorted(date_bars["instrument_id"].astype(str).unique()))
@@ -312,10 +321,15 @@ def run_historical_tca(
             symbol = str(instrument_bars["symbol"].iloc[0])
             adv_match = adv20.loc[
                 (adv20["instrument_id"].astype(str) == instrument_id)
-                & (pd.to_datetime(adv20["session_date"]).dt.date == session_date)
+                & adv_session_dates.eq(session_date)
             ]
-            if len(adv_match) != 1:
-                continue
+            # validate_tca_adv20 above makes this a defensive assertion rather
+            # than a silent population change if this path is edited later.
+            if len(adv_match) != 1:  # pragma: no cover - guarded by preflight
+                raise ValueError(
+                    "ADV20 required for eligible TCA case "
+                    f"{instrument_id}/{session_date}: expected exactly one row."
+                )
             quantity = max(1, round(order_fraction * float(adv_match["adv20"].iloc[0])))
             arrival = float(
                 instrument_bars.loc[

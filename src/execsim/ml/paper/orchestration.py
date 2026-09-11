@@ -1397,7 +1397,8 @@ def evaluate_forecasts_stage(
         run_ewma_workers,
     )
 
-    universe = read_json(Path(config.data["universe_manifest"]))
+    universe_path = _verify_frozen_universe_manifest(config)
+    universe = read_json(universe_path)
     liquidity = {
         str(member["instrument_id"]): int(member["liquidity_group"])
         for member in universe["members"]
@@ -1411,7 +1412,7 @@ def evaluate_forecasts_stage(
         ),
     }
     market_inputs = compact_profile_corpus(
-        Path(config.data["target_corpus_root"]),
+        config.data_path("target_corpus_root"),
         evaluation_root(config) / "evaluation-v2" / "profile-corpus",
         identity=execution_identity,
     )
@@ -1860,6 +1861,7 @@ def run_tca_stage(
         prepare_tca_history,
         read_tca_date,
         tca_eligible_instrument_ids,
+        validate_tca_adv20,
     )
     from execsim.ml.paper.tca_workers import (
         TCAWork,
@@ -1937,7 +1939,8 @@ def run_tca_stage(
             "cutoff": pd.Timestamp(fold["train"][1]).date(),
         }
 
-    universe = pd.DataFrame(read_json(Path(config.data["universe_manifest"]))["members"])
+    universe_path = _verify_frozen_universe_manifest(config)
+    universe = pd.DataFrame(read_json(universe_path)["members"])
     instruments = set(
         select_liquidity_spaced_instruments(universe, size=int(config.tca["universe_size"]))
     ) | set(
@@ -1946,7 +1949,7 @@ def run_tca_stage(
         )
     )
     market = compact_profile_corpus(
-        source or Path(config.data["target_corpus_root"]),
+        source or config.data_path("target_corpus_root"),
         evaluation_root(config) / "evaluation-v2" / "tca-market",
         identity=execution,
         include_market_bars=True,
@@ -1991,9 +1994,12 @@ def run_tca_stage(
         for day in dates:
             if not start <= day <= end:
                 continue
-            date_bars, _ = read_tca_date(histories, day)
+            date_bars, date_adv = read_tca_date(histories, day)
             eligible = tca_eligible_instrument_ids(date_bars, instruments)
             if eligible:
+                # Validate required derived evidence before ledger preflight or
+                # construction/launch of any TCA worker.
+                validate_tca_adv20(date_adv, {day: eligible})
                 eligible_cases[day] = eligible
         preflight_tca_ledgers(
             ledger_records=context["ledgers"],
@@ -3097,6 +3103,38 @@ def _is_frozen_universe(path: Path, *, config_hash: str) -> bool:
     )
 
 
+def _verify_frozen_universe_manifest(config: PaperRunConfig) -> Path:
+    """Bind relocated runtime universe bytes to every fold's frozen sequence identity.
+
+    The universe controls liquidity groups and therefore the locked evaluation
+    population.  Sequence manifests are immutable upstream evidence; a
+    relocated evaluator must consume exactly the byte-identical manifest they
+    reference, never a similarly named repository-relative file.
+    """
+    universe_path = config.data_path("universe_manifest")
+    if not universe_path.is_file():
+        raise RuntimeError(f"BLOCKED: runtime universe manifest is unavailable: {universe_path}")
+    expected_hashes: list[str] = []
+    for fold in config.evaluation["folds"]:
+        fold_id = str(fold["id"])
+        sequence_path = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
+        if not sequence_path.is_file():
+            raise RuntimeError(f"BLOCKED: frozen sequence manifest is unavailable: {sequence_path}")
+        sequence = read_json(sequence_path)
+        expected = sequence.get("universe_manifest_hash")
+        if not isinstance(expected, str) or not expected:
+            raise ValueError(f"Sequence manifest has no universe identity: {sequence_path}")
+        expected_hashes.append(expected)
+    if not expected_hashes or len(set(expected_hashes)) != 1:
+        raise ValueError("Frozen sequence manifests do not share one universe manifest identity.")
+    actual = file_sha256(universe_path)
+    if actual != expected_hashes[0]:
+        raise ValueError(
+            "Runtime universe manifest checksum does not match the frozen sequence identity."
+        )
+    return universe_path
+
+
 def _as_date(value: object) -> date:
     """Normalize YAML date scalars and ISO strings."""
     if isinstance(value, date):
@@ -3497,11 +3535,21 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
     if not result_files:
         raise RuntimeError("BLOCKED: final historical result bundle is empty.")
     representation_manifests = sorted(representation_root(config).glob("*/*/*/final/manifest.json"))
-    representation_commits = {
-        str(read_json(path).get("code_commit")) for path in representation_manifests
-    }
-    if len(representation_manifests) != 18 or len(representation_commits) != 1:
+    representation_commits = [
+        read_json(path).get("code_commit") for path in representation_manifests
+    ]
+    normalized_representation_commits = [
+        commit.strip()
+        for commit in representation_commits
+        if isinstance(commit, str) and commit.strip()
+    ]
+    if (
+        len(representation_manifests) != 18
+        or len(normalized_representation_commits) != len(representation_manifests)
+        or len(set(normalized_representation_commits)) != 1
+    ):
         raise RuntimeError("BLOCKED: representation source identity is not uniquely frozen.")
+    representation_source_commit = normalized_representation_commits[0]
     lightgbm_manifests = sorted((config.artifact_root / "lightgbm").glob("*/*/*/manifest.json"))
     if len(lightgbm_manifests) != 24:
         raise RuntimeError("BLOCKED: final result freeze requires 24 LightGBM manifests.")
@@ -3509,7 +3557,7 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
         "schema_version": "paper-final-result-freeze-v1",
         "status": "FINAL-RESULTS-FROZEN",
         "frozen_at_utc": datetime.now(UTC).isoformat(),
-        "representation_source_commit": representation_commits.pop(),
+        "representation_source_commit": representation_source_commit,
         "downstream_evaluation_commit": _git_head(),
         "downstream_evaluation_tree": _git_tree(),
         "paper_config_hash": config.config_hash,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,52 @@ def tca_eligible_instrument_ids(
     """Return the selected instruments that have at least one exact TCA session."""
     filtered = filter_tca_window_exact(bars, selected_instruments)
     return tuple(sorted(filtered["instrument_id"].astype(str).unique()))
+
+
+def validate_tca_adv20(
+    adv20: pd.DataFrame,
+    eligible_cases: Mapping[date, tuple[str, ...] | set[str]],
+) -> None:
+    """Require one finite, positive causal ADV20 value for every eligible case.
+
+    Exact-window eligibility is a scientific population rule and is intentionally
+    independent of ADV availability.  Once that population is fixed, however,
+    ADV20 is required evidence for constructing the frozen order quantity.  This
+    validator therefore fails closed instead of allowing a missing or malformed
+    derived row to silently remove a case.
+    """
+    required = {"instrument_id", "session_date", "adv20"}
+    if missing := required.difference(adv20.columns):
+        raise ValueError(f"ADV20 input missing columns: {sorted(missing)}")
+    if not eligible_cases:
+        return
+    try:
+        session_dates = pd.to_datetime(adv20["session_date"], errors="coerce").dt.date
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("ADV20 session-date identity is invalid.") from exc
+    for session_date, instruments in sorted(eligible_cases.items()):
+        for instrument_id in sorted(str(value) for value in instruments):
+            matches = adv20.loc[
+                adv20["instrument_id"].astype(str).eq(instrument_id)
+                & session_dates.eq(session_date)
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "ADV20 required for eligible TCA case "
+                    f"{instrument_id}/{session_date}: expected exactly one row, "
+                    f"found {len(matches)}."
+                )
+            try:
+                value = float(matches.iloc[0]["adv20"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"ADV20 for eligible TCA case {instrument_id}/{session_date} is not numeric."
+                ) from exc
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"ADV20 for eligible TCA case {instrument_id}/{session_date} "
+                    "must be finite and positive."
+                )
 
 
 def prepare_tca_history(

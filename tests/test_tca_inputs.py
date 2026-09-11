@@ -134,7 +134,7 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
     )
     sequence = root / "sequences/fold-1/sequence-manifest.json"
     sequence.parent.mkdir(parents=True)
-    sequence.write_text("{}")
+    sequence.write_text(json.dumps({"universe_manifest_hash": file_sha256(universe)}))
     execution = {
         "source_commit": "fixture",
         "source_tree": "fixture",
@@ -161,6 +161,7 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
             ]
         },
     )
+    config.data_path = lambda name: Path(config.data[name])
     base = root / "evaluation-v2/bases/fold-1"
     base.mkdir(parents=True)
     (base / "manifest.json").write_text("{}")

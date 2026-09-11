@@ -262,6 +262,20 @@ interruption, unchanged reuse, changed source, corrupted output, and changed inp
 Historical restart remains PLANNED. Existing unit checks
 do not establish completion of these runtime stages. See ADR 0022 for rationale.
 
+Before a resealed TEST execution can consume runtime data, forecast and TCA
+stages resolve the universe and target corpus with `PaperRunConfig.data_path`.
+The runtime universe must have the exact byte hash recorded by every fold's
+sequence manifest, and all sequence manifests must agree on that identity.
+Reseal also checks the complete configured primary JEPA final inventory: every
+manifest must provide a non-empty training `code_commit`, and all coordinates
+must share one commit.  Final-result-freeze retains the same check as defense
+in depth.  For TCA, exact-window eligibility remains independent of ADV
+availability, but every eligible case must have exactly one finite, positive
+causal ADV20 row before worker launch; direct historical replay repeats this
+check and raises rather than silently dropping a case.  These are fail-closed
+identity and derived-evidence checks; they do not open TEST or change the
+frozen estimand.
+
 Learned inference materializes at most 2,048 scale samples and their complete
 future shape rows per wide batch. A compact embedding partition is read once per
 coordinate and attached by exact sample ID to each batch, rather than expanded

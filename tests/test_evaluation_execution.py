@@ -5,6 +5,7 @@ import pytest
 
 from execsim.data.paper.manifests import file_sha256
 from execsim.ml.paper.evaluation_execution import (
+    _validate_primary_jepa_source_uniformity,
     seal_evaluation_execution,
     verify_evaluation_execution,
 )
@@ -48,6 +49,7 @@ def frozen_run(tmp_path):
                 "seed": seed,
                 "paper_config_hash": "fixture",
                 "calibrated_rdm_lambda": 10.0,
+                "code_commit": "jepa-commit",
                 "weights_sha256": weights,
             },
         )
@@ -227,3 +229,20 @@ def test_verified_execution_hashes_once_then_detects_changed_files(frozen_run, m
     model.write_text("changed")
     with pytest.raises(ValueError, match="changed"):
         verify_evaluation_execution(config, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("commits", "matches"),
+    [
+        (["jepa"] * 18, None),
+        (["jepa"] * 17, "exactly 18"),
+        (["jepa"] * 17 + [None], "non-empty"),
+        (["jepa"] * 17 + ["other"], "one shared"),
+    ],
+)
+def test_primary_jepa_source_uniformity_is_fail_closed(commits, matches):
+    if matches is None:
+        _validate_primary_jepa_source_uniformity(commits, expected_count=18)
+    else:
+        with pytest.raises(ValueError, match=matches):
+            _validate_primary_jepa_source_uniformity(commits, expected_count=18)

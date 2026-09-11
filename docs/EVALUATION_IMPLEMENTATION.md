@@ -1,5 +1,11 @@
 # Optimized evaluation implementation
 
+Result shard merging promotes each timestamp field to the finest input storage
+unit, including typed empty shards. Timezones must match exactly, batch casts are
+safe (overflow fails), and other type conflicts remain errors. No timestamp is
+rounded or converted to another timezone. Input hashes, canonical row ordering,
+atomic publication, and resume verification remain mandatory; see ADR 0024.
+
 This document records software behavior for the downstream evaluator replacement.
 It does not amend model parameters, TEST inclusion, or statistical estimands.
 

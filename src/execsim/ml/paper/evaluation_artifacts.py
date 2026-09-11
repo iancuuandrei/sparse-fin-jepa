@@ -193,7 +193,7 @@ def merge_result_shards(
             ranges.append((first, last, shard))
             total += len(frame)
             del frame, table
-        schema = pa.unify_schemas(schemas)
+        schema = _merge_schema(schemas)
         ranges.sort(key=lambda item: item[0])
         for previous, current in pairwise(ranges):
             if previous[1] >= current[0]:
@@ -220,6 +220,33 @@ def merge_result_shards(
         os.replace(output, destination)
         write_json_atomic(receipt_path, receipt)
     return receipt
+
+
+def _merge_schema(schemas: Sequence[pa.Schema]) -> pa.Schema:
+    """Promote timestamp units losslessly; retain strict checks for all other types."""
+    units = {"s": 0, "ms": 1, "us": 2, "ns": 3}
+    timestamps: dict[str, Any] = {}
+    for schema in schemas:
+        for field in schema:
+            if pa.types.is_timestamp(field.type):
+                previous = timestamps.get(field.name)
+                if previous is not None and previous.tz != field.type.tz:
+                    raise ValueError("Result shard timestamp timezones differ.")
+                if previous is None or units[field.type.unit] > units[previous.unit]:
+                    timestamps[field.name] = field.type
+    normalized = [
+        pa.schema(
+            [
+                field.with_type(timestamps[field.name])
+                if pa.types.is_timestamp(field.type)
+                else field
+                for field in schema
+            ]
+        )
+        for schema in schemas
+    ]
+    # The streaming table cast remains safe=True: overflow cannot silently wrap.
+    return pa.unify_schemas(normalized)
 
 
 class VerifiedArtifact:

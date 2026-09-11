@@ -1,4 +1,6 @@
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from execsim.data.paper.manifests import file_sha256
@@ -63,3 +65,68 @@ def test_result_merge_rejects_invalid_expected_inventory(tmp_path, problem):
             schema_version="fixture-v1",
         )
     assert not (tmp_path / "merged.manifest.json").exists()
+
+
+def test_merge_preserves_mixed_timestamp_precision_and_empty_shards(tmp_path):
+    sources = {}
+    expected = []
+    for index, unit in enumerate(("ms", "us", "ns", "us")):
+        stamp = pd.Timestamp("2024-04-12 10:30:00", tz="America/New_York")
+        stamp += pd.Timedelta(index, unit=unit)
+        values = [] if index == 3 else [stamp, None]
+        table = pa.table(
+            {
+                "id": pa.array([index * 2, index * 2 + 1] if values else [], type=pa.int64()),
+                "generated_at": pa.array(values, type=pa.timestamp(unit, "America/New_York")),
+            }
+        )
+        path = tmp_path / f"{index}.parquet"
+        pq.write_table(table, path)
+        sources[str(index)] = (path, file_sha256(path))
+        expected.extend(values)
+    output = tmp_path / "merged.parquet"
+    options = dict(
+        sources=sources,
+        keys=("id",),
+        identity={"paper_config_hash": "fixture"},
+        schema_version="fixture-v1",
+    )
+    receipt = merge_result_shards(output, **options)
+    actual = pq.read_table(output)["generated_at"]
+    assert actual.type == pa.timestamp("ns", "America/New_York")
+    assert actual == pa.chunked_array([pa.array(expected, type=actual.type)])
+    assert receipt["rows"] == 6
+    assert merge_result_shards(output, **options) == receipt
+    other = tmp_path / "reversed.parquet"
+    merge_result_shards(other, **{**options, "sources": dict(reversed(list(sources.items())))})
+    assert file_sha256(other) == file_sha256(output)
+
+
+@pytest.mark.parametrize("problem", ["timezone", "naive", "type", "overflow"])
+def test_timestamp_promotion_remains_fail_closed(tmp_path, problem):
+    types = [pa.timestamp("ms", "America/New_York"), pa.timestamp("ns", "America/New_York")]
+    if problem == "timezone":
+        types[1] = pa.timestamp("us", "UTC")
+    elif problem == "naive":
+        types[1] = pa.timestamp("us")
+    elif problem == "type":
+        types[1] = pa.int64()
+    sources = {}
+    for index, kind in enumerate(types):
+        value = 20_000_000_000_000 if problem == "overflow" and index == 0 else 1
+        path = tmp_path / f"{index}.parquet"
+        pq.write_table(
+            pa.table({"id": [index], "generated_at": pa.array([value], type=kind)}), path
+        )
+        sources[str(index)] = (path, file_sha256(path))
+    output = tmp_path / "merged.parquet"
+    with pytest.raises((ValueError, pa.ArrowException)):
+        merge_result_shards(
+            output,
+            sources=sources,
+            keys=("id",),
+            identity={"paper_config_hash": "fixture"},
+            schema_version="fixture-v1",
+        )
+    assert not output.exists()
+    assert not output.with_suffix(".manifest.json").exists()

@@ -29,6 +29,9 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 
 ## Recording a decision
 
+ADR [0024](0024-promote-result-timestamp-precision.md) is accepted: promote only
+timestamp precision during result merging, preserving instants and strict timezones.
+
 ADR [0023](0023-record-unavailable-historical-forecasts.md) is accepted: record
 method-specific historical forecast unavailability without changing estimators.
 

@@ -282,7 +282,7 @@ def _publish_multi_session_preflight_ledgers(tmp_path):
             "unavailable.parquet": unavailable,
         },
     )
-    return learned, learned_identity, ewma, ewma_identity, learned_scale, minute_rows, unavailable
+    return learned, learned_identity, ewma, ewma_identity, minute_rows
 
 
 def test_tca_ledger_preflight_scopes_ewma_to_current_multi_session(tmp_path):
@@ -291,9 +291,7 @@ def test_tca_ledger_preflight_scopes_ewma_to_current_multi_session(tmp_path):
         learned_identity,
         ewma,
         ewma_identity,
-        _learned_scale,
         minute_rows,
-        unavailable,
     ) = _publish_multi_session_preflight_ledgers(tmp_path)
     records = (("raw", None, learned, learned_identity),)
     kwargs = {
@@ -308,16 +306,17 @@ def test_tca_ledger_preflight_scopes_ewma_to_current_multi_session(tmp_path):
     assert "fold_id" not in pd.read_parquet(ewma / "scale.parquet").columns
     preflight_tca_ledgers(ewma_records={"A": (ewma, ewma_identity)}, **kwargs)
 
+    ewma_frames = {
+        name: pd.read_parquet(ewma / name)
+        for name in ("scale.parquet", "shape.parquet", "metrics.parquet", "unavailable.parquet")
+    }
     missing_current = tmp_path / "ewma-missing-current"
     publish_frames(
         missing_current,
         identity=ewma_identity,
         frames={
-            "scale.parquet": pd.read_parquet(ewma / "scale.parquet"),
-            "shape.parquet": pd.read_parquet(ewma / "shape.parquet"),
-            "metrics.parquet": pd.read_parquet(ewma / "metrics.parquet"),
+            **ewma_frames,
             "minute-forecasts.parquet": pd.DataFrame(minute_rows[1:]),
-            "unavailable.parquet": unavailable,
         },
     )
     with pytest.raises(ValueError, match="missing or conflicting"):
@@ -333,11 +332,8 @@ def test_tca_ledger_preflight_scopes_ewma_to_current_multi_session(tmp_path):
         wrong_current,
         identity=ewma_identity,
         frames={
-            "scale.parquet": pd.read_parquet(ewma / "scale.parquet"),
-            "shape.parquet": pd.read_parquet(ewma / "shape.parquet"),
-            "metrics.parquet": pd.read_parquet(ewma / "metrics.parquet"),
+            **ewma_frames,
             "minute-forecasts.parquet": pd.DataFrame(wrong_rows),
-            "unavailable.parquet": unavailable,
         },
     )
     with pytest.raises(ValueError, match=r"as-of/sample identity|sample identity"):

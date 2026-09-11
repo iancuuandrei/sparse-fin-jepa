@@ -1884,6 +1884,59 @@ def run_tca_stage(
     market_profiles = {
         key: profile_root / name for key, name in profile_receipt["instruments"].items()
     }
+
+    def fold_context(fold: dict[str, Any]) -> dict[str, Any]:
+        """Resolve immutable ledger paths and fold bounds once for both passes."""
+        fold_id = str(fold["id"])
+        start, end = (pd.Timestamp(value).date() for value in fold["test"])
+        variants = [
+            ("raw", None),
+            ("untrained_neural", None),
+            *(
+                (geometry, int(seed))
+                for geometry in ("dense", "sparse")
+                for seed in config.representation["seeds"]
+            ),
+        ]
+        ledgers = tuple(
+            (
+                method,
+                seed,
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / method
+                / str(seed or "shared"),
+                _learned_ledger_identity(config, fold_id, method, seed),
+            )
+            for method, seed in variants
+        )
+        ewma_records = {}
+        for instrument in sorted(instruments):
+            work = EWMAWork(
+                evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
+                market_profiles[instrument],
+                evaluation_root(config)
+                / "evaluation-v2"
+                / "forecasts"
+                / fold_id
+                / "ewma"
+                / instrument_key(instrument),
+                instrument,
+                {**execution, "fold_id": fold_id},
+            )
+            ewma_records[instrument] = (work.output_directory, ewma_ledger_identity(work))
+        return {
+            "fold_id": fold_id,
+            "start": start,
+            "end": end,
+            "sequence": config.artifact_root / "sequences" / fold_id / "sequence-manifest.json",
+            "ledgers": ledgers,
+            "ewma_records": ewma_records,
+            "cutoff": pd.Timestamp(fold["train"][1]).date(),
+        }
+
     universe = pd.DataFrame(read_json(Path(config.data["universe_manifest"]))["members"])
     instruments = set(
         select_liquidity_spaced_instruments(universe, size=int(config.tca["universe_size"]))
@@ -1925,50 +1978,15 @@ def run_tca_stage(
             for day in pd.read_parquet(history / "sessions.parquet")["session_date"]
         }
     )
+    fold_contexts = {str(fold["id"]): fold_context(fold) for fold in config.evaluation["folds"]}
     # Resolve the scientific population and validate every required ledger before
     # constructing or launching any expensive date worker.
     eligible_by_fold: dict[str, dict[date, tuple[str, ...]]] = {}
     for fold in config.evaluation["folds"]:
-        fold_id = str(fold["id"])
-        start, end = (pd.Timestamp(value).date() for value in fold["test"])
-        variants = [
-            ("raw", None),
-            ("untrained_neural", None),
-            *(
-                (geometry, int(seed))
-                for geometry in ("dense", "sparse")
-                for seed in config.representation["seeds"]
-            ),
-        ]
-        ledgers = tuple(
-            (
-                method,
-                seed,
-                evaluation_root(config)
-                / "evaluation-v2"
-                / "forecasts"
-                / fold_id
-                / method
-                / str(seed or "shared"),
-                _learned_ledger_identity(config, fold_id, method, seed),
-            )
-            for method, seed in variants
-        )
-        ewma_records = {}
-        for instrument in sorted(instruments):
-            work = EWMAWork(
-                evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
-                market_profiles[instrument],
-                evaluation_root(config)
-                / "evaluation-v2"
-                / "forecasts"
-                / fold_id
-                / "ewma"
-                / instrument_key(instrument),
-                instrument,
-                {**execution, "fold_id": fold_id},
-            )
-            ewma_records[instrument] = (work.output_directory, ewma_ledger_identity(work))
+        context = fold_contexts[str(fold["id"])]
+        fold_id = str(context["fold_id"])
+        start = context["start"]
+        end = context["end"]
         eligible_cases: dict[date, tuple[str, ...]] = {}
         for day in dates:
             if not start <= day <= end:
@@ -1978,58 +1996,24 @@ def run_tca_stage(
             if eligible:
                 eligible_cases[day] = eligible
         preflight_tca_ledgers(
-            ledger_records=ledgers,
-            ewma_records=ewma_records,
+            ledger_records=context["ledgers"],
+            ewma_records=context["ewma_records"],
             eligible_cases=eligible_cases,
-            training_cutoff=pd.Timestamp(fold["train"][1]).date(),
+            training_cutoff=context["cutoff"],
             tca_config=config.tca,
         )
         eligible_by_fold[fold_id] = eligible_cases
 
     main_outputs, sensitivity_outputs = [], []
     for fold in config.evaluation["folds"]:
-        fold_id = str(fold["id"])
-        start, end = (pd.Timestamp(value).date() for value in fold["test"])
-        sequence = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
-        variants = [
-            ("raw", None),
-            ("untrained_neural", None),
-            *(
-                (geometry, int(seed))
-                for geometry in ("dense", "sparse")
-                for seed in config.representation["seeds"]
-            ),
-        ]
-        ledgers = tuple(
-            (
-                method,
-                seed,
-                evaluation_root(config)
-                / "evaluation-v2"
-                / "forecasts"
-                / fold_id
-                / method
-                / str(seed or "shared"),
-                _learned_ledger_identity(config, fold_id, method, seed),
-            )
-            for method, seed in variants
-        )
-        ewma_records = {}
-        for instrument in sorted(instruments):
-            work = EWMAWork(
-                evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
-                market_profiles[instrument],
-                evaluation_root(config)
-                / "evaluation-v2"
-                / "forecasts"
-                / fold_id
-                / "ewma"
-                / instrument_key(instrument),
-                instrument,
-                {**execution, "fold_id": fold_id},
-            )
-            ewma_records[instrument] = (work.output_directory, ewma_ledger_identity(work))
-        cutoff = pd.Timestamp(fold["train"][1]).date()
+        context = fold_contexts[str(fold["id"])]
+        fold_id = str(context["fold_id"])
+        start = context["start"]
+        end = context["end"]
+        sequence = context["sequence"]
+        ledgers = context["ledgers"]
+        ewma_records = context["ewma_records"]
+        cutoff = context["cutoff"]
         profiles = pd.concat(
             [
                 pd.read_parquet(path / "profiles.parquet", filters=[("fold_id", "==", fold_id)])

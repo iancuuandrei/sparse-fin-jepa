@@ -77,8 +77,14 @@
     },
     "repo_manifest.yaml": {
       "frozen_sha256": "ba17e716f73b8ef82c1e3c0309911572ec8ca2662725d023b1c48a4a393a1d4f",
-      "current_sha256": "2ff93f83a50c91a6fd467699f9a31f3dba1759256eeb315b2bccb39ed7683da5",
+      "current_sha256": "b4d5ec6b603918630ee31ab26b9c83139f0b1a31981e07279946917f1bd8d580",
       "edits": [
+        {
+          "start": 81,
+          "end": 82,
+          "original": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper]\n",
+          "replacement": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py]\n"
+        },
         {
           "start": 83,
           "end": 84,

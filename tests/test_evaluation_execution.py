@@ -5,9 +5,11 @@ import pytest
 
 from execsim.data.paper.manifests import file_sha256
 from execsim.ml.paper.evaluation_execution import (
+    CHAINED_SCHEMA,
     _validate_primary_jepa_source_uniformity,
     seal_evaluation_execution,
     verify_evaluation_execution,
+    write_evaluation_supersession_receipt,
 )
 
 
@@ -346,3 +348,130 @@ def test_reseal_rejects_foreign_jepa_source_commit_before_publishing(frozen_run)
     with pytest.raises(ValueError, match="source commit"):
         _reseal_fixture(frozen_run)
     assert not (frozen_run.runtime_evaluation_root / "execution.json").exists()
+
+
+def test_chained_reseal_binds_original_authorization_and_immediate_prior(frozen_run):
+    config = frozen_run
+    first = seal_evaluation_execution(
+        config,
+        source_commit="evaluator-b",
+        source_tree="tree-b",
+        supersession=config.artifact_root / "supersession.json",
+    )
+    first_root = config.runtime_evaluation_root
+    supersession_path = config.artifact_root / "superseded-b7.json"
+    write_evaluation_supersession_receipt(
+        config,
+        superseded_execution=first_root,
+        output=supersession_path,
+        replacement_source_commit="evaluator-c",
+        replacement_source_tree="tree-c",
+        reason="corrected evaluation provenance contract",
+    )
+    config.runtime_evaluation_root = config.artifact_root / "evaluation-executions/second"
+    second = seal_evaluation_execution(
+        config,
+        source_commit="evaluator-c",
+        source_tree="tree-c",
+        supersession=supersession_path,
+    )
+    assert second["schema_version"] == CHAINED_SCHEMA
+    assert second["root_evaluation_source"] == {"commit": "old", "tree": "old-tree"}
+    assert second["previous_evaluation_source"] == first["evaluation_source"]
+    assert (
+        verify_evaluation_execution(config, source_commit="evaluator-c", source_tree="tree-c")
+        == second
+    )
+
+
+def test_chained_reseal_rejects_mutated_prior_execution(frozen_run):
+    config = frozen_run
+    first = seal_evaluation_execution(
+        config,
+        source_commit="evaluator-b",
+        source_tree="tree-b",
+        supersession=config.artifact_root / "supersession.json",
+    )
+    first_root = config.runtime_evaluation_root
+    supersession_path = config.artifact_root / "superseded-b7.json"
+    write_evaluation_supersession_receipt(
+        config,
+        superseded_execution=first_root,
+        output=supersession_path,
+        replacement_source_commit="evaluator-c",
+        replacement_source_tree="tree-c",
+        reason="corrected evaluation provenance contract",
+    )
+    # Preserve the namespace but mutate only the prior receipt bytes.  The
+    # typed receipt's checksum must make the second seal fail closed.
+    (first_root / "execution.json").write_text(json.dumps({**first, "mutated": True}))
+    config.runtime_evaluation_root = config.artifact_root / "evaluation-executions/second"
+    with pytest.raises(ValueError, match="checksum"):
+        seal_evaluation_execution(
+            config,
+            source_commit="evaluator-c",
+            source_tree="tree-c",
+            supersession=supersession_path,
+        )
+    assert not (config.runtime_evaluation_root / "execution.json").exists()
+
+
+@pytest.mark.parametrize("field", ["paper_config_hash", "parameter_freeze_sha256"])
+def test_chained_reseal_rejects_wrong_typed_identity(frozen_run, field):
+    config = frozen_run
+    _first = seal_evaluation_execution(
+        config,
+        source_commit="evaluator-b",
+        source_tree="tree-b",
+        supersession=config.artifact_root / "supersession.json",
+    )
+    supersession_path = config.artifact_root / "superseded-b7.json"
+    write_evaluation_supersession_receipt(
+        config,
+        superseded_execution=config.runtime_evaluation_root,
+        output=supersession_path,
+        replacement_source_commit="evaluator-c",
+        replacement_source_tree="tree-c",
+        reason="corrected evaluation provenance contract",
+    )
+    typed = json.loads(supersession_path.read_text())
+    typed[field] = "wrong"
+    _rewrite_fixture_json(supersession_path, typed)
+    config.runtime_evaluation_root = config.artifact_root / "evaluation-executions/second"
+    with pytest.raises(ValueError, match="incompatible"):
+        seal_evaluation_execution(
+            config,
+            source_commit="evaluator-c",
+            source_tree="tree-c",
+            supersession=supersession_path,
+        )
+
+
+def test_chained_reseal_rejects_populated_destination(frozen_run):
+    config = frozen_run
+    _first = seal_evaluation_execution(
+        config,
+        source_commit="evaluator-b",
+        source_tree="tree-b",
+        supersession=config.artifact_root / "supersession.json",
+    )
+    supersession_path = config.artifact_root / "superseded-b7.json"
+    write_evaluation_supersession_receipt(
+        config,
+        superseded_execution=config.runtime_evaluation_root,
+        output=supersession_path,
+        replacement_source_commit="evaluator-c",
+        replacement_source_tree="tree-c",
+        reason="corrected evaluation provenance contract",
+    )
+    destination = config.artifact_root / "evaluation-executions/second"
+    destination.mkdir(parents=True)
+    (destination / "partial.parquet").write_text("not a completed artifact")
+    config.runtime_evaluation_root = destination
+    with pytest.raises(ValueError, match="empty"):
+        seal_evaluation_execution(
+            config,
+            source_commit="evaluator-c",
+            source_tree="tree-c",
+            supersession=supersession_path,
+        )

@@ -1940,6 +1940,9 @@ def run_tca_stage(
         }
 
     universe_path = _verify_frozen_universe_manifest(config)
+    _corporate_action_source, corporate_actions, corporate_action_manifest_hash = (
+        _verify_frozen_corporate_action_manifest(config)
+    )
     universe = pd.DataFrame(read_json(universe_path)["members"])
     instruments = set(
         select_liquidity_spaced_instruments(universe, size=int(config.tca["universe_size"]))
@@ -1961,6 +1964,12 @@ def run_tca_stage(
         != profile_identity["source_inventory_sha256"]
     ):
         raise ValueError("TCA and forecast ledgers require the same immutable source corpus.")
+    history_kwargs: dict[str, Any] = {}
+    if corporate_actions is not None and corporate_action_manifest_hash is not None:
+        history_kwargs = {
+            "corporate_actions": corporate_actions,
+            "corporate_action_manifest_sha256": corporate_action_manifest_hash,
+        }
     histories = {
         instrument: prepare_tca_history(
             market[instrument],
@@ -1971,6 +1980,7 @@ def run_tca_stage(
                 for fold in config.evaluation["folds"]
             },
             identity=execution,
+            **history_kwargs,
         )
         for instrument in sorted(instruments)
     }
@@ -3135,6 +3145,75 @@ def _verify_frozen_universe_manifest(config: PaperRunConfig) -> Path:
     return universe_path
 
 
+def _verify_frozen_corporate_action_manifest(
+    config: PaperRunConfig,
+) -> tuple[Path | None, pd.DataFrame | None, str | None]:
+    """Bind relocated corporate-action bytes to every frozen sequence manifest.
+
+    The v2 paper configuration always declares these paths.  Returning an
+    empty optional result is retained only for small legacy unit fixtures that
+    predate corporate-action wiring; a configured evaluator fails closed on any
+    missing or mismatched evidence.
+    """
+    if not {
+        "corporate_action_source",
+        "corporate_action_manifest",
+    }.issubset(config.data):
+        return None, None, None
+    source_path = config.data_path("corporate_action_source")
+    manifest_path = config.data_path("corporate_action_manifest")
+    if not source_path.is_file() or not manifest_path.is_file():
+        raise RuntimeError(
+            "BLOCKED: runtime corporate-action source or manifest is unavailable: "
+            f"{source_path}, {manifest_path}"
+        )
+    manifest = read_json(manifest_path)
+    if manifest.get("schema_version") != "paper-corporate-actions-v1":
+        raise ValueError("Corporate-action manifest schema is incompatible.")
+    actual_source_hash = file_sha256(source_path)
+    if manifest.get("source_sha256") != actual_source_hash:
+        raise ValueError("Runtime corporate-action source checksum does not match its manifest.")
+    if manifest.get("paper_config_hash") != config.config_hash:
+        raise ValueError("Corporate-action manifest paper configuration mismatch.")
+    actual_manifest_hash = file_sha256(manifest_path)
+    if manifest.get("manifest_hash") != stable_hash(
+        {
+            key: manifest.get(key)
+            for key in (
+                "schema_version",
+                "source_sha256",
+                "row_count",
+                "instruments",
+                "paper_config_hash",
+            )
+        }
+    ):
+        raise ValueError("Corporate-action manifest self-hash mismatch.")
+    expected_hashes: list[str] = []
+    for fold in config.evaluation["folds"]:
+        fold_id = str(fold["id"])
+        sequence_path = config.artifact_root / "sequences" / fold_id / "sequence-manifest.json"
+        if not sequence_path.is_file():
+            raise RuntimeError(f"BLOCKED: frozen sequence manifest is unavailable: {sequence_path}")
+        sequence = read_json(sequence_path)
+        expected = sequence.get("corporate_action_manifest_hash")
+        if not isinstance(expected, str) or not expected:
+            raise ValueError(f"Sequence manifest has no corporate-action identity: {sequence_path}")
+        expected_hashes.append(expected)
+    if not expected_hashes or len(set(expected_hashes)) != 1:
+        raise ValueError("Frozen sequence manifests do not share one corporate-action identity.")
+    if actual_manifest_hash != expected_hashes[0]:
+        raise ValueError(
+            "Runtime corporate-action manifest checksum does not match frozen sequence identity."
+        )
+    actions = ingest_corporate_actions(source_path)
+    manifest_instruments = sorted(str(value) for value in manifest.get("instruments", []))
+    action_instruments = sorted(actions["instrument_id"].astype(str).unique())
+    if len(actions) != manifest.get("row_count") or action_instruments != manifest_instruments:
+        raise ValueError("Corporate-action manifest content summary mismatch.")
+    return source_path, actions, actual_manifest_hash
+
+
 def _as_date(value: object) -> date:
     """Normalize YAML date scalars and ISO strings."""
     if isinstance(value, date):
@@ -3455,7 +3534,12 @@ def _require_locked_test_opened(config: PaperRunConfig) -> dict[str, object]:
         execution = verify_evaluation_execution(
             config, source_commit=_git_head(), source_tree=_git_tree()
         )
-        opened_source = execution["previous_evaluation_source"]
+        # A resealed v3 execution records the original TEST authorization and
+        # its immediate predecessor independently.  Legacy v2 receipts retain
+        # the original source in ``previous_evaluation_source``.
+        opened_source = (
+            execution.get("root_evaluation_source") or execution["previous_evaluation_source"]
+        )
     if (
         payload.get("status") != "LOCKED-TEST-OPENED"
         or payload.get("evaluation_git_commit") != opened_source["commit"]

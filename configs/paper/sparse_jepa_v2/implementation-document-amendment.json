@@ -35,7 +35,7 @@
     },
     "docs/standards/implementation.md": {
       "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
-      "current_sha256": "d3a50218c7b40c8fc9538b039aeb7055bdae2d15df70d351e0aa54744b3c4c35",
+      "current_sha256": "5790180e34a8cb629fcbfa53b0a09b3a0bae39354a92b802535f5f86d90d346c",
       "edits": [
         {
           "start": 23,
@@ -60,6 +60,12 @@
           "end": 285,
           "original": "",
           "replacement": "\n### 2026-09-12 — cross-link resealed evaluation artifacts (ADR 0026)\n\nReseal must verify the existing identity links between each fold sequence\nmanifest, JEPA checkpoint, compatibility record, embedding export, and frozen\nLightGBM coordinate.  Independent file checksums do not prove that a complete\nartifact set was trained from the same sequence, universe, representation\nsource, and TRAIN/VALIDATION embedding bytes.  Cross-link checks run before\n`execution.json` publication and preserve all scientific inputs and estimands.\nSee ADR 0026.\n"
+        },
+        {
+          "start": 285,
+          "end": 296,
+          "original": "",
+          "replacement": "\n### 2026-09-12 — execution-share ADV20 and chained reseal provenance (ADRs 0027 and 0028)\n\nTCA history builders now restate each prior daily volume into the target\nsession's raw execution-share basis using the existing point-in-time split\nfactor and the 10:30 quantity-decision information clock. Replay bars remain\nraw, the 20-session lag is strict, and the corporate-action manifest identity\nis part of the history artifact identity. New reseals preserve v2 evidence but\nuse a typed supersession receipt and v3 execution identity to distinguish the\nroot TEST authorization from the immediate prior evaluator. See ADRs 0027 and\n0028.\n"
         }
       ]
     },

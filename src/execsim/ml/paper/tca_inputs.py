@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date
+from datetime import date, time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from execsim.data.paper.corporate_actions import point_in_time_split_factor
 from execsim.data.paper.manifests import file_sha256
 from execsim.data.paper.resolution_quality import assess_session_resolution_quality
 from execsim.ml.paper.evaluation_artifacts import publish_frames, verify_artifact
@@ -142,15 +143,32 @@ def prepare_tca_history(
     instrument_id: str,
     cutoffs: dict[str, date],
     identity: dict[str, Any],
+    corporate_actions: pd.DataFrame | None = None,
+    corporate_action_manifest_sha256: str | None = None,
 ) -> Path:
-    """Reuse one instrument's history, all fold profiles, and original ADV20."""
+    """Reuse one instrument's history, profiles, and causal execution-share ADV20.
+
+    When corporate-action evidence is supplied, historical daily volumes are
+    converted into the target session's raw execution-share basis using only
+    actions known and effective at the frozen 10:30 America/New_York quantity
+    decision.  Replay bars remain untouched in their raw execution basis.
+    """
+    if (corporate_actions is None) != (corporate_action_manifest_sha256 is None):
+        raise ValueError("Corporate-action rows and manifest identity must be supplied together.")
+    history_schema = (
+        "paper-tca-history-v3"
+        if corporate_action_manifest_sha256 is not None
+        else "paper-tca-history-v2"
+    )
     expected = {
         **identity,
-        "schema_version": "paper-tca-history-v2",
+        "schema_version": history_schema,
         "instrument_id": instrument_id,
         "market_sha256": file_sha256(market_path),
         "training_cutoffs": {key: value.isoformat() for key, value in sorted(cutoffs.items())},
     }
+    if corporate_action_manifest_sha256 is not None:
+        expected["corporate_action_manifest_sha256"] = corporate_action_manifest_sha256
     if directory.exists():
         verify_artifact(directory, identity=expected, names=HISTORY_FILES)
         return directory
@@ -158,7 +176,7 @@ def prepare_tca_history(
     if bars.empty or not bars["instrument_id"].astype(str).eq(instrument_id).all():
         raise ValueError("TCA compact history instrument mismatch.")
     # Aggregate in original corpus order before sorting derived replay rows.
-    adv = causal_adv20(bars)
+    adv = causal_adv20(bars, corporate_actions=corporate_actions)
     profiles = pd.DataFrame(
         {
             "fold_id": list(sorted(cutoffs)),
@@ -198,20 +216,103 @@ def read_tca_date(histories: dict[str, Path], day: date) -> tuple[pd.DataFrame, 
     return pd.concat(frames, ignore_index=True), pd.concat(advances, ignore_index=True)
 
 
-def causal_adv20(bars: pd.DataFrame) -> pd.DataFrame:
+def causal_adv20(
+    bars: pd.DataFrame,
+    *,
+    corporate_actions: pd.DataFrame | None = None,
+    decision_time: time = time(10, 30),
+) -> pd.DataFrame:
+    """Calculate causal ADV20 in each target session's execution-share units.
+
+    ``volume`` is the raw daily share volume.  For target session ``t`` and a
+    prior session ``h``, the adjusted contribution is
+
+    ``V_h * F(h, I_t) / F(t, I_t)``
+
+    where ``F`` is the cumulative point-in-time split factor resolved with
+    ``observation_at`` and information clock ``I_t``.  Thus ADV20 and the
+    target session replay bars use one raw execution-share basis.  The target
+    session itself is excluded by the 20-session lag.
+    """
     frame = bars.copy()
-    frame["session_date"] = (
-        pd.to_datetime(frame["timestamp"]).dt.tz_convert("America/New_York").dt.date
-    )
-    daily = (
-        frame.groupby(["instrument_id", "session_date"], sort=True, as_index=False)["volume"]
-        .sum()
+    timestamps = pd.to_datetime(frame["timestamp"])
+    frame["session_date"] = timestamps.dt.tz_convert("America/New_York").dt.date
+    # Preserve the historical no-action implementation exactly.  This keeps
+    # old v2 histories numerically compatible while v3 histories bind action
+    # evidence explicitly.
+    if corporate_actions is None or corporate_actions.empty:
+        daily = (
+            frame.groupby(["instrument_id", "session_date"], sort=True, as_index=False)["volume"]
+            .sum()
+            .sort_values(["instrument_id", "session_date"], kind="stable")
+        )
+        daily["adv20"] = daily.groupby("instrument_id", sort=False)["volume"].transform(
+            lambda values: values.shift(1).rolling(20, min_periods=20).mean()
+        )
+        return daily.dropna(subset=["adv20"])
+
+    # Validate and normalize the sourced action contract once at the boundary.
+    actions = ingest_corporate_actions_from_frame(corporate_actions)
+    grouped = (
+        frame.assign(__timestamp=timestamps)
+        .groupby(["instrument_id", "session_date"], sort=True, as_index=False)
+        .agg(volume=("volume", "sum"), session_observation_at=("__timestamp", "max"))
         .sort_values(["instrument_id", "session_date"], kind="stable")
     )
-    daily["adv20"] = daily.groupby("instrument_id", sort=False)["volume"].transform(
-        lambda values: values.shift(1).rolling(20, min_periods=20).mean()
-    )
-    return daily.dropna(subset=["adv20"])
+    rows: list[dict[str, object]] = []
+    for instrument_id, group in grouped.groupby("instrument_id", sort=False):
+        ordered = group.reset_index(drop=True)
+        for index in range(20, len(ordered)):
+            target = ordered.iloc[index]
+            target_date = target["session_date"]
+            target_info = pd.Timestamp(
+                f"{target_date.isoformat()} {decision_time.isoformat()}",
+                tz="America/New_York",
+            )
+            target_factor = point_in_time_split_factor(
+                actions,
+                instrument_id=str(instrument_id),
+                observation_at=target_info,
+                market_information_as_of=target_info,
+            )
+            adjusted: list[float] = []
+            for historical in ordered.iloc[index - 20 : index].itertuples(index=False):
+                historical_observation = pd.Timestamp(historical.session_observation_at)
+                historical_factor = point_in_time_split_factor(
+                    actions,
+                    instrument_id=str(instrument_id),
+                    observation_at=historical_observation,
+                    market_information_as_of=target_info,
+                )
+                adjusted.append(float(historical.volume) * historical_factor / target_factor)
+            rows.append(
+                {
+                    "instrument_id": instrument_id,
+                    "session_date": target_date,
+                    "volume": target["volume"],
+                    "adv20": float(np.mean(adjusted)),
+                }
+            )
+    return pd.DataFrame(rows, columns=["instrument_id", "session_date", "volume", "adv20"])
+
+
+def ingest_corporate_actions_from_frame(actions: pd.DataFrame) -> pd.DataFrame:
+    """Validate an already-loaded corporate-action frame without filesystem I/O."""
+    required = {"instrument_id", "effective_date", "factor", "available_at", "source"}
+    if missing := required.difference(actions.columns):
+        raise ValueError(f"Corporate-action source missing columns: {sorted(missing)}")
+    frame = actions.copy()
+    frame["effective_date"] = pd.to_datetime(frame["effective_date"], errors="coerce").dt.date
+    frame["available_at"] = pd.to_datetime(frame["available_at"], errors="coerce", utc=True)
+    frame["factor"] = pd.to_numeric(frame["factor"], errors="coerce")
+    if (
+        frame[["effective_date", "available_at", "factor"]].isna().any().any()
+        or (frame["factor"] <= 0).any()
+        or frame["source"].astype(str).str.len().eq(0).any()
+        or frame.duplicated(["instrument_id", "effective_date"]).any()
+    ):
+        raise ValueError("Corporate-action rows contain invalid dates, factors, or provenance.")
+    return frame.sort_values(["instrument_id", "effective_date"], kind="stable")
 
 
 def within_token_profile(

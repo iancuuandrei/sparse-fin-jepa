@@ -397,3 +397,10 @@ only timings, resource measurements, and a digest of mathematical outputs.
 Source bytes bind benchmark cache reuse. The reported evaluator wall time
 includes cache construction but excludes initial checkpoint/index loading.
 These are operational qualification outputs, not paper results.
+
+The execution-verification memoization guard includes every receipt and upstream
+file reached during recursive supersession verification, not only the immediate
+predecessor. After an initial successful verification, changing an older ancestor
+execution or supersession receipt still fails closed. This enforces the existing
+ADR 0028 chain contract for third and later generations without altering schemas
+or copying old results.

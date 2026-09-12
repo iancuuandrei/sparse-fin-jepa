@@ -16,8 +16,16 @@ import pandas as pd
 
 from execsim.data.paper.manifests import file_sha256
 from execsim.ml.paper.evaluation_artifacts import VerifiedArtifact, publish_frames, verify_artifact
-from execsim.ml.paper.evaluation_workers import EWMA_FILES, NATIVE_THREAD_VARIABLES
-from execsim.ml.paper.forecast_ledger import EWMAForecastLedgerProvider, PaperForecastLedgerProvider
+from execsim.ml.paper.evaluation_workers import (
+    EWMA_FILES,
+    NATIVE_THREAD_VARIABLES,
+    configure_evaluation_worker,
+)
+from execsim.ml.paper.forecast_ledger import (
+    EWMAForecastLedgerProvider,
+    ForecastLedgerDate,
+    PaperForecastLedgerProvider,
+)
 from execsim.ml.paper.tca import run_historical_tca
 
 _VERIFIED_LEDGERS: dict[Path, VerifiedArtifact] = {}
@@ -381,8 +389,16 @@ def run_tca_work(work: TCAWork) -> Path:
         artifact = _verified_ledger(
             path, expected, ("scale.parquet", "shape.parquet", "metrics.parquet")
         )
+        date_slice = ForecastLedgerDate.read(
+            artifact, dates.iloc[0], tuple(sorted(bars["instrument_id"].unique()))
+        )
 
-        def learned(instrument: str, day: date, artifact: VerifiedArtifact = artifact) -> Any:
+        def learned(
+            instrument: str,
+            day: date,
+            artifact: VerifiedArtifact = artifact,
+            date_slice: ForecastLedgerDate = date_slice,
+        ) -> Any:
             return PaperForecastLedgerProvider(
                 artifact.directory,
                 expected_identity=artifact.identity,
@@ -392,6 +408,7 @@ def run_tca_work(work: TCAWork) -> Path:
                 training_cutoff=work.training_cutoff,
                 sequence_hash=work.sequence_hash,
                 verified_artifact=artifact,
+                date_slice=date_slice,
             )
 
         name = {"raw": "lightgbm_raw", "untrained_neural": "raw_untrained_neural"}.get(
@@ -457,6 +474,9 @@ def run_tca_workers(work: list[TCAWork], *, workers: int | None = None) -> list[
     count = int(os.environ.get("EXECSIM_EVALUATION_WORKERS", "16")) if workers is None else workers
     if count < 1 or len({item.output_directory for item in work}) != len(work):
         raise ValueError("TCA workers require positive concurrency and distinct output paths.")
+    from execsim.ml.representations.probe_runtime import effective_cpu_capacity
+
+    count = min(count, max(1, int(effective_cpu_capacity())))
     if count == 1:
         return [run_tca_work(item) for item in work]
     previous = {key: os.environ.get(key) for key in NATIVE_THREAD_VARIABLES}
@@ -464,7 +484,9 @@ def run_tca_workers(work: list[TCAWork], *, workers: int | None = None) -> list[
         for key in NATIVE_THREAD_VARIABLES:
             os.environ[key] = "1"
         with ProcessPoolExecutor(
-            max_workers=count, mp_context=multiprocessing.get_context("spawn")
+            max_workers=count,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=configure_evaluation_worker,
         ) as pool:
             return list(pool.map(run_tca_work, work, chunksize=1))
     finally:

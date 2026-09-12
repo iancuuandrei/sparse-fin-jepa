@@ -335,3 +335,65 @@ and VALIDATION. All 144 requested forecasts matched the original prefix oracle
 exactly across mean, median, previous, EWMA, pooled/unpooled scope, and three
 requested minute windows. The local receipt records input SHA-256 values; this
 was not a speed benchmark, model fit, or TEST effectiveness evaluation.
+
+## Frozen input reuse (ADR 0029)
+
+The representation evaluator can materialize the exact `_encoded_batch` output
+once per coordinate and partition. Four contiguous files retain feature,
+latent-target, observable-target, and complete-mask dtypes. A metadata stream
+records the original batch boundaries, sample IDs, dates, and as-of positions.
+Memory-mapped replay copies only the active batch to the execution device.
+No incomplete rows are dropped during materialization. Statistics and probe
+updates still perform their original mask selection and reduction order.
+
+Cache manifests bind the evaluator coordinate identity, checkpoint and sequence,
+device, PyTorch version, partition, and batching. All data files are checksummed;
+missing checksums, changed bytes, unaligned shapes, or different identities fail
+closed. Publication is atomic. Cache materialization restores the loader's RNG
+state; replay consumes the same DataLoader iterator seed transition. Completed
+scientific coordinate artifacts retain their existing independent publication
+and resume contract. Disposable cache files are retired after publication so
+storage does not grow with the full coordinate matrix.
+
+The representation-stage thread policy accounts for affinity and cgroup v1/v2
+quota, limits native pools, and sets inter-op parallelism to one. This is local
+execution configuration, not a change to batch size or any scientific setting.
+
+Forecast raw features are constructed in consecutive session groups, preserving
+sample order, values, categorical inputs, and target/weight calculations. Existing
+manifest-bound index caches replace repeated tiny-index reads. TCA workers read
+one verified learned date slice and construct independent provider states for
+each simulation. Identity/file-state checks remain active; old evaluation result
+namespaces are never imported as completed outputs in a new execution.
+
+These changes require real bounded benchmark evidence and exact fixture
+equivalence. They do not imply empirical effectiveness or authorize evaluation.
+
+TCA date inputs are published during the first population pass, after exact-window
+and positive unique ADV20 validation. Dataframes remain bounded to one date.
+All fold ledger preflights must pass before any worker launches. A failed
+preflight may leave valid atomic input artifacts, never completed TCA results;
+the same source-bound execution verifies those inputs on retry. This eliminates
+the second history read and repeated window assessment without changing the
+surviving cases or their order.
+
+### Bounded probe benchmark
+
+On the qualified Linux/CUDA host, run the reference and cached paths with the
+same source, inputs, geometry, seed, row count, and native thread limit:
+
+```bash
+PYTHONPATH="$SOURCE/src" "$PYTHON" "$SOURCE/scripts/benchmark_frozen_probes.py" \
+  --source "$SOURCE" --artifact-root "$ARTIFACT_ROOT" \
+  --work "$BENCHMARK_ROOT" --mode reference --geometry sparse --rows 8192 --threads 4
+PYTHONPATH="$SOURCE/src" "$PYTHON" "$SOURCE/scripts/benchmark_frozen_probes.py" \
+  --source "$SOURCE" --artifact-root "$ARTIFACT_ROOT" \
+  --work "$BENCHMARK_ROOT" --mode cached --geometry sparse --rows 8192 --threads 4
+```
+
+The script reads TRAIN/VALIDATION only, runs the unchanged 20-epoch probe ladder,
+and uses a second VALIDATION loader in place of TEST for timing/scoring. It emits
+only timings, resource measurements, and a digest of mathematical outputs.
+Source bytes bind benchmark cache reuse. The reported evaluator wall time
+includes cache construction but excludes initial checkpoint/index loading.
+These are operational qualification outputs, not paper results.

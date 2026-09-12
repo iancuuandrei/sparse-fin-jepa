@@ -230,6 +230,9 @@ def run_ewma_workers(work: list[EWMAWork], *, workers: int | None = None) -> lis
     count = int(os.environ.get("EXECSIM_EVALUATION_WORKERS", "16")) if workers is None else workers
     if count < 1:
         raise ValueError("Evaluation worker count must be positive.")
+    from execsim.ml.representations.probe_runtime import effective_cpu_capacity
+
+    count = min(count, max(1, int(effective_cpu_capacity())))
     if len({item.output_directory for item in work}) != len(work):
         raise ValueError("Evaluation workers must own distinct output directories.")
     if count == 1:
@@ -239,7 +242,9 @@ def run_ewma_workers(work: list[EWMAWork], *, workers: int | None = None) -> lis
         for key in NATIVE_THREAD_VARIABLES:
             os.environ[key] = "1"
         with ProcessPoolExecutor(
-            max_workers=count, mp_context=multiprocessing.get_context("spawn")
+            max_workers=count,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=configure_evaluation_worker,
         ) as pool:
             return list(pool.map(run_ewma_work, work, chunksize=1))
     finally:
@@ -248,6 +253,14 @@ def run_ewma_workers(work: list[EWMAWork], *, workers: int | None = None) -> lis
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def configure_evaluation_worker() -> None:
+    """Bound Arrow pools as well as the inherited one-thread BLAS/OpenMP policy."""
+    import pyarrow as pa
+
+    pa.set_cpu_count(1)
+    pa.set_io_thread_count(1)
 
 
 def instrument_key(instrument_id: str) -> str:

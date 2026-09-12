@@ -1594,6 +1594,21 @@ def evaluate_representations_stage(
     full_run_cli_enabled: bool,
     runtime_approval: PaperRuntimeApproval | None,
 ) -> dict[str, object]:
+    """Run representation probes with bounded native pools for this stage."""
+    from execsim.ml.representations.probe_runtime import probe_thread_policy
+
+    with probe_thread_policy():
+        return _evaluate_representations_stage(
+            config, full_run_cli_enabled=full_run_cli_enabled, runtime_approval=runtime_approval
+        )
+
+
+def _evaluate_representations_stage(
+    config: PaperRunConfig,
+    *,
+    full_run_cli_enabled: bool,
+    runtime_approval: PaperRuntimeApproval | None,
+) -> dict[str, object]:
     """Run the frozen capacity ladder, observable probe, and exploratory support analysis."""
     config.authorize(
         "locked_result_evaluation",
@@ -1729,6 +1744,12 @@ def evaluate_representations_stage(
                     loader("test"),
                     device=device,
                     seed=int(seed),
+                    cache_root=evaluation_root(config) / "probe-cache" / coordinate,
+                    cache_identity={
+                        **identity,
+                        "batch_size": int(config.representation["batch_size"]),
+                        "num_workers": int(config.sequences["num_workers"]),
+                    },
                     options=FrozenProbeOptions(
                         ridge_alphas=tuple(
                             float(value) for value in config.representation["probe_ridge_alphas"]
@@ -1789,6 +1810,11 @@ def evaluate_representations_stage(
                 if method == "sparse":
                     frames["support.parquet"] = pd.DataFrame(support_rows)
                 receipt = publish_frames(destination, identity=identity, frames=frames)
+                from execsim.ml.representations.probe_cache import discard_completed_probe_cache
+
+                discard_completed_probe_cache(
+                    evaluation_root(config) / "probe-cache" / coordinate, identity=identity
+                )
                 for name in names:
                     parts[Path(name).stem][coordinate] = (
                         destination / name,
@@ -1860,7 +1886,6 @@ def run_tca_stage(
         filter_tca_window_exact,
         prepare_tca_history,
         read_tca_date,
-        tca_eligible_instrument_ids,
         validate_tca_adv20,
     )
     from execsim.ml.paper.tca_workers import (
@@ -1992,44 +2017,12 @@ def run_tca_stage(
         }
     )
     fold_contexts = {str(fold["id"]): fold_context(fold) for fold in config.evaluation["folds"]}
-    # Resolve the scientific population and validate every required ledger before
-    # constructing or launching any expensive date worker.
-    eligible_by_fold: dict[str, dict[date, tuple[str, ...]]] = {}
+    # Publish only exact-window/ADV-validated date inputs, then validate every
+    # fold ledger before any worker launches. Keep frames bounded to one date.
+    tasks_by_fold: dict[str, list[TCAWork]] = {}
     for fold in config.evaluation["folds"]:
         context = fold_contexts[str(fold["id"])]
         fold_id = str(context["fold_id"])
-        start = context["start"]
-        end = context["end"]
-        eligible_cases: dict[date, tuple[str, ...]] = {}
-        for day in dates:
-            if not start <= day <= end:
-                continue
-            date_bars, date_adv = read_tca_date(histories, day)
-            eligible = tca_eligible_instrument_ids(date_bars, instruments)
-            if eligible:
-                # Validate required derived evidence before ledger preflight or
-                # construction/launch of any TCA worker.
-                validate_tca_adv20(date_adv, {day: eligible})
-                eligible_cases[day] = eligible
-        preflight_tca_ledgers(
-            ledger_records=context["ledgers"],
-            ewma_records=context["ewma_records"],
-            eligible_cases=eligible_cases,
-            training_cutoff=context["cutoff"],
-            tca_config=config.tca,
-        )
-        eligible_by_fold[fold_id] = eligible_cases
-
-    main_outputs, sensitivity_outputs = [], []
-    for fold in config.evaluation["folds"]:
-        context = fold_contexts[str(fold["id"])]
-        fold_id = str(context["fold_id"])
-        start = context["start"]
-        end = context["end"]
-        sequence = context["sequence"]
-        ledgers = context["ledgers"]
-        ewma_records = context["ewma_records"]
-        cutoff = context["cutoff"]
         profiles = pd.concat(
             [
                 pd.read_parquet(path / "profiles.parquet", filters=[("fold_id", "==", fold_id)])
@@ -2037,18 +2030,22 @@ def run_tca_stage(
             ],
             ignore_index=True,
         ).drop(columns="fold_id")
-        tasks = []
+        tasks: list[TCAWork] = []
+        eligible_cases: dict[date, tuple[str, ...]] = {}
         for day in dates:
-            if not start <= day <= end or day not in eligible_by_fold[fold_id]:
+            if not context["start"] <= day <= context["end"]:
                 continue
             date_bars, date_adv = read_tca_date(histories, day)
-            eligible_instruments = set(eligible_by_fold[fold_id][day])
-            date_bars = filter_tca_window_exact(date_bars, eligible_instruments)
-            date_adv = date_adv.loc[
-                date_adv["instrument_id"].astype(str).isin(eligible_instruments)
-            ].reset_index(drop=True)
-            if date_bars.empty:
+            # Use the authoritative assessor exactly once for each date.
+            date_bars = filter_tca_window_exact(date_bars, instruments)
+            eligible = tuple(sorted(date_bars["instrument_id"].astype(str).unique()))
+            if not eligible:
                 continue
+            validate_tca_adv20(date_adv, {day: eligible})
+            eligible_cases[day] = eligible
+            date_adv = date_adv.loc[
+                date_adv["instrument_id"].astype(str).isin(eligible)
+            ].reset_index(drop=True)
             identity = {
                 **execution,
                 "fold_id": fold_id,
@@ -2063,7 +2060,7 @@ def run_tca_stage(
                 identity=identity,
                 frames={
                     "bars.parquet": date_bars.reset_index(drop=True),
-                    "adv.parquet": date_adv.reset_index(drop=True),
+                    "adv.parquet": date_adv,
                     "profiles.parquet": profiles,
                     "universe.parquet": universe,
                 },
@@ -2073,18 +2070,30 @@ def run_tca_stage(
                 TCAWork(
                     input_directory,
                     evaluation_root(config) / "evaluation-v2" / "tca-shards" / fold_id / str(day),
-                    ledgers,
-                    ewma_records,
-                    cutoff,
-                    file_sha256(sequence),
+                    context["ledgers"],
+                    context["ewma_records"],
+                    context["cutoff"],
+                    file_sha256(context["sequence"]),
                     dict(config.tca),
                     identity,
                 )
             )
+        preflight_tca_ledgers(
+            ledger_records=context["ledgers"],
+            ewma_records=context["ewma_records"],
+            eligible_cases=eligible_cases,
+            training_cutoff=context["cutoff"],
+            tca_config=config.tca,
+        )
+        tasks_by_fold[fold_id] = tasks
+        del profiles
+        gc.collect()
+
+    main_outputs, sensitivity_outputs = [], []
+    for tasks in tasks_by_fold.values():
         for completed in run_tca_workers(tasks):
             main_outputs.append(completed / "main.parquet")
             sensitivity_outputs.append(completed / "sensitivity.parquet")
-        del profiles, tasks
         gc.collect()
     output_root = evaluation_root(config) / "tca"
     output_root.mkdir(parents=True, exist_ok=True)

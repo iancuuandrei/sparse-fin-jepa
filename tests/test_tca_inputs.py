@@ -178,8 +178,17 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
 
     monkeypatch.setattr(orchestration, "_load_parquet_corpus", forbidden)
     seen = []
+    reads = []
+    preflight_complete = []
+
+    def counted_read(histories, day):
+        reads.append(day)
+        return read_tca_date(histories, day)
+
+    monkeypatch.setattr("execsim.ml.paper.tca_inputs.read_tca_date", counted_read)
 
     def workers(tasks):
+        assert preflight_complete == [True]
         for task in tasks:
             current = pd.Timestamp(task.identity["session_date"]).date()
             seen.append(current)
@@ -211,12 +220,16 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
     monkeypatch.setattr("execsim.ml.paper.tca_workers.run_tca_workers", workers)
     # This fixture isolates corpus/date slicing; ledger preflight has its own
     # fail-closed regression tests and is not populated by this small harness.
-    monkeypatch.setattr("execsim.ml.paper.tca_workers.preflight_tca_ledgers", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "execsim.ml.paper.tca_workers.preflight_tca_ledgers",
+        lambda **kwargs: preflight_complete.append(True),
+    )
     result = orchestration.run_tca_stage(config, full_run_cli_enabled=True, runtime_approval=None)
     assert result["status"] == "SOFTWARE READY"
     # The production orchestrator must exclude the early-close date before
     # constructing a worker task; valid dates remain unchanged.
     assert seen == [date(2024, 2, 7), date(2024, 2, 9)]
+    assert reads == [date(2024, 2, 7), date(2024, 2, 8), date(2024, 2, 9)]
 
 
 def _adv_fixture(*, post_volume: float = 100.0) -> pd.DataFrame:

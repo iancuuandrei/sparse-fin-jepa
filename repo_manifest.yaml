@@ -79,7 +79,7 @@ areas:
     tests: [tests/test_paper_representations.py, tests/test_paper_pipeline.py]
     verify: [python -m pytest tests/test_paper_representations.py tests/test_paper_pipeline.py]
   paper_evaluation:
-    roots: [src/execsim/ml/paper, configs/paper, reports/paper]
+    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py]
     purpose: Locked hierarchical paper planning, validation freeze, block inference, causal TCA, and main/appendix report bundles.
     specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]
     tests: [tests/test_paper_pipeline.py]

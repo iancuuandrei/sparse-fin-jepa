@@ -72,6 +72,17 @@ def _tca_as_of_origins(tca_config: Mapping[str, Any]) -> tuple[int, ...]:
     return tuple(range(start_offset // 15, end_offset // 15))
 
 
+def _require_integer_key(frame: pd.DataFrame, column: str, *, ledger: str) -> None:
+    """Reject null, floating-point, and string keys before any integer coercion."""
+    values = frame[column]
+    if (
+        values.isna().any()
+        or not pd.api.types.is_integer_dtype(values.dtype)
+        or pd.api.types.is_bool_dtype(values.dtype)
+    ):
+        raise ValueError(f"TCA preflight found an invalid non-null integer {ledger} key: {column}.")
+
+
 def _validate_learned_case(
     directory: Path,
     *,
@@ -107,6 +118,7 @@ def _validate_learned_case(
     if scale_dates.isna().any() or cutoff_dates.isna().any():
         raise ValueError("TCA preflight found invalid learned date identities.")
     scale = scale.loc[scale_dates.dt.date == session_date].copy()
+    _require_integer_key(scale, "as_of", ledger="learned")
     if scale.empty or scale["sample_id"].duplicated().any() or scale["as_of"].duplicated().any():
         raise ValueError("TCA preflight found missing or duplicate learned as-of rows.")
     if not scale["instrument_id"].astype(str).eq(instrument_id).all():
@@ -131,6 +143,7 @@ def _validate_learned_case(
     )
     if missing := shape_required.difference(shape.columns):
         raise ValueError(f"TCA learned shape is missing columns: {sorted(missing)}")
+    _require_integer_key(shape, "target_bucket", ledger="learned")
     if shape.empty or shape[["case_id", "target_bucket"]].astype(str).duplicated().any():
         raise ValueError("TCA preflight found missing or duplicate learned shape rows.")
     shape_positions = shape.groupby(shape["case_id"].astype(str), sort=False).indices
@@ -175,6 +188,7 @@ def _validate_ewma_case(
         (scale["instrument_id"].astype(str) == instrument_id)
         & (scale_dates.dt.date == session_date)
     ]
+    _require_integer_key(scale, "as_of", ledger="EWMA")
     if scale.empty or scale["sample_id"].duplicated().any() or scale["as_of"].duplicated().any():
         raise ValueError("TCA preflight found missing or duplicate EWMA as-of rows.")
     if not set(origins).issubset(set(scale["as_of"].astype(int))):

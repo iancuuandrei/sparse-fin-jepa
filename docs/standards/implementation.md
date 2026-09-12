@@ -10,6 +10,7 @@ The active implementation directions are:
 |---|---|---|
 | Repository navigation | Use `AGENTS.md`, `repo_manifest.yaml`, `docs/NAVIGATION.md`, and `scripts/repo_context.py`; do not add Nx | A single Python package does not justify a second Node dependency and task graph |
 | Decision history | Record material choices in indexed ADRs and supersede rather than rewrite accepted records | Specifications define current behavior, while ADRs preserve the reason and rejected alternatives |
+| Evaluation integration contracts | Propagate canonical metadata and test real producer-to-consumer paths through reporting and final freeze; retain exact scientific parity independently of legacy metadata omissions | Mocked boundaries cannot prove an executable historical pipeline; see ADR 0032 |
 | Policy information boundary | Give policies a point-in-time `DecisionContext`, not an unrestricted target-session data frame | The boundary makes future-data access enforceable and testable |
 | Optimization core | Use an explicit OSQP convex quadratic program, with a separate analytical Almgren–Chriss reference | The QP exposes feasibility, participation constraints, matrices, residuals, and deterministic integer projection |
 | Realized cost model | Use half-spread plus linear-in-participation temporary price impact | The resulting total impact cost is transparent, convex, and consistent between planning and simulation |

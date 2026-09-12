@@ -347,6 +347,7 @@ def build_historical_baseline_regime_frame(
         rows.append(
             {
                 "sample_id": sample.sample_id,
+                "session_id": sample.session_id,
                 "instrument_id": record.instrument_id,
                 "session_date": record.session_date,
                 "as_of_token": sample.as_of_token,

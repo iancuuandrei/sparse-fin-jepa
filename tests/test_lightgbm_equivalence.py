@@ -98,8 +98,13 @@ def test_frozen_builder_matches_raw_and_hybrid_rows(tmp_path: Path, partition: s
             pd.testing.assert_frame_equal(before[position], after[position], check_exact=True)
         np.testing.assert_array_equal(before[1], after[1])
         np.testing.assert_array_equal(before[3], after[3])
+    regime = build_historical_baseline_regime_frame(manifest, partition=partition)
+    # Legacy science remains exact; its omitted canonical metadata was a defect,
+    # not part of the frozen estimator. Check that identity independently.
     pd.testing.assert_frame_equal(
         old_regime_builder(manifest, partition=partition),
-        build_historical_baseline_regime_frame(manifest, partition=partition),
+        regime.drop(columns="session_id"),
         check_exact=True,
     )
+    sessions = {sample.sample_id: sample.session_id for sample in samples}
+    assert regime["session_id"].tolist() == regime["sample_id"].map(sessions).tolist()

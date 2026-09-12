@@ -2134,6 +2134,36 @@ def run_tca_stage(
     return {"status": "SOFTWARE READY", **paths}
 
 
+def _report_input_names(config: PaperRunConfig) -> tuple[str, ...]:
+    """Name the exact numerical dependencies shared by reporting and final freeze."""
+    names: tuple[str, ...] = (
+        "evaluation/forecast-results.parquet",
+        "evaluation/representation-accessibility.parquet",
+        "evaluation/representation-date-metrics.parquet",
+        "evaluation/support-regimes.parquet",
+        "tca/main.parquet",
+        "tca/sensitivity.parquet",
+    )
+    if (evaluation_root(config) / "evaluation/forecast-unavailable.parquet").is_file():
+        names += ("evaluation/forecast-unavailable.parquet",)
+    return names
+
+
+def _verify_report_input_receipt(config: PaperRunConfig, path: Path, digest: str) -> None:
+    """Bind a merged numerical input to its producing evaluator at consumption."""
+    receipt = read_json(path.with_suffix(".manifest.json"))
+    if (
+        receipt.get("parquet_sha256") != digest
+        or receipt.get("paper_config_hash") != config.config_hash
+        or receipt.get("merge_identity", {}).get("source_commit") != _git_head()
+        or receipt.get("merge_identity", {}).get("source_tree") != _git_tree()
+        or receipt.get("merge_identity", {}).get("paper_config_hash") != config.config_hash
+        or receipt.get("merge_identity", {}).get("parameter_freeze_sha256")
+        != file_sha256(config.artifact_root / "selection/parameter-freeze-v1.json")
+    ):
+        raise ValueError("Report input merge checksum or source identity mismatch.")
+
+
 def report_stage(
     config: PaperRunConfig,
     *,
@@ -2149,28 +2179,11 @@ def report_stage(
     from execsim.ml.paper.evaluation_artifacts import publish_bundle
 
     root = evaluation_root(config)
-    input_names: tuple[str, ...] = (
-        "evaluation/forecast-results.parquet",
-        "evaluation/representation-accessibility.parquet",
-        "evaluation/representation-date-metrics.parquet",
-        "evaluation/support-regimes.parquet",
-        "tca/main.parquet",
-        "tca/sensitivity.parquet",
-    )
-    if (root / "evaluation/forecast-unavailable.parquet").is_file():
-        input_names += ("evaluation/forecast-unavailable.parquet",)
     inputs = {}
-    for name in input_names:
+    for name in _report_input_names(config):
         path = root / name
         digest = file_sha256(path)
-        if config.runtime_evaluation_root is not None:
-            receipt = read_json(path.with_suffix(".manifest.json"))
-            if (
-                receipt.get("parquet_sha256") != digest
-                or receipt.get("paper_config_hash") != config.config_hash
-                or receipt.get("merge_identity", {}).get("source_commit") != _git_head()
-            ):
-                raise ValueError("Report input merge checksum or source identity mismatch.")
+        _verify_report_input_receipt(config, path, digest)
         inputs[name] = digest
     identity = {
         "source_commit": _git_head(),
@@ -2199,7 +2212,9 @@ def report_stage(
     }
 
 
-def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[str, object]:
+def _build_report_stage(
+    config: PaperRunConfig, *, output_root: Path, historical_schema_fixture: bool = False
+) -> dict[str, object]:
     """Construct named historical tables, matched inference, and the real report bundle."""
     from execsim.ml.paper.reports import (
         write_historical_paper_bundle,
@@ -2300,7 +2315,7 @@ def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[st
         result = sensitivity_results[int(config.evaluation["bootstrap_block_dates"])]
         candidate_rows = tca.loc[tca["method"] == candidate]
         seed_text = candidate.rsplit("_seed_", maxsplit=1)
-        seed = int(seed_text[1]) if len(seed_text) == 2 else -1
+        seed = int(seed_text[1]) if len(seed_text) == 2 else None
         execution_rows.append(
             {
                 "method": candidate,
@@ -2466,7 +2481,7 @@ def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[st
         "forecast_performance": forecast_performance,
         "forecast_by_asof": forecast_by_asof,
         "lightgbm_selected_parameters": pd.DataFrame(lightgbm_parameters),
-        "tca_execution": pd.DataFrame(execution_rows),
+        "tca_execution": pd.DataFrame(execution_rows).astype({"seed": "Int64"}),
         "confirmatory_statistics": confirmatory,
         "support_regime_diagnostics": support,
         "appendix_sensitivities": pd.concat(appendix_frames, ignore_index=True, sort=False),
@@ -2476,12 +2491,19 @@ def _build_report_stage(config: PaperRunConfig, *, output_root: Path) -> dict[st
         paper_run_id=config.paper_run_id,
         tables=tables,
         provenance={
-            "data_classification": "historical",
+            "data_classification": "synthetic_fixture"
+            if historical_schema_fixture
+            else "historical",
             "paper_config_hash": config.config_hash,
-            "network_acquisition": "completed before this reporting stage",
-            "historical_training": "completed before this reporting stage",
+            "network_acquisition": "NOT RUN"
+            if historical_schema_fixture
+            else "completed before this reporting stage",
+            "historical_training": "NOT RUN"
+            if historical_schema_fixture
+            else "completed before this reporting stage",
             "empirical_claim": "not automatically generated",
         },
+        historical_schema_fixture=historical_schema_fixture,
     )
     appendix = output / "appendix"
     appendix.mkdir()
@@ -3580,6 +3602,44 @@ def _write_or_verify_timestamped_receipt(
     write_json_atomic(path, payload)
 
 
+def _verify_final_stage_manifests(config: PaperRunConfig) -> None:
+    """Cross-check aggregate stage receipts against their canonical merged outputs."""
+    root = evaluation_root(config)
+    representation = read_json(root / "evaluation/representation-evaluation-manifest.json")
+    if (
+        representation.get("schema_version") != "paper-representation-evaluation-v2"
+        or representation.get("paper_config_hash") != config.config_hash
+    ):
+        raise ValueError("Final representation manifest identity mismatch.")
+    for key, name in (
+        ("accessibility", "representation-accessibility"),
+        ("date_metrics", "representation-date-metrics"),
+        ("support_regimes", "support-regimes"),
+    ):
+        if representation.get(f"{key}_sha256") != file_sha256(root / f"evaluation/{name}.parquet"):
+            raise ValueError("Final representation manifest output checksum mismatch.")
+    expected_identity = {
+        "source_commit": _git_head(),
+        "source_tree": _git_tree(),
+        "paper_config_hash": config.config_hash,
+        "parameter_freeze_sha256": file_sha256(
+            config.artifact_root / "selection/parameter-freeze-v1.json"
+        ),
+    }
+    tca = read_json(root / "tca/manifest.json")
+    if (
+        tca.get("schema_version") != "paper-tca-v1"
+        or tca.get("paper_config_hash") != config.config_hash
+        or tca.get("evaluation_identity") != expected_identity
+        or set(tca.get("files", {})) != {"main", "sensitivity"}
+    ):
+        raise ValueError("Final TCA manifest identity mismatch.")
+    for name, record in tca["files"].items():
+        path = root / f"tca/{name}.parquet"
+        if record.get("path") != str(path) or record.get("sha256") != file_sha256(path):
+            raise ValueError("Final TCA manifest output identity/checksum mismatch.")
+
+
 def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
     """Hash the complete locked result bundle after every declared stage finishes."""
     _require_parameter_freeze(config)
@@ -3597,32 +3657,36 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
         "report_provenance": evaluation_report_root(config)
         / config.paper_run_id
         / "provenance.json",
+        "report_completion": evaluation_report_root(config)
+        / config.paper_run_id
+        / "completion.json",
     }
     if getattr(config, "runtime_evaluation_root", None) is not None:
         required["evaluation_execution"] = evaluation_root(config) / "execution.json"
-        required["report_completion"] = (
-            evaluation_report_root(config) / config.paper_run_id / "completion.json"
-        )
     missing = [name for name, path in required.items() if not path.is_file()]
     if missing:
         raise RuntimeError(f"BLOCKED: final result-freeze inputs are missing: {missing}")
     result_root = evaluation_report_root(config) / config.paper_run_id
-    if getattr(config, "runtime_evaluation_root", None) is not None:
-        from execsim.ml.paper.evaluation_artifacts import publish_bundle
+    from execsim.ml.paper.evaluation_artifacts import publish_bundle
 
-        completion = read_json(required["report_completion"])
-        identity = completion["identity"]
-        if (
-            identity.get("source_commit") != _git_head()
-            or identity.get("source_tree") != _git_tree()
-            or identity.get("paper_config_hash") != config.config_hash
-            or identity.get("parameter_freeze_sha256") != file_sha256(required["parameter_freeze"])
-        ):
-            raise ValueError("Final report completion identity mismatch.")
-        publish_bundle(result_root, identity=identity, build=lambda _: None)
-        for name, digest in identity["input_sha256"].items():
-            if file_sha256(evaluation_root(config) / name) != digest:
-                raise ValueError("Final report numerical input checksum mismatch.")
+    completion = read_json(required["report_completion"])
+    identity = completion["identity"]
+    if (
+        identity.get("source_commit") != _git_head()
+        or identity.get("source_tree") != _git_tree()
+        or identity.get("paper_config_hash") != config.config_hash
+        or identity.get("parameter_freeze_sha256") != file_sha256(required["parameter_freeze"])
+    ):
+        raise ValueError("Final report completion identity mismatch.")
+    input_hashes = identity.get("input_sha256")
+    if not isinstance(input_hashes, dict) or set(input_hashes) != set(_report_input_names(config)):
+        raise ValueError("Final report numerical input inventory mismatch.")
+    publish_bundle(result_root, identity=identity, build=lambda _: None)
+    for name, digest in input_hashes.items():
+        if file_sha256(evaluation_root(config) / name) != digest:
+            raise ValueError("Final report numerical input checksum mismatch.")
+        _verify_report_input_receipt(config, evaluation_root(config) / name, digest)
+    _verify_final_stage_manifests(config)
     result_files = sorted(
         path
         for path in result_root.rglob("*")
@@ -3679,11 +3743,8 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
             for path in result_files
         ],
     }
-    path = (
-        evaluation_root(config) / "selection" / "final-result-freeze-v1.json"
-        if getattr(config, "runtime_evaluation_root", None) is not None
-        else result_root / "final-result-freeze-v1.json"
-    )
+    # Completion seals the report tree; freeze must not add a file to that tree.
+    path = evaluation_root(config) / "selection" / "final-result-freeze-v1.json"
     _write_or_verify_timestamped_receipt(path, payload, timestamp_field="frozen_at_utc")
     return {**read_json(path), "path": str(path), "sha256": file_sha256(path)}
 
@@ -3848,9 +3909,13 @@ def _stream_embedding_diagnostics(
         session_labels.clear()
 
     parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(batch_size=batch_size, columns=["sample_id", "embedding"]):
+    for batch in parquet.iter_batches(
+        batch_size=batch_size, columns=["sample_id", "session_id", "embedding"]
+    ):
         frame = batch.to_pandas()
-        for sample_id, embedding in zip(frame["sample_id"], frame["embedding"], strict=True):
+        for sample_id, exported_session_id, embedding in zip(
+            frame["sample_id"], frame["session_id"], frame["embedding"], strict=True
+        ):
             key = str(sample_id)
             if key in seen or key not in metadata.index:
                 raise ValueError(f"Embedding TEST identity is duplicate or unexpected: {key}")
@@ -3860,6 +3925,8 @@ def _stream_embedding_diagnostics(
                 )
             seen.add(key)
             row = metadata.loc[key]
+            if str(exported_session_id) != str(row["session_id"]):
+                raise ValueError("Embedding TEST session identity contradicts regime metadata.")
             latent = np.asarray(embedding, dtype=np.float64)[:latent_width]
             if latent.shape != (latent_width,):
                 raise ValueError("Embedding latent width is incompatible with diagnostics.")

@@ -20,6 +20,34 @@ from execsim.ml.paper.tca_workers import (
 )
 
 _SESSION_DATES = (date(2040, 1, 2), date(2040, 1, 3))
+
+
+@pytest.mark.parametrize("origins_count", [1, 2, 20, 22])
+def test_benchmark_window_matches_all_generated_origins(tmp_path, origins_count):
+    from scripts import benchmark_tca_preflight
+
+    _, _, _, config = benchmark_tca_preflight._synthetic_ledgers(
+        tmp_path,
+        dates_count=1,
+        origins_count=origins_count,
+        learned_ledger_count=1,
+        publish_frames=publish_frames,
+    )
+    assert tca_workers._tca_as_of_origins(config) == tuple(range(4, 4 + origins_count))
+
+
+@pytest.mark.parametrize("revision", ["HEAD", "--help", "-x", "a" * 39, "z" * 40])
+def test_benchmark_rejects_non_commit_arguments_before_git(revision, monkeypatch):
+    from scripts import benchmark_tca_preflight
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Invalid baseline reached subprocess execution")
+
+    monkeypatch.setattr(benchmark_tca_preflight.subprocess, "run", unexpected)
+    with pytest.raises(ValueError, match="full lowercase Git commit SHA"):
+        benchmark_tca_preflight._load_legacy_preflight(tca_workers, revision)
+
+
 _INSTRUMENT_ID = "SYNTH"
 _FOLD_ID = "fold-synthetic"
 _TRAINING_CUTOFF = date(2039, 12, 31)

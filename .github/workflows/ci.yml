@@ -23,8 +23,8 @@ jobs:
         with:
           version: "0.12.13"
       - run: uv sync --frozen --extra dev --python "${{ matrix.python-version }}"
-      - run: uv run --frozen --no-sync python -m ruff check src tests scripts
-      - run: uv run --frozen --no-sync python -m ruff format --check src tests scripts
-      - run: uv run --frozen --no-sync python -m mypy src
-      - run: uv run --frozen --no-sync python scripts/repo_context.py --check
-      - run: uv run --frozen --no-sync python -m pytest -q --cov=execsim --cov-report=term-missing
+      - run: uv run --frozen --no-sync --no-build python -m ruff check src tests scripts
+      - run: uv run --frozen --no-sync --no-build python -m ruff format --check src tests scripts
+      - run: uv run --frozen --no-sync --no-build python -m mypy src
+      - run: uv run --frozen --no-sync --no-build python scripts/repo_context.py --check
+      - run: uv run --frozen --no-sync --no-build python -m pytest -q --cov=execsim --cov-report=term-missing

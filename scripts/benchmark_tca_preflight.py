@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import statistics
 import subprocess
 import sys
@@ -39,8 +40,10 @@ def _load_legacy_preflight(
     tca_workers: ModuleType, revision: str
 ) -> tuple[Callable[..., None], str]:
     """Compile only baseline preflight functions from a read-only `git show`."""
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise ValueError("Benchmark baseline must be a full lowercase Git commit SHA.")
     resolved_revision = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"],
         cwd=_REPOSITORY,
         check=True,
         capture_output=True,
@@ -105,7 +108,7 @@ def _synthetic_ledgers(
     """Publish deterministic checksum-bound artifacts built only in memory."""
     dates = tuple(pd.bdate_range("2040-01-02", periods=dates_count).date)
     origins = tuple(range(4, 4 + origins_count))
-    end_offset = 9 * 60 + 30 + 15 * origins_count
+    end_offset = 10 * 60 + 30 + 15 * origins_count
     end_time = time(end_offset // 60, end_offset % 60).strftime("%H:%M")
     tca_config = {"window": ["10:30", end_time]}
     learned_scale_rows: list[dict[str, Any]] = []
@@ -280,7 +283,7 @@ def _timed_preflight(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-revision", default="HEAD")
+    parser.add_argument("--baseline-revision", default="3eb221bf787421fd4d5397b725397861b403fdaa")
     parser.add_argument("--dates", type=int, default=128, help="Synthetic dates, maximum 128.")
     parser.add_argument("--origins", type=int, default=22, help="Synthetic origins, maximum 22.")
     parser.add_argument(

@@ -421,6 +421,17 @@ predict a full-coordinate completion time. Total OS threads were 84, including
 idle native/CUDA pools; four is the computational pool limit, not a claim that
 the process contains only four threads.
 
+A later bounded real-pod qualification at source
+`4eabe206a61e2e334f73fbb46568eaa30393a551` used frozen TRAIN/VALIDATION inputs:
+8,192 TRAIN rows, 512 VALIDATION rows, and a second VALIDATION loader for
+scoring. Reference evaluation took 125.556818787 seconds and cached evaluation
+took 26.735507892 seconds (about 4.70 times faster), with the same output
+SHA-256, `dc1a0e698ae6cd229088f32224ac8abb6bc9c7c0c7c60ce8cdea7bd9c7633d26`.
+Each run used 24 OS threads, four native threads, and one Torch inter-op thread.
+Peak RSS was 2,905,764 KiB for reference and 2,951,296 KiB for cached. The run
+log SHA-256 is `555f0b0c958313ccf0d3f7ea87be6cf4604fc3b7e35ab7359de2e8f8e928ecce`.
+No historical TEST data was used, and no JEPA or LightGBM retraining occurred.
+
 A subsequent cached-input comparison at one, two, four, and eight native threads
 preserved all nonnumeric identities and both selected ridge alphas. The maximum
 absolute mathematical-output difference was 1.7764e-15; comparisons used
@@ -481,10 +492,13 @@ Run the bounded synthetic comparison from the repository root:
 The benchmark uses eight learned ledgers and one EWMA ledger for one synthetic
 instrument, preserves all preflight checks, and extracts the old validator from
 the specified Git revision. It never reads historical TEST data or calls a
-forecast provider. On the local Python 3.13 environment, two paired runs gave
-median elapsed times of 17.119 seconds before indexing and 11.968 seconds after
-indexing (1.43 times faster). Learned validator time was 13.245 versus 7.247
-seconds. Both paths made 19 Parquet reads and returned 326,656 rows.
+forecast provider. After correcting the end-window boundary, two paired runs
+with 128 dates and all 22 configured origins on the local Python 3.13 environment
+gave median elapsed times of 21.772753 seconds for legacy preflight and 13.740527
+seconds for indexed preflight. Learned validator time was 16.584558 versus
+8.169671 seconds. Both paths made 19 Parquet reads and returned 326,656 rows.
+The benchmark ran concurrently with the full test suite, so these measurements
+are informative and are not an isolated performance estimate.
 
 The benchmark imposes no CI timing threshold. These results quantify only
 preflight work on the declared fixture, not historical replay, report matching,

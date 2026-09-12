@@ -60,3 +60,14 @@ the operational decisions.
 No warning is suppressed through `NOSONAR`, a rule exclusion, relaxed numerical
 tolerance, or disabled test. Reviewed false positives are distinguished from
 code corrections; a clean local test run is not a hosted Sonar resolution.
+
+## PR analysis follow-up
+
+The initial PR #8 analysis added five `githubactions:S8541` findings for the
+verification commands and one `pythonsecurity:S8705` finding for the benchmark's
+baseline revision. Verification commands now explicitly use both `--no-sync`
+and `--no-build`: dependency installation is confined to the preceding frozen
+sync step. The benchmark accepts only a full lowercase commit SHA and places
+it after Git's end-of-options marker. Its default is an immutable baseline,
+not `HEAD`. Tests reject option-like and mutable revision arguments before
+subprocess execution. A new hosted analysis must verify these corrections.

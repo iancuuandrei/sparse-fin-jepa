@@ -10,6 +10,7 @@ The active implementation directions are:
 |---|---|---|
 | Repository navigation | Use `AGENTS.md`, `repo_manifest.yaml`, `docs/NAVIGATION.md`, and `scripts/repo_context.py`; do not add Nx | A single Python package does not justify a second Node dependency and task graph |
 | Decision history | Record material choices in indexed ADRs and supersede rather than rewrite accepted records | Specifications define current behavior, while ADRs preserve the reason and rejected alternatives |
+| Evaluation integration contracts | Propagate canonical metadata and test real producer-to-consumer paths through reporting and final freeze; retain exact scientific parity independently of legacy metadata omissions | Mocked boundaries cannot prove an executable historical pipeline; see ADR 0032 |
 | Policy information boundary | Give policies a point-in-time `DecisionContext`, not an unrestricted target-session data frame | The boundary makes future-data access enforceable and testable |
 | Optimization core | Use an explicit OSQP convex quadratic program, with a separate analytical Almgren–Chriss reference | The QP exposes feasibility, participation constraints, matrices, residuals, and deterministic integer projection |
 | Realized cost model | Use half-spread plus linear-in-participation temporary price impact | The resulting total impact cost is transparent, convex, and consistent between planning and simulation |
@@ -258,3 +259,71 @@ This standard adopts broadly applicable guidance from these official sources:
 - [GitHub Docs content design principles](https://docs.github.com/en/contributing/writing-for-github-docs/content-design-principles)
 - [GitHub Docs style guide](https://docs.github.com/en/contributing/style-guide-and-content-model/style-guide)
 - [GitHub guidance for repository README files](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes)
+
+### 2026-09-11 — pre-evaluation identity hardening (ADR 0025)
+
+The locked evaluator now treats causal ADV20 as required derived evidence for
+every exact-window eligible instrument/session.  Validation occurs before TCA
+workers and is repeated at the direct replay boundary; missing, duplicate,
+non-finite, or non-positive values fail closed rather than changing the sample.
+Forecast and TCA stages resolve relocated runtime data through the canonical
+`PaperRunConfig.data_path` abstraction.  Before consuming TEST inputs they bind
+the runtime universe bytes to one shared `universe_manifest_hash` recorded by
+every fold sequence manifest.  Reseal now validates the complete configured
+primary JEPA final inventory and requires one non-empty training `code_commit`
+across all coordinates, before publishing a new execution namespace.  These
+checks are identity/provenance safeguards only and do not alter scientific
+configuration, estimands, or model artifacts.  See ADR 0025.
+
+### 2026-09-12 — cross-link resealed evaluation artifacts (ADR 0026)
+
+Reseal must verify the existing identity links between each fold sequence
+manifest, JEPA checkpoint, compatibility record, embedding export, and frozen
+LightGBM coordinate.  Independent file checksums do not prove that a complete
+artifact set was trained from the same sequence, universe, representation
+source, and TRAIN/VALIDATION embedding bytes.  Cross-link checks run before
+`execution.json` publication and preserve all scientific inputs and estimands.
+See ADR 0026.
+
+### 2026-09-12 — execution-share ADV20 and chained reseal provenance (ADRs 0027 and 0028)
+
+TCA history builders now restate each prior daily volume into the target
+session's raw execution-share basis using the existing point-in-time split
+factor and the 10:30 quantity-decision information clock. Replay bars remain
+raw, the 20-session lag is strict, and the corporate-action manifest identity
+is part of the history artifact identity. New reseals preserve v2 evidence but
+use a typed supersession receipt and v3 execution identity to distinguish the
+root TEST authorization from the immediate prior evaluator. See ADRs 0027 and
+0028.
+
+### 2026-09-12 — bounded reuse of immutable evaluation inputs (ADR 0029)
+
+Frozen probe tensors may be encoded once and replayed with their original batch
+boundaries, dtypes, masks, and RNG transitions. Temporary caches are checksummed,
+source-bound, atomically published, and retired after coordinate publication.
+Use cgroup-aware native thread limits for representation evaluation. Batch raw
+forecast feature construction by consecutive session and reuse verified index
+and learned date slices without sharing mutable forecast-provider state.
+Retain an optimization only after equivalence and real-input performance checks.
+See ADR 0029 and the evaluation implementation contract. Scientific configuration,
+trained artifacts, estimands, and cross-source result isolation remain unchanged.
+
+### 2026-09-12 — operational artifact boundaries (ADR 0030)
+
+Construct complete encoded-cache identities consistently at publication and
+retirement. Verify every cache partition before cleanup. Restrict trusted resume
+deserialization to the existing tensor and NumPy RNG contract. Publish receipts
+through unique same-directory temporary files and construct detached commands
+from parsed arguments. Lock fresh CI dependencies without replacing the qualified
+historical environment. Exact frozen-parameter equality remains mandatory.
+See ADR 0030. These safeguards do not change scientific inputs or estimands.
+
+### 2026-09-12 — exact evaluation fast paths (ADR 0031)
+
+Index immutable preflight rows once, retain per-case softmax reduction order,
+and bypass metric merges only after exact key alignment is established. Slice
+learned forecast volumes only against a verified private minute grid; preserve
+the dictionary fallback for general requests. Keep all validation and numerical
+gates in their original order. Benchmark bounded workloads before retaining a
+fast path; do not extrapolate historical completion from synthetic timings.
+See ADR 0031. Scientific configuration and result provenance remain unchanged.

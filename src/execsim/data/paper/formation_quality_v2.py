@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pandas as pd
@@ -254,7 +254,7 @@ def _peak_rss_bytes() -> int | None:
         return None
 
     class ProcessMemoryCounters(ctypes.Structure):
-        _fields_ = [
+        _fields_: ClassVar[list[tuple[str, Any]]] = [
             ("cb", ctypes.c_ulong),
             ("PageFaultCount", ctypes.c_ulong),
             ("PeakWorkingSetSize", ctypes.c_size_t),

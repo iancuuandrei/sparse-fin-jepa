@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import random
 from dataclasses import asdict, dataclass
@@ -132,9 +133,23 @@ def load_trusted_resume_state(
 
     if not trusted_local:
         raise PermissionError("Resume state uses pickle and requires explicit local trust.")
-    if hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256:
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
         raise ValueError("Resume-state checksum mismatch.")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    # Legacy continuation files contain NumPy's MT19937 uint32 state. Permit
+    # only those reconstruction types, never arbitrary checkpoint globals.
+    from numpy.core.multiarray import _reconstruct
+
+    with torch.serialization.safe_globals(
+        [
+            (_reconstruct, "numpy.core.multiarray._reconstruct"),
+            (_reconstruct, "numpy._core.multiarray._reconstruct"),
+            np.ndarray,
+            np.dtype,
+            type(np.dtype(np.uint32)),
+        ]
+    ):
+        payload = torch.load(io.BytesIO(content), map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or payload.get("trusted_local_only") is not True:
         raise ValueError("Resume state is not marked trusted-local-only.")
     optimizer.load_state_dict(payload["optimizer"])

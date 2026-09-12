@@ -6,6 +6,7 @@ import hashlib
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -32,6 +33,8 @@ def evaluate_frozen_capacity_streaming(
     device: str,
     seed: int,
     options: FrozenProbeOptions | None = None,
+    cache_root: Path | None = None,
+    cache_identity: dict[str, Any] | None = None,
 ) -> tuple[
     list[dict[str, float | int | str]],
     list[dict[str, float | int | str]],
@@ -47,6 +50,29 @@ def evaluate_frozen_capacity_streaming(
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+
+    if cache_root is not None:
+        from execsim.ml.representations.probe_cache import (
+            encoded_probe_identity,
+            materialize_probe_batches,
+        )
+
+        if not cache_identity:
+            raise ValueError("Encoded probe caches require an explicit immutable identity.")
+        cached = [
+            materialize_probe_batches(
+                cache_root / partition,
+                identity=encoded_probe_identity(cache_identity, partition=partition, device=device),
+                loader=loader,
+                encode=lambda batch: _encoded_batch(model, batch, device),
+            )
+            for partition, loader in zip(
+                ("train", "validation", "test"),
+                (training_loader, validation_loader, test_loader),
+                strict=True,
+            )
+        ]
+        training_loader, validation_loader, test_loader = cached
 
     feature_dim = 8 * model.config.latent_dim + 8
     target_dim = model.config.latent_dim
@@ -212,6 +238,10 @@ def _date_identity_statistics(
 
 def _encoded_batch(model: Any, batch: dict[str, Any], device: str) -> tuple[Any, Any, Any, Any]:
     import torch
+
+    if "encoded_probe" in batch:
+        features, targets, observable, complete = batch["encoded_probe"]
+        return features.to(device), targets.to(device), observable.to(device), complete.to(device)
 
     context = batch["context"].to(device)
     context_mask = batch["context_mask"].to(device)

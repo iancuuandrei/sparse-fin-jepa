@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import date
 
 import numpy as np
@@ -15,6 +16,46 @@ from execsim.ml.paper.tca import expand_volume_forecast, mean_seed_forecast
 FeatureResolver = Callable[
     [str, date, pd.Timestamp, pd.DataFrame | None], tuple[pd.DataFrame, pd.DataFrame]
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class _MinuteGrid:
+    """Immutable minute grid whose timestamps came from one explicit date range."""
+
+    start: pd.Timestamp
+    frequency: pd.Timedelta
+    periods: int
+    timestamps: tuple[pd.Timestamp, ...]
+
+    @classmethod
+    def from_range(cls, start: pd.Timestamp, end: pd.Timestamp) -> _MinuteGrid:
+        """Create a trusted one-minute grid, inclusive of both endpoints."""
+        frequency = pd.Timedelta(minutes=1)
+        timestamps = tuple(pd.date_range(start, end, freq=frequency))
+        if not timestamps:
+            raise ValueError("A forecast minute grid must not be empty.")
+        return cls(
+            start=timestamps[0],
+            frequency=frequency,
+            periods=len(timestamps),
+            timestamps=timestamps,
+        )
+
+    def contiguous_offset(self, requested: tuple[pd.Timestamp, ...]) -> int | None:
+        """Return the exact start offset only when request matches one grid slice."""
+        if not requested:
+            return None
+        try:
+            delta = requested[0] - self.start
+            offset, remainder = divmod(delta.value, self.frequency.value)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if remainder or offset < 0:
+            return None
+        stop = offset + len(requested)
+        if stop > self.periods or self.timestamps[offset:stop] != requested:
+            return None
+        return int(offset)
 
 
 class PaperLightGBMForecastProvider:
@@ -40,6 +81,7 @@ class PaperLightGBMForecastProvider:
         self.manifest_hash = manifest_hash
         self._provider_id = method_id
         self._latest: dict[tuple[str, date], VolumeForecast] = {}
+        self._latest_grids: dict[tuple[str, date], _MinuteGrid] = {}
 
     @property
     def provider_id(self) -> str:
@@ -71,20 +113,17 @@ class PaperLightGBMForecastProvider:
             )
             token_shape = valid["conditional_share"].to_numpy(dtype=float)
             local = generated_at.tz_convert("America/New_York")
-            full_minutes = tuple(
-                pd.date_range(
-                    local,
-                    pd.Timestamp.combine(session_date, pd.Timestamp("15:59").time()).tz_localize(
-                        "America/New_York"
-                    ),
-                    freq="min",
-                )
+            minute_grid = _MinuteGrid.from_range(
+                local,
+                pd.Timestamp.combine(session_date, pd.Timestamp("15:59").time()).tz_localize(
+                    "America/New_York"
+                ),
             )
             fresh = expand_volume_forecast(
                 symbol=symbol,
                 session_date=session_date,
                 generated_at=generated_at,
-                minute_timestamps=full_minutes,
+                minute_timestamps=minute_grid.timestamps,
                 expected_remaining_volume=float(total[0]),
                 conditional_token_shape=token_shape,
                 within_token_profile=self.within_token_profile,
@@ -93,22 +132,35 @@ class PaperLightGBMForecastProvider:
                 forecaster_id=self.provider_id,
             )
             self._latest[key] = fresh
-            return _truncate_forecast(fresh, requested, generated_at)
+            self._latest_grids[key] = minute_grid
+            return _truncate_forecast(fresh, requested, generated_at, minute_grid=minute_grid)
         cached = self._latest.get(key)
         if cached is None:
             raise ValueError("A between-boundary request has no prior causal model forecast.")
-        return _truncate_forecast(cached, requested, generated_at)
+        return _truncate_forecast(
+            cached, requested, generated_at, minute_grid=self._latest_grids[key]
+        )
 
 
 def _truncate_forecast(
     cached: VolumeForecast,
     requested: tuple[pd.Timestamp, ...],
     generated_at: pd.Timestamp,
+    *,
+    minute_grid: _MinuteGrid | None = None,
 ) -> VolumeForecast:
-    cached_by_time = dict(zip(cached.bucket_timestamps, cached.expected_volumes, strict=True))
-    if any(timestamp not in cached_by_time for timestamp in requested):
-        raise ValueError("Requested horizon is incompatible with the latest boundary forecast.")
-    volumes = np.asarray([cached_by_time[timestamp] for timestamp in requested], dtype=float)
+    """Return the requested forecast horizon, preserving order and normalization math."""
+    volumes: np.ndarray | None = None
+    if minute_grid is not None and cached.bucket_timestamps is minute_grid.timestamps:
+        offset = minute_grid.contiguous_offset(requested)
+        if offset is not None:
+            stop = offset + len(requested)
+            volumes = np.asarray(list(cached.expected_volumes[offset:stop]), dtype=float)
+    if volumes is None:
+        cached_by_time = dict(zip(cached.bucket_timestamps, cached.expected_volumes, strict=True))
+        if any(timestamp not in cached_by_time for timestamp in requested):
+            raise ValueError("Requested horizon is incompatible with the latest boundary forecast.")
+        volumes = np.asarray([cached_by_time[timestamp] for timestamp in requested], dtype=float)
     remaining_sum = float(volumes.sum())
     shares = volumes / remaining_sum if remaining_sum > 0 else np.zeros_like(volumes)
     return VolumeForecast(

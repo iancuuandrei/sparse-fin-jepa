@@ -7,6 +7,31 @@ from execsim.data.paper.manifests import file_sha256, write_json_atomic
 from scripts import runpod
 
 
+@pytest.mark.parametrize("pid", [0, -1, True, "123", "invalid/path", None])
+def test_process_token_rejects_invalid_pid_before_filesystem_access(pid, monkeypatch):
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("Invalid process identity reached the filesystem")
+
+    monkeypatch.setattr(Path, "read_text", unexpected_read)
+    with pytest.raises(ValueError, match="positive integer PID"):
+        runpod.process_token(pid)
+
+
+@pytest.mark.parametrize("directory", ["start", "resume", "--output=other", "with spaces"])
+def test_child_command_preserves_paths_and_uses_fixed_operation(tmp_path, directory):
+    paths = {
+        name: tmp_path / directory / name
+        for name in ("repo", "bundle", "work", "output", "ready", "approval")
+    }
+    args = SimpleNamespace(**paths, fold="fold-2", bundle_sha256="a" * 64)
+    command = runpod.training_process_command(args)
+    assert command[3] == "_train"
+    assert command[4:6] == ["--fold=fold-2", f"--bundle-sha256={'a' * 64}"]
+    assert len(command) == 11
+    for name, path in paths.items():
+        assert f"--{name}={path.resolve()}" in command
+
+
 def test_transfer_verification_rejects_corruption_duplicates_and_escape(tmp_path: Path):
     member = tmp_path / "data.bin"
     member.write_bytes(b"immutable fixture")

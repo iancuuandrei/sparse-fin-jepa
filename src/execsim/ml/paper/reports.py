@@ -41,6 +41,7 @@ HISTORICAL_FIGURE_NAMES = (
     "forecast_error_vs_asof",
     "allocation_regret_with_paired_intervals",
 )
+HISTORICAL_EMPTY_TABLE_NAMES = frozenset({"forecast_performance", "forecast_by_asof"})
 
 
 def write_paper_bundle(
@@ -270,7 +271,7 @@ def write_historical_paper_bundle(
     for name, required in HISTORICAL_TABLE_SCHEMAS.items():
         frame = tables.get(name)
         missing = required if frame is None else required.difference(frame.columns)
-        if frame is None or frame.empty or missing:
+        if frame is None or missing or (frame.empty and name not in HISTORICAL_EMPTY_TABLE_NAMES):
             raise ValueError(f"Historical table {name} is empty or missing {sorted(missing)}")
     destination = output_root / paper_run_id
     destination.mkdir(parents=True, exist_ok=False)
@@ -368,50 +369,64 @@ def _render_historical_figures(
     _save_historical(figure, figure_dir / "observable_capacity_vs_error.png", fixture_label)
 
     combined = tables["forecast_by_asof"]
-    summary = combined.groupby("method", sort=True, as_index=False).agg(
-        log_remaining_volume_mae=("log_remaining_volume_mae", "mean"),
-        conditional_curve_error=("conditional_curve_error", "mean"),
-    )
     figure, axis = plt.subplots(figsize=(6.4, 3.6))
-    positions = np.arange(len(summary))
-    width = 0.38
-    axis.bar(
-        positions - width / 2,
-        summary["log_remaining_volume_mae"],
-        width,
-        label="remaining-volume log MAE",
-    )
-    axis.bar(
-        positions + width / 2,
-        summary["conditional_curve_error"],
-        width,
-        label="conditional-curve error",
-    )
-    axis.set_xticks(positions, summary["method"], rotation=30)
-    axis.legend()
+    if combined.empty:
+        _annotate_no_common_forecast_cases(axis)
+    else:
+        summary = combined.groupby("method", sort=True, as_index=False).agg(
+            log_remaining_volume_mae=("log_remaining_volume_mae", "mean"),
+            conditional_curve_error=("conditional_curve_error", "mean"),
+        )
+        positions = np.arange(len(summary))
+        width = 0.38
+        axis.bar(
+            positions - width / 2,
+            summary["log_remaining_volume_mae"],
+            width,
+            label="remaining-volume log MAE",
+        )
+        axis.bar(
+            positions + width / 2,
+            summary["conditional_curve_error"],
+            width,
+            label="conditional-curve error",
+        )
+        axis.set_xticks(positions, summary["method"], rotation=30)
+        axis.legend()
     _save_historical(figure, figure_dir / "forecast_performance_by_model.png", fixture_label)
 
     figure, axis = plt.subplots(figsize=(6.4, 3.6))
-    for name, group in combined.groupby("method", sort=True):
-        axis.plot(group["as_of_token"], group["log_remaining_volume_mae"], marker="o", label=name)
-    axis.legend()
+    if combined.empty:
+        _annotate_no_common_forecast_cases(axis)
+    else:
+        for name, group in combined.groupby("method", sort=True):
+            axis.plot(
+                group["as_of_token"], group["log_remaining_volume_mae"], marker="o", label=name
+            )
+        axis.legend()
     axis.set(xlabel="as-of token", ylabel="forecast error")
     _save_historical(figure, figure_dir / "forecast_error_vs_asof.png", fixture_label)
 
     paired = tables["tca_execution"].drop_duplicates(["method", "seed"])
     figure, axis = plt.subplots(figsize=(6.4, 3.6))
-    errors = np.vstack(
-        (
-            paired["mean_difference"] - paired["ci_lower"],
-            paired["ci_upper"] - paired["mean_difference"],
-        )
-    )
-    axis.errorbar(paired["method"], paired["mean_difference"], yerr=errors, fmt="o")
+    axis.vlines(paired["method"], paired["ci_lower"], paired["ci_upper"], color="#214761")
+    axis.scatter(paired["method"], paired["mean_difference"], color="#214761")
     axis.axhline(0, color="#777777", linewidth=0.8)
     axis.tick_params(axis="x", rotation=30)
     axis.set_ylabel("paired normalized allocation regret difference")
     _save_historical(
         figure, figure_dir / "allocation_regret_with_paired_intervals.png", fixture_label
+    )
+
+
+def _annotate_no_common_forecast_cases(axis: Any) -> None:
+    axis.text(
+        0.5,
+        0.5,
+        "No common forecast cases",
+        ha="center",
+        va="center",
+        transform=axis.transAxes,
     )
 
 

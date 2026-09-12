@@ -1407,7 +1407,11 @@ def test_streamed_embedding_diagnostics_match_in_memory_estimator(tmp_path: Path
     embeddings = [np.concatenate((row, np.zeros(516))) for row in latents]
     path = tmp_path / "embeddings.parquet"
     pd.DataFrame(
-        {"sample_id": [f"sample-{index}" for index in range(6)], "embedding": embeddings}
+        {
+            "sample_id": [f"sample-{index}" for index in range(6)],
+            "session_id": ["session-a"] * 3 + ["session-b"] * 3,
+            "embedding": embeddings,
+        }
     ).to_parquet(path, index=False, row_group_size=2)
     states = pd.DataFrame(
         {

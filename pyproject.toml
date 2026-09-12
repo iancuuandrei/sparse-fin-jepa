@@ -39,8 +39,10 @@ deep = [
   "scipy>=1.11.0",
   "safetensors==0.8.0",
   "torch==2.13.0",
+  "threadpoolctl>=3.1.0",
 ]
 paper = [
+  "threadpoolctl>=3.1.0",
   "alpaca-py>=0.43.0",
   "exchange-calendars>=4.5",
   "lightgbm==4.7.0",

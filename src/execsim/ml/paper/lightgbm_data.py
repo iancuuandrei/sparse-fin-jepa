@@ -7,6 +7,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import groupby
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +18,7 @@ from execsim.ml.paper.features import append_embedding, build_raw_feature_frame
 from execsim.ml.sequences.dataset import extract_window
 from execsim.ml.sequences.manifests import read_sequence_record
 from execsim.ml.sequences.schemas import SequenceRecord, SequenceSample
-from execsim.ml.sequences.streaming import _sample_from_row
+from execsim.ml.sequences.streaming import _load_cached_index_frame, _sample_from_row
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,8 +139,11 @@ def build_lightgbm_base_frames(
     shape_targets = []
     samples = [
         _sample_from_row(row)
-        for index_path in sorted(index_paths)
-        for row in pd.read_parquet(index_path).itertuples(index=False)
+        for row in _load_cached_index_frame(
+            sequence_manifest_path,
+            partition=partition,
+            index_paths=tuple(sorted(index_paths)),
+        ).itertuples(index=False)
     ]
     shape_probabilities = (
         _shape_origin_probabilities(samples)
@@ -159,27 +163,40 @@ def build_lightgbm_base_frames(
             shape_chunks.append(pd.concat(shape_frames, ignore_index=True))
             shape_frames.clear()
 
-    for sample in samples:
-        record = cached_record(sample.session_id)
-        window = extract_window(record, sample)
-        timestamp = pd.Timestamp(sample.as_of_ns, tz="UTC").tz_convert("America/New_York")
-        metadata = pd.DataFrame(
-            {
-                "as_of_bucket": [sample.as_of_token],
-                "target_bucket": [-1],
-                "horizon_offset": [-1],
-                "minutes_remaining": [(26 - sample.as_of_token) * 15],
-                "weekday": [timestamp.weekday()],
-                "month": [timestamp.month],
-                "is_month_end": [timestamp.is_month_end],
-                "is_quarter_end": [timestamp.is_quarter_end],
-                "symbol": [record.symbol],
-                "liquidity_group": [liquidity_groups[record.instrument_id]],
-            }
-        )
-        raw = build_raw_feature_frame(
-            window["context"][None, ...], window["context_mask"][None, ...], metadata
-        ).drop(columns=["target_bucket", "horizon_offset"])
+    def raw_rows():
+        # Group only consecutive rows: no sorting or population changes. A session
+        # has at most 22 origins, so feature materialization stays bounded.
+        for session_id, session_samples in groupby(samples, key=lambda sample: sample.session_id):
+            group = list(session_samples)
+            record = cached_record(session_id)
+            windows = [extract_window(record, sample) for sample in group]
+            timestamps = [
+                pd.Timestamp(sample.as_of_ns, tz="UTC").tz_convert("America/New_York")
+                for sample in group
+            ]
+            metadata = pd.DataFrame(
+                {
+                    "as_of_bucket": [sample.as_of_token for sample in group],
+                    "target_bucket": -1,
+                    "horizon_offset": -1,
+                    "minutes_remaining": [(26 - sample.as_of_token) * 15 for sample in group],
+                    "weekday": [timestamp.weekday() for timestamp in timestamps],
+                    "month": [timestamp.month for timestamp in timestamps],
+                    "is_month_end": [timestamp.is_month_end for timestamp in timestamps],
+                    "is_quarter_end": [timestamp.is_quarter_end for timestamp in timestamps],
+                    "symbol": record.symbol,
+                    "liquidity_group": liquidity_groups[record.instrument_id],
+                }
+            )
+            frame = build_raw_feature_frame(
+                np.stack([window["context"] for window in windows]),
+                np.stack([window["context_mask"] for window in windows]),
+                metadata,
+            ).drop(columns=["target_bucket", "horizon_offset"])
+            for index, sample in enumerate(group):
+                yield sample, record, frame.iloc[[index]].reset_index(drop=True)
+
+    for sample, record, raw in raw_rows():
         raw.insert(0, "sample_id", sample.sample_id)
         raw.insert(1, "fold_id", sample.fold_id)
         raw.insert(2, "instrument_id", record.instrument_id)
@@ -307,33 +324,38 @@ def build_historical_baseline_regime_frame(
         for value in manifest["index_files"]
         if f"indexes/{partition}/" in str(value).replace("\\", "/")
     ]
-    records = {name: read_sequence_record(path) for name, path in sequence_paths.items()}
+
+    @lru_cache(maxsize=32)
+    def record_for(session_id: str) -> SequenceRecord:
+        return read_sequence_record(sequence_paths[session_id])
+
     rows = []
-    for index_path in sorted(index_paths):
-        for row in pd.read_parquet(index_path).itertuples(index=False):
-            sample = _sample_from_row(row)
-            record = records[sample.session_id]
-            actual = record.raw_volume[sample.as_of_token :].astype(float)
-            baseline = record.causal_baseline_volume[sample.as_of_token :].astype(float)
-            if actual.sum() <= 0 or baseline.sum() <= 0:
-                continue
-            actual_share = actual / actual.sum()
-            baseline_share = baseline / baseline.sum()
-            curve_error = float(
-                np.mean(np.abs(np.cumsum(actual_share) - np.cumsum(baseline_share)))
-            )
-            current = record.features[sample.as_of_token - 1]
-            rows.append(
-                {
-                    "sample_id": sample.sample_id,
-                    "instrument_id": record.instrument_id,
-                    "session_date": record.session_date,
-                    "as_of_token": sample.as_of_token,
-                    "volume_surprise": float(current[4]),
-                    "realized_volatility": float(current[3]),
-                    "historical_baseline_curve_error": curve_error,
-                }
-            )
+    index_frame = _load_cached_index_frame(
+        sequence_manifest_path, partition=partition, index_paths=tuple(sorted(index_paths))
+    )
+    for row in index_frame.itertuples(index=False):
+        sample = _sample_from_row(row)
+        record = record_for(sample.session_id)
+        actual = record.raw_volume[sample.as_of_token :].astype(float)
+        baseline = record.causal_baseline_volume[sample.as_of_token :].astype(float)
+        if actual.sum() <= 0 or baseline.sum() <= 0:
+            continue
+        actual_share = actual / actual.sum()
+        baseline_share = baseline / baseline.sum()
+        curve_error = float(np.mean(np.abs(np.cumsum(actual_share) - np.cumsum(baseline_share))))
+        current = record.features[sample.as_of_token - 1]
+        rows.append(
+            {
+                "sample_id": sample.sample_id,
+                "session_id": sample.session_id,
+                "instrument_id": record.instrument_id,
+                "session_date": record.session_date,
+                "as_of_token": sample.as_of_token,
+                "volume_surprise": float(current[4]),
+                "realized_volatility": float(current[3]),
+                "historical_baseline_curve_error": curve_error,
+            }
+        )
     result = pd.DataFrame(rows)
     if result.empty or result["sample_id"].duplicated().any():
         raise ValueError(f"Regime frame is empty or duplicates sample IDs for {partition}.")

@@ -35,16 +35,18 @@ def test_bundle_interruption_resume_and_corruption(tmp_path):
     assert len(calls) == 1
 
 
-def test_report_orchestration_reuses_only_unchanged_inputs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("relocated", [True, False])
+def test_report_orchestration_reuses_only_unchanged_inputs(tmp_path, monkeypatch, relocated):
     from types import SimpleNamespace
 
     from execsim.data.paper.manifests import file_sha256, write_json_atomic
     from execsim.ml.paper import orchestration
 
-    root = tmp_path / "execution"
+    root = tmp_path / "execution" if relocated else tmp_path
     config = SimpleNamespace(
         artifact_root=tmp_path,
-        runtime_evaluation_root=root,
+        runtime_evaluation_root=root if relocated else None,
+        report_root=tmp_path / "reports",
         paper_run_id="paper",
         config_hash="science",
         authorize=lambda *args, **kwargs: None,
@@ -71,7 +73,14 @@ def test_report_orchestration_reuses_only_unchanged_inputs(tmp_path, monkeypatch
             {
                 "parquet_sha256": file_sha256(path),
                 "paper_config_hash": "science",
-                "merge_identity": {"source_commit": "source"},
+                "merge_identity": {
+                    "source_commit": "source",
+                    "source_tree": "tree",
+                    "paper_config_hash": "science",
+                    "parameter_freeze_sha256": file_sha256(
+                        tmp_path / "selection/parameter-freeze-v1.json"
+                    ),
+                },
             },
         )
     calls = []
@@ -100,6 +109,43 @@ def test_report_orchestration_reuses_only_unchanged_inputs(tmp_path, monkeypatch
     ):
         write_json_atomic(root / name, {"fixture": True})
     write_json_atomic(tmp_path / "selection/locked-test-opened-v1.json", {"fixture": True})
+    write_json_atomic(
+        root / "evaluation/representation-evaluation-manifest.json",
+        {
+            "schema_version": "paper-representation-evaluation-v2",
+            "paper_config_hash": "science",
+            **{
+                f"{key}_sha256": file_sha256(root / f"evaluation/{name}.parquet")
+                for key, name in (
+                    ("accessibility", "representation-accessibility"),
+                    ("date_metrics", "representation-date-metrics"),
+                    ("support_regimes", "support-regimes"),
+                )
+            },
+        },
+    )
+    write_json_atomic(
+        root / "tca/manifest.json",
+        {
+            "schema_version": "paper-tca-v1",
+            "paper_config_hash": "science",
+            "evaluation_identity": {
+                "source_commit": "source",
+                "source_tree": "tree",
+                "paper_config_hash": "science",
+                "parameter_freeze_sha256": file_sha256(
+                    tmp_path / "selection/parameter-freeze-v1.json"
+                ),
+            },
+            "files": {
+                name: {
+                    "path": str(root / f"tca/{name}.parquet"),
+                    "sha256": file_sha256(root / f"tca/{name}.parquet"),
+                }
+                for name in ("main", "sensitivity")
+            },
+        },
+    )
     for fold in range(1, 4):
         for geometry in ("dense", "sparse"):
             for seed in (13, 29, 47):

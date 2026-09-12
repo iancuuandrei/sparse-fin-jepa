@@ -35,31 +35,49 @@
     },
     "docs/standards/implementation.md": {
       "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
-      "current_sha256": "0ff65e8092c02a3f70b9fadd39683214303a5ad7197758062b0c3651faa28e24",
+      "current_sha256": "d930f1694271bb01e6d03d99078dde00371b7a8c784dbd8505f063ed88a72ffc",
       "edits": [
         {
-          "start": 23,
-          "end": 24,
+          "start": 12,
+          "end": 13,
+          "original": "",
+          "replacement": "| Evaluation integration contracts | Propagate canonical metadata and test real producer-to-consumer paths through reporting and final freeze; retain exact scientific parity independently of legacy metadata omissions | Mocked boundaries cannot prove an executable historical pipeline; see ADR 0032 |\n"
+        },
+        {
+          "start": 24,
+          "end": 25,
           "original": "| Performance architecture | Cache causally filtered historical matrices and reuse exact-horizon OSQP setups through `OptimalExecutionWorkspace` | Profiling identified repeated forecast reconstruction as dominant; exact-horizon reuse preserves the original integer schedule |\n",
           "replacement": "| Performance architecture | Index one immutable historical matrix per symbol or pooled scope; binary-search the strict date cutoff; reuse exact-horizon OSQP setups through `OptimalExecutionWorkspace` | Repeated date-prefix pivots duplicate work and memory; scope indexes preserve finite-window estimators and exact-horizon reuse preserves the original integer schedule |\n"
         },
         {
-          "start": 43,
-          "end": 46,
+          "start": 44,
+          "end": 47,
           "original": "",
           "replacement": "| Historical forecast availability | Record unavailable exact EWMA requests and method-specific TCA cases; retain other methods and report paired coverage | Missing eligible history is not a fabricated zero forecast or a reason to remove an instrument globally; see ADR 0023 |\n| Result timestamp storage | Merge timestamp fields at the finest input precision with identical timezones and safe casts; keep other types strict | Arrow storage-unit differences must neither abort compatible results nor truncate instants; see ADR 0024 |\n| Evaluation derived state | Build one compact base per fold and publish learned predictions with checksum-bound atomic manifests; reuse completed predictions within the new evaluation identity | Reconstructing raw rows or rerunning identical frozen predictions adds work without information; incomplete artifacts must never be treated as completed stages |\n"
+        },
+        {
+          "start": 261,
+          "end": 329,
+          "original": "",
+          "replacement": "\n### 2026-09-11 \u2014 pre-evaluation identity hardening (ADR 0025)\n\nThe locked evaluator now treats causal ADV20 as required derived evidence for\nevery exact-window eligible instrument/session.  Validation occurs before TCA\nworkers and is repeated at the direct replay boundary; missing, duplicate,\nnon-finite, or non-positive values fail closed rather than changing the sample.\nForecast and TCA stages resolve relocated runtime data through the canonical\n`PaperRunConfig.data_path` abstraction.  Before consuming TEST inputs they bind\nthe runtime universe bytes to one shared `universe_manifest_hash` recorded by\nevery fold sequence manifest.  Reseal now validates the complete configured\nprimary JEPA final inventory and requires one non-empty training `code_commit`\nacross all coordinates, before publishing a new execution namespace.  These\nchecks are identity/provenance safeguards only and do not alter scientific\nconfiguration, estimands, or model artifacts.  See ADR 0025.\n\n### 2026-09-12 \u2014 cross-link resealed evaluation artifacts (ADR 0026)\n\nReseal must verify the existing identity links between each fold sequence\nmanifest, JEPA checkpoint, compatibility record, embedding export, and frozen\nLightGBM coordinate.  Independent file checksums do not prove that a complete\nartifact set was trained from the same sequence, universe, representation\nsource, and TRAIN/VALIDATION embedding bytes.  Cross-link checks run before\n`execution.json` publication and preserve all scientific inputs and estimands.\nSee ADR 0026.\n\n### 2026-09-12 \u2014 execution-share ADV20 and chained reseal provenance (ADRs 0027 and 0028)\n\nTCA history builders now restate each prior daily volume into the target\nsession's raw execution-share basis using the existing point-in-time split\nfactor and the 10:30 quantity-decision information clock. Replay bars remain\nraw, the 20-session lag is strict, and the corporate-action manifest identity\nis part of the history artifact identity. New reseals preserve v2 evidence but\nuse a typed supersession receipt and v3 execution identity to distinguish the\nroot TEST authorization from the immediate prior evaluator. See ADRs 0027 and\n0028.\n\n### 2026-09-12 \u2014 bounded reuse of immutable evaluation inputs (ADR 0029)\n\nFrozen probe tensors may be encoded once and replayed with their original batch\nboundaries, dtypes, masks, and RNG transitions. Temporary caches are checksummed,\nsource-bound, atomically published, and retired after coordinate publication.\nUse cgroup-aware native thread limits for representation evaluation. Batch raw\nforecast feature construction by consecutive session and reuse verified index\nand learned date slices without sharing mutable forecast-provider state.\nRetain an optimization only after equivalence and real-input performance checks.\nSee ADR 0029 and the evaluation implementation contract. Scientific configuration,\ntrained artifacts, estimands, and cross-source result isolation remain unchanged.\n\n### 2026-09-12 \u2014 operational artifact boundaries (ADR 0030)\n\nConstruct complete encoded-cache identities consistently at publication and\nretirement. Verify every cache partition before cleanup. Restrict trusted resume\ndeserialization to the existing tensor and NumPy RNG contract. Publish receipts\nthrough unique same-directory temporary files and construct detached commands\nfrom parsed arguments. Lock fresh CI dependencies without replacing the qualified\nhistorical environment. Exact frozen-parameter equality remains mandatory.\nSee ADR 0030. These safeguards do not change scientific inputs or estimands.\n\n### 2026-09-12 \u2014 exact evaluation fast paths (ADR 0031)\n\nIndex immutable preflight rows once, retain per-case softmax reduction order,\nand bypass metric merges only after exact key alignment is established. Slice\nlearned forecast volumes only against a verified private minute grid; preserve\nthe dictionary fallback for general requests. Keep all validation and numerical\ngates in their original order. Benchmark bounded workloads before retaining a\nfast path; do not extrapolate historical completion from synthetic timings.\nSee ADR 0031. Scientific configuration and result provenance remain unchanged.\n"
         }
       ]
     },
     "repo_manifest.yaml": {
       "frozen_sha256": "ba17e716f73b8ef82c1e3c0309911572ec8ca2662725d023b1c48a4a393a1d4f",
-      "current_sha256": "2ff93f83a50c91a6fd467699f9a31f3dba1759256eeb315b2bccb39ed7683da5",
+      "current_sha256": "ebcb5ae307d38a006487a45a99506d2a2996489a28e1a7183d52c6ee74ee0eba",
       "edits": [
+        {
+          "start": 81,
+          "end": 82,
+          "original": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper]\n",
+          "replacement": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py, scripts/benchmark_tca_preflight.py, scripts/benchmark_evaluation_preparation.py, scripts/runpod.py, scripts/setup_runpod.sh]\n"
+        },
         {
           "start": 83,
           "end": 84,
           "original": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n",
-          "replacement": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n"
+          "replacement": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/RUNPOD_EXECUTION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n"
         }
       ]
     }

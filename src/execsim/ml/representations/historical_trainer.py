@@ -339,8 +339,10 @@ def train_historical_representation(
     write_json_atomic(output_root / "compatibility.json", asdict(compatibility))
     latest_model = PredictiveRepresentationModel(representation)
     latest_model.load_state_dict(latest_state)
+    latest_model.eval()
     best_model = PredictiveRepresentationModel(representation)
     best_model.load_state_dict(best_state)
+    best_model.eval()
     checkpoint_models: tuple[tuple[Literal["latest", "best", "final"], Any], ...] = (
         ("latest", latest_model),
         ("best", best_model),

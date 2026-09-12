@@ -3,8 +3,8 @@
 set -euo pipefail
 REPOSITORY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPOSITORY"
-test "$(uname -s)" = Linux
-if [ "$(id -u)" -eq 0 ]; then SUDO=(); else SUDO=(sudo); fi
+[[ "$(uname -s)" == Linux ]]
+if [[ "$(id -u)" -eq 0 ]]; then SUDO=(); else SUDO=(sudo); fi
 "${SUDO[@]}" apt-get update
 "${SUDO[@]}" apt-get install -y python3-venv python3-dev build-essential cmake ninja-build \
   libboost-dev libboost-system-dev libboost-filesystem-dev libboost-chrono-dev \
@@ -13,7 +13,7 @@ nvidia-smi
 # NVIDIA Container Toolkit exposes the driver library; register its ICD if the image
 # did not ship the vendor entry. Do not install or replace the host NVIDIA driver.
 NVIDIA_ICD="$(ldconfig -p | awk '/libnvidia-opencl.so.1/{print $NF; exit}')"
-if [ -z "$NVIDIA_ICD" ]; then
+if [[ -z "$NVIDIA_ICD" ]]; then
   printf '%s\n' 'NVIDIA OpenCL driver library is not exposed by this pod image.' >&2
   exit 1
 fi

@@ -133,8 +133,9 @@ def _validate_learned_case(
         raise ValueError(f"TCA learned shape is missing columns: {sorted(missing)}")
     if shape.empty or shape[["case_id", "target_bucket"]].astype(str).duplicated().any():
         raise ValueError("TCA preflight found missing or duplicate learned shape rows.")
+    shape_positions = shape.groupby(shape["case_id"].astype(str), sort=False).indices
     for row in scale.itertuples(index=False):
-        sample_shape = shape.loc[shape["case_id"].astype(str) == str(row.sample_id)]
+        sample_shape = shape.iloc[shape_positions.get(str(row.sample_id), [])]
         expected = np.arange(int(row.as_of), 26)
         shares = sample_shape["conditional_share"].to_numpy(dtype=float)
         if (
@@ -290,7 +291,27 @@ def preflight_tca_ledgers(
                 )
             else:
                 shape = pd.DataFrame(columns=["case_id", "target_bucket", "conditional_share"])
+            # Index immutable instrument frames once. Preserve row order within
+            # each case; all existing per-case contract checks still run below.
+            if "session_date" not in scale or "training_cutoff" not in scale:
+                raise ValueError("TCA learned scale is missing date identity columns.")
+            scale_dates = pd.to_datetime(scale["session_date"], errors="coerce")
+            cutoff_dates = pd.to_datetime(scale["training_cutoff"], errors="coerce")
+            if scale_dates.isna().any() or cutoff_dates.isna().any():
+                raise ValueError("TCA preflight found invalid learned date identities.")
+            if "case_id" not in shape:
+                raise ValueError("TCA learned shape is missing columns: ['case_id']")
+            date_positions = scale.groupby(scale_dates.dt.date, sort=False).indices
+            case_positions = shape.groupby(shape["case_id"].astype(str), sort=False).indices
             for session_date in session_dates:
+                date_scale = scale.iloc[date_positions.get(session_date, [])]
+                positions = [
+                    int(position)
+                    for sample_id in date_scale["sample_id"].astype(str).drop_duplicates()
+                    for position in case_positions.get(sample_id, [])
+                ]
+                # Original filtering kept physical shape order, not scale order.
+                date_shape = shape.iloc[sorted(positions)]
                 _validate_learned_case(
                     directory,
                     instrument_id=instrument_id,
@@ -298,8 +319,8 @@ def preflight_tca_ledgers(
                     fold_id=str(identity["fold_id"]),
                     training_cutoff=training_cutoff,
                     origins=origins,
-                    scale_frame=scale,
-                    shape_frame=shape,
+                    scale_frame=date_scale,
+                    shape_frame=date_shape,
                 )
 
     verified_ewma: set[Path] = set()

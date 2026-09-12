@@ -421,6 +421,17 @@ predict a full-coordinate completion time. Total OS threads were 84, including
 idle native/CUDA pools; four is the computational pool limit, not a claim that
 the process contains only four threads.
 
+A later bounded real-pod qualification at source
+`4eabe206a61e2e334f73fbb46568eaa30393a551` used frozen TRAIN/VALIDATION inputs:
+8,192 TRAIN rows, 512 VALIDATION rows, and a second VALIDATION loader for
+scoring. Reference evaluation took 125.556818787 seconds and cached evaluation
+took 26.735507892 seconds (about 4.70 times faster), with the same output
+SHA-256, `dc1a0e698ae6cd229088f32224ac8abb6bc9c7c0c7c60ce8cdea7bd9c7633d26`.
+Each run used 24 OS threads, four native threads, and one Torch inter-op thread.
+Peak RSS was 2,905,764 KiB for reference and 2,951,296 KiB for cached. The run
+log SHA-256 is `555f0b0c958313ccf0d3f7ea87be6cf4604fc3b7e35ab7359de2e8f8e928ecce`.
+No historical TEST data was used, and no JEPA or LightGBM retraining occurred.
+
 A subsequent cached-input comparison at one, two, four, and eight native threads
 preserved all nonnumeric identities and both selected ridge alphas. The maximum
 absolute mathematical-output difference was 1.7764e-15; comparisons used
@@ -443,3 +454,100 @@ than one percent; a summary-only simulator was not introduced. A synthetic
 10,000-replicate block-bootstrap timing was under two seconds and did not justify
 changing the report estimator. These observations are bounded profiling evidence,
 not a full historical TCA or reporting performance claim.
+
+### Operational artifact safeguards
+
+The coordinate-result schema and encoded-cache schema are distinct. Construct
+the complete cache identity with `encoded_probe_identity` for both creation and
+retirement, including batching, partition, device, and PyTorch version. Retirement
+verifies all partition identities and file checksums before deleting any cache
+file; it never ignores the schema to permit cleanup. The published coordinate
+remains the scientific result and must exist before retirement.
+
+Trusted resume loading verifies the exact bytes passed to PyTorch's restricted
+weights-only loader. Only the existing NumPy MT19937 reconstruction types are
+additionally allowed, within a scoped context. Unsupported object types fail;
+existing safetensors and continuation files are not rewritten. JSON publication
+uses unique same-directory temporary files and atomic replacement, preserving
+the prior receipt if replacement fails. See ADR 0030.
+
+Learned TCA ledger preflight builds date and case-position indexes once per
+instrument. It passes physically ordered date slices through the existing
+identity, cutoff, origin, duplicate, future-bucket, and share checks. Indexing is
+operational: it does not remove an eligible case or replace preflight with trust
+in a cache. A missing eligible date still fails before workers launch.
+
+The [Sonar review](SONAR_REMEDIATION.md) accounts for the full project finding
+inventory and distinguishes operational corrections from intentional exact
+identity and runtime-path contracts. It does not replace exact-head hosted gates.
+
+### Indexed preflight benchmark
+
+Run the bounded synthetic comparison from the repository root:
+
+```powershell
+.venv/Scripts/python.exe scripts/benchmark_tca_preflight.py --baseline-revision 3eb221bf787421fd4d5397b725397861b403fdaa --dates 128 --origins 22 --repeats 2
+```
+
+The benchmark uses eight learned ledgers and one EWMA ledger for one synthetic
+instrument, preserves all preflight checks, and extracts the old validator from
+the specified Git revision. It never reads historical TEST data or calls a
+forecast provider. After correcting the end-window boundary, two paired runs
+with 128 dates and all 22 configured origins on the local Python 3.13 environment
+gave median elapsed times of 21.772753 seconds for legacy preflight and 13.740527
+seconds for indexed preflight. Learned validator time was 16.584558 versus
+8.169671 seconds. Both paths made 19 Parquet reads and returned 326,656 rows.
+The benchmark ran concurrently with the full test suite, so these measurements
+are informative and are not an isolated performance estimate.
+
+The benchmark imposes no CI timing threshold. These results quantify only
+preflight work on the declared fixture, not historical replay, report matching,
+or end-to-end completion time. Exact-output and adversarial regressions remain
+separate gates.
+
+### Guarded forecast fast paths
+
+Contiguous shape groups retain the original per-group NumPy max, exponential,
+sum, and assignment order while avoiding pandas group-index and row-write
+overhead. Interleaved, categorical, or missing keys retain the original path.
+Metric inputs bypass merge/sort only when unique typed keys align exactly and
+future buckets ascend within contiguous cases. Fallback share validation stays
+before sorting. Tests include near-tolerance sums and malformed populations.
+
+Learned forecast providers retain private immutable metadata for the minute grid
+they construct. Truncation slices only if the cached timestamp tuple is that
+grid object and the entire requested tuple matches a contiguous slice. Generic
+requests, including unsorted or duplicate timestamps, retain dictionary semantics.
+The normalization reduction and returned forecast fields are unchanged. See ADR
+0031.
+
+The synthetic helper benchmarks in `test_forecast_fast_paths.py` assert exact
+outputs before timing. For 10,000 cases and 80,000 shape rows, stub-model
+`predict_frames` took 1.237 seconds on the reference path and 0.069 seconds on
+the guarded path. Full metric construction took 0.078 versus 0.063 seconds.
+These timings exclude real LightGBM prediction cost. The 300-minute truncation
+helper took 0.334 versus 0.194 seconds; the full synthetic simulation parity test
+also passes. No historical effectiveness was inspected for these comparisons.
+
+### Other preparation costs
+
+Run the bounded preparation audit from the repository root:
+
+```powershell
+.venv/Scripts/python.exe scripts/benchmark_evaluation_preparation.py --ewma-samples 128 --sequence-samples 100000 --report-cases 25000 --repeats 3
+```
+
+On the local environment, 2,048 exact EWMA requests took a median 0.994 seconds.
+Each offset retains its independently eligible historical window; substituting
+truncation would not preserve the estimator. Fixed-grid construction for 100,000
+samples took 1.427 seconds, with 0.094 seconds in grouping/sorting. Reusing
+DataLoader instances is not adopted because it can change generator state.
+
+For 97,877 synthetic method rows and three complete-case comparisons, narrowing
+columns before copying took 0.181 seconds versus 0.171 seconds for the existing
+matcher. That prototype is not retained; the current benchmark measures the
+canonical matcher and verifies repeat-exact rows and drop counts rather than
+maintaining a second copy of the rejected matcher. Peak RSS was unavailable in this local
+benchmark; it is not reported as zero. These bounded observations do not rule
+out larger-corpus bottlenecks or replace the required full-coordinate runtime
+observation. Cross-process checksum verification remains unchanged.

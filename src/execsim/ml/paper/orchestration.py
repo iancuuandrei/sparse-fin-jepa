@@ -1737,6 +1737,11 @@ def _evaluate_representations_stage(
                         prefetch_factor=int(config.sequences["prefetch_factor"]),
                     )
 
+                cache_base_identity = {
+                    **identity,
+                    "batch_size": int(config.representation["batch_size"]),
+                    "num_workers": int(config.sequences["num_workers"]),
+                }
                 capacity, observable, dated = evaluate_frozen_capacity_streaming(
                     model,
                     loader("train"),
@@ -1745,11 +1750,7 @@ def _evaluate_representations_stage(
                     device=device,
                     seed=int(seed),
                     cache_root=evaluation_root(config) / "probe-cache" / coordinate,
-                    cache_identity={
-                        **identity,
-                        "batch_size": int(config.representation["batch_size"]),
-                        "num_workers": int(config.sequences["num_workers"]),
-                    },
+                    cache_identity=cache_base_identity,
                     options=FrozenProbeOptions(
                         ridge_alphas=tuple(
                             float(value) for value in config.representation["probe_ridge_alphas"]
@@ -1813,7 +1814,9 @@ def _evaluate_representations_stage(
                 from execsim.ml.representations.probe_cache import discard_completed_probe_cache
 
                 discard_completed_probe_cache(
-                    evaluation_root(config) / "probe-cache" / coordinate, identity=identity
+                    evaluation_root(config) / "probe-cache" / coordinate,
+                    identity=cache_base_identity,
+                    device=device,
                 )
                 for name in names:
                     parts[Path(name).stem][coordinate] = (

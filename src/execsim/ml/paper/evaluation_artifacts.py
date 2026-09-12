@@ -288,23 +288,31 @@ def forecast_metric_frame(
     if len(totals) != len(base.scale) or not np.isfinite(totals).all() or np.any(totals < 0):
         raise ValueError("Forecast totals must be finite nonnegative aligned predictions.")
     actual = base.shape.loc[:, ["case_id", "target_bucket"]].copy()
-    actual["actual_share"] = base.shape_target
-    joined = actual.merge(
-        predicted_shape.loc[:, ["case_id", "target_bucket", "conditional_share"]],
-        on=["case_id", "target_bucket"],
-        validate="one_to_one",
-        how="outer",
-        indicator=True,
-    )
-    if not joined["_merge"].eq("both").all():
-        raise ValueError("Forecast shape population differs from the declared base.")
+    predicted = predicted_shape.loc[:, ["case_id", "target_bucket", "conditional_share"]]
+    aligned = _can_use_aligned_shape_keys(actual, predicted)
+    if aligned:
+        joined = actual.reset_index(drop=True)
+        joined["actual_share"] = base.shape_target
+        joined["conditional_share"] = predicted["conditional_share"].to_numpy(copy=False)
+    else:
+        actual["actual_share"] = base.shape_target
+        joined = actual.merge(
+            predicted,
+            on=["case_id", "target_bucket"],
+            validate="one_to_one",
+            how="outer",
+            indicator=True,
+        )
+        if not joined["_merge"].eq("both").all():
+            raise ValueError("Forecast shape population differs from the declared base.")
     shares = joined["conditional_share"].to_numpy(dtype=float)
     if not np.isfinite(shares).all() or np.any(shares < 0):
         raise ValueError("Forecast shares must be finite and nonnegative.")
     sums = joined.groupby("case_id", sort=False)["conditional_share"].sum()
     if not np.allclose(sums.to_numpy(), 1.0, rtol=0, atol=1e-12):
         raise ValueError("Forecast conditional shares must sum to one.")
-    joined = joined.sort_values(["case_id", "target_bucket"], kind="stable")
+    if not aligned:
+        joined = joined.sort_values(["case_id", "target_bucket"], kind="stable")
     cumulative = joined.groupby("case_id", sort=False)[
         ["actual_share", "conditional_share"]
     ].cumsum()
@@ -329,6 +337,33 @@ def forecast_metric_frame(
             "conditional_curve_wasserstein": scale["sample_id"].map(errors),
         }
     )
+
+
+def _can_use_aligned_shape_keys(actual: pd.DataFrame, predicted: pd.DataFrame) -> bool:
+    """Prove the direct metric path has the same unique ordered keys as a merge."""
+    if len(actual) != len(predicted) or actual.empty:
+        return False
+    actual_keys = actual.reset_index(drop=True)
+    predicted_keys = predicted.loc[:, ["case_id", "target_bucket"]].reset_index(drop=True)
+    if not actual_keys.equals(predicted_keys):
+        return False
+    if actual_keys.duplicated(["case_id", "target_bucket"]).any():
+        return False
+    if (
+        isinstance(actual_keys["case_id"].dtype, pd.CategoricalDtype)
+        or not pd.api.types.is_integer_dtype(actual_keys["target_bucket"].dtype)
+        or actual_keys[["case_id", "target_bucket"]].isna().to_numpy().any()
+    ):
+        return False
+    try:
+        case_codes, _ = pd.factorize(actual_keys["case_id"], sort=False)
+        buckets = actual_keys["target_bucket"].to_numpy(dtype=np.int64)
+    except (TypeError, ValueError):
+        return False
+    if np.any(case_codes < 0) or np.any(case_codes[1:] < case_codes[:-1]):
+        return False
+    same_case = case_codes[1:] == case_codes[:-1]
+    return bool(np.all(buckets[1:][same_case] > buckets[:-1][same_case]))
 
 
 def verify_artifact(

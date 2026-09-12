@@ -79,9 +79,9 @@ areas:
     tests: [tests/test_paper_representations.py, tests/test_paper_pipeline.py]
     verify: [python -m pytest tests/test_paper_representations.py tests/test_paper_pipeline.py]
   paper_evaluation:
-    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py]
+    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py, scripts/benchmark_tca_preflight.py, scripts/benchmark_evaluation_preparation.py, scripts/runpod.py, scripts/setup_runpod.sh]
     purpose: Locked hierarchical paper planning, validation freeze, block inference, causal TCA, and main/appendix report bundles.
-    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]
+    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/RUNPOD_EXECUTION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]
     tests: [tests/test_paper_pipeline.py]
     verify: [python -m pytest tests/test_paper_pipeline.py]
   cli:

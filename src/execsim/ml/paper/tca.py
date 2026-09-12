@@ -282,16 +282,29 @@ def run_historical_tca(
         raise ValueError("Paper TCA supports only primary 3% and appendix 1%/5% ADV sizes.")
     start_time = time.fromisoformat(start)
     end_time = time.fromisoformat(end)
-    if (
-        start_time != time(10, 30)
-        or end_time != time(15, 30)
-        or planned_participation != 0.10
-        or hard_participation != 0.10
-        or risk_aversion != 0.0
-        or tracking_penalty != 0.0
-        or half_spread_arrival_fraction != 5e-5
-        or temporary_impact_arrival_fraction != 1e-3
-    ):
+    # This is exact protocol identity, not comparison of estimated quantities.
+    # A tolerance would incorrectly authorize a different execution experiment.
+    actual_contract = {
+        "start": start_time,
+        "end": end_time,
+        "planned_participation": planned_participation,
+        "hard_participation": hard_participation,
+        "risk_aversion": risk_aversion,
+        "tracking_penalty": tracking_penalty,
+        "half_spread_arrival_fraction": half_spread_arrival_fraction,
+        "temporary_impact_arrival_fraction": temporary_impact_arrival_fraction,
+    }
+    frozen_contract = {
+        "start": time(10, 30),
+        "end": time(15, 30),
+        "planned_participation": 0.10,
+        "hard_participation": 0.10,
+        "risk_aversion": 0.0,
+        "tracking_penalty": 0.0,
+        "half_spread_arrival_fraction": 5e-5,
+        "temporary_impact_arrival_fraction": 1e-3,
+    }
+    if actual_contract != frozen_contract:
         raise ValueError("Historical TCA parameters contradict the locked experiment.")
     instruments = select_liquidity_spaced_instruments(universe, size=liquidity_size)
     required_adv = {"instrument_id", "session_date", "adv20"}

@@ -73,6 +73,10 @@ ADR [0031](0031-preserve-arithmetic-in-evaluation-fast-paths.md) is accepted:
 index immutable preflight rows and use guarded forecast fast paths while retaining
 the exact reduction order and general-case validation behavior.
 
+ADR [0032](0032-enforce-evaluation-producer-contracts.md) is accepted: propagate
+canonical evaluation identities and exercise real producer-to-consumer boundaries,
+including report rendering and final completion verification.
+
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 
 Do not rewrite an accepted decision to hide its history. Add a new ADR that supersedes it, then update the old record's status and link to the replacement. Update `docs/standards/implementation.md` in the same change when the decision changes the active direction.

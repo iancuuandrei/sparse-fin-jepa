@@ -1,5 +1,24 @@
 # Optimized evaluation implementation
 
+The [production contract audit](EVALUATION_CONTRACT_AUDIT.md) records the concrete
+producer-to-consumer invariants and regression coverage. ADR 0032 explains why
+canonical metadata and report completion are enforced independently of legacy
+equivalence fixtures. These corrections do not change frozen scientific values.
+
+New final-result freezes are written to `selection/final-result-freeze-v1.json`
+under the evaluation root, including the default-root mode. The completed report
+tree remains immutable so both report reuse and repeated freeze verification
+succeed. No historical receipt is moved or rewritten. Completion verification
+requires the exact six numerical inputs and the optional unavailable-forecast
+input when present, as well as current source commit/tree and bundle checksums.
+The representation aggregate must bind all three canonical merged outputs. The
+TCA aggregate must bind the current execution identity and the canonical main
+and sensitivity paths and checksums. Hashing an inconsistent aggregate is not
+sufficient proof of compatibility with the report inputs.
+Both reporting and final freeze revalidate each numerical merge receipt, including
+its parameter-freeze hash and nested scientific configuration identity. A changed
+sidecar cannot acquire authority merely because the Parquet bytes still match.
+
 Result shard merging promotes each timestamp field to the finest input storage
 unit, including typed empty shards. Timezones must match exactly, batch casts are
 safe (overflow fails), and other type conflicts remain errors. No timestamp is

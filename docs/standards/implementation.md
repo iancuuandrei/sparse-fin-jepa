@@ -283,3 +283,14 @@ artifact set was trained from the same sequence, universe, representation
 source, and TRAIN/VALIDATION embedding bytes.  Cross-link checks run before
 `execution.json` publication and preserve all scientific inputs and estimands.
 See ADR 0026.
+
+### 2026-09-12 — execution-share ADV20 and chained reseal provenance (ADRs 0027 and 0028)
+
+TCA history builders now restate each prior daily volume into the target
+session's raw execution-share basis using the existing point-in-time split
+factor and the 10:30 quantity-decision information clock. Replay bars remain
+raw, the 20-session lag is strict, and the corporate-action manifest identity
+is part of the history artifact identity. New reseals preserve v2 evidence but
+use a typed supersession receipt and v3 execution identity to distinguish the
+root TEST authorization from the immediate prior evaluator. See ADRs 0027 and
+0028.

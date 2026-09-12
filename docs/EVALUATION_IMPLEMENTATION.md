@@ -201,6 +201,20 @@ every date. See the existing resolution-quality contract and
 
 ## Evaluator reseal and isolated output namespace
 
+To supersede an existing resealed execution, first create the typed chain
+receipt (for example, with `prepare-evaluation-supersession`) and then pass it
+to `reseal-evaluation`:
+
+```text
+execsim ml paper prepare-evaluation-supersession \
+  --superseded-execution artifacts/paper/protocols/sparse-jepa-v2/evaluation-executions/b7eee96 \
+  --supersession-output artifacts/paper/protocols/sparse-jepa-v2/superseded/SECOND_RESEAL/supersession.json \
+  --reason "corrected pre-evaluation provenance contract"
+```
+
+The command records a typed, checksum-bound predecessor; it does not copy or
+reuse any predecessor result artifacts.
+
 `execsim ml paper reseal-evaluation` accepts `--evaluation-root` and a required
 `--supersession-receipt`. It requires locked-evaluation runtime approval and clean
 committed source. The output root must be a new child of the authoritative
@@ -275,6 +289,21 @@ causal ADV20 row before worker launch; direct historical replay repeats this
 check and raises rather than silently dropping a case.  These are fail-closed
 identity and derived-evidence checks; they do not open TEST or change the
 frozen estimand.
+
+TCA ADV20 histories bind the runtime corporate-action manifest and use the
+existing point-in-time split-factor convention to express every prior daily
+volume in the target session's raw execution-share basis. The target volume is
+excluded by the strict 20-session lag, and raw replay bars are not restated.
+Action-bound histories use a new artifact identity, so a history built from
+different corporate-action bytes cannot be reused.
+
+First-generation reseals remain `paper-evaluation-execution-v2` for immutable
+historical compatibility. A reseal that supersedes an existing resealed
+execution uses a typed `paper-evaluation-supersession-v1` receipt and publishes
+`paper-evaluation-execution-v3`. The v3 identity records both the original
+TEST-open source and the immediate predecessor; validation checks the prior
+`execution.json`, its checksum, and its immutable inventory before publishing
+the new empty namespace.
 
 Reseal cross-links the immutable inventory before publishing `execution.json`.
 Each fold's sequence manifest must be the sequence named by every LightGBM

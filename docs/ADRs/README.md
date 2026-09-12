@@ -28,6 +28,8 @@ Architecture decision records (ADRs) explain durable technical choices, their co
 | [0020](0020-bound-lightgbm-coordinate-memory.md) | Accepted | Bound LightGBM hybrid features and coordinate lifetime on the qualified host |
 | [0025](0025-fail-closed-evaluation-input-identities.md) | Accepted | Fail closed on required ADV20 evidence and bind relocated evaluation identities before execution |
 | [0026](0026-cross-link-resealed-evaluation-artifacts.md) | Accepted | Cross-link sequence, JEPA, embedding, and frozen LightGBM identities during reseal |
+| [0027](0027-corporate-action-consistent-tca-adv20.md) | Accepted | Restate causal ADV20 into the target execution-share basis with point-in-time actions |
+| [0028](0028-chained-resealed-evaluation-provenance.md) | Accepted | Preserve root TEST authorization and immediate predecessor across resealed executions |
 
 ## Recording a decision
 
@@ -50,6 +52,14 @@ and qualify JEPA source uniformity during reseal.
 ADR [0026](0026-cross-link-resealed-evaluation-artifacts.md) is accepted: reject
  internally consistent but cross-coordinate-swapped immutable artifacts before
  publishing a resealed execution.
+
+ADR [0027](0027-corporate-action-consistent-tca-adv20.md) is accepted: restate
+causal ADV20 into the target execution-share basis using only point-in-time
+known and effective corporate actions.
+
+ADR [0028](0028-chained-resealed-evaluation-provenance.md) is accepted: bind a
+new reseal to both the immutable root TEST authorization and the immediate prior
+resealed execution with a typed supersession receipt.
 
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 

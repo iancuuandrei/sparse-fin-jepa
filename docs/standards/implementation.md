@@ -306,3 +306,23 @@ and learned date slices without sharing mutable forecast-provider state.
 Retain an optimization only after equivalence and real-input performance checks.
 See ADR 0029 and the evaluation implementation contract. Scientific configuration,
 trained artifacts, estimands, and cross-source result isolation remain unchanged.
+
+### 2026-09-12 — operational artifact boundaries (ADR 0030)
+
+Construct complete encoded-cache identities consistently at publication and
+retirement. Verify every cache partition before cleanup. Restrict trusted resume
+deserialization to the existing tensor and NumPy RNG contract. Publish receipts
+through unique same-directory temporary files and construct detached commands
+from parsed arguments. Lock fresh CI dependencies without replacing the qualified
+historical environment. Exact frozen-parameter equality remains mandatory.
+See ADR 0030. These safeguards do not change scientific inputs or estimands.
+
+### 2026-09-12 — exact evaluation fast paths (ADR 0031)
+
+Index immutable preflight rows once, retain per-case softmax reduction order,
+and bypass metric merges only after exact key alignment is established. Slice
+learned forecast volumes only against a verified private minute grid; preserve
+the dictionary fallback for general requests. Keep all validation and numerical
+gates in their original order. Benchmark bounded workloads before retaining a
+fast path; do not extrapolate historical completion from synthetic timings.
+See ADR 0031. Scientific configuration and result provenance remain unchanged.

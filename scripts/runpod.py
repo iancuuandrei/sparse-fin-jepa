@@ -454,6 +454,8 @@ def train(args) -> dict:
 
 def process_token(pid: int) -> str | None:
     """Bind stop requests to a Linux PID start time, protecting against PID reuse."""
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("Process identity requires a positive integer PID.")
     path = Path(f"/proc/{pid}/stat")
     try:
         fields = path.read_text().rsplit(")", 1)[1].split()
@@ -594,6 +596,21 @@ def reassemble(args) -> dict:
     return result
 
 
+def training_process_command(args) -> list[str]:
+    """Build the fixed child command from parsed arguments, never raw argv."""
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        f"--repo={args.repo.resolve()}",
+        "_train",
+        f"--fold={args.fold}",
+        f"--bundle-sha256={args.bundle_sha256}",
+    ]
+    for name in ("bundle", "work", "output", "ready", "approval"):
+        command.append(f"--{name}={getattr(args, name).resolve()}")
+    return command
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
@@ -654,12 +671,10 @@ def main() -> None:
             state = read_json(state_path)
             if state["token"] is not None and process_token(state["pid"]) == state["token"]:
                 raise ValueError("Fold worker already active.")
-        argv = sys.argv[1:]
-        argv[argv.index(args.command)] = "_train"
         log = args.work / f"attempt-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}.log"
         with log.open("wb") as stream:
             child = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), *argv],
+                training_process_command(args),
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,

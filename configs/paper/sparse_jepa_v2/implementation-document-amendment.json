@@ -35,7 +35,7 @@
     },
     "docs/standards/implementation.md": {
       "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
-      "current_sha256": "177c2617a68015cb2944672cab41c9bdb26890d975030d55bc6f527ffdab3e0c",
+      "current_sha256": "4523da829d25b7526f9674f0a8ab17a8118ca3d64eb958e58bc7e0f3132134ab",
       "edits": [
         {
           "start": 23,
@@ -72,24 +72,36 @@
           "end": 308,
           "original": "",
           "replacement": "\n### 2026-09-12 — bounded reuse of immutable evaluation inputs (ADR 0029)\n\nFrozen probe tensors may be encoded once and replayed with their original batch\nboundaries, dtypes, masks, and RNG transitions. Temporary caches are checksummed,\nsource-bound, atomically published, and retired after coordinate publication.\nUse cgroup-aware native thread limits for representation evaluation. Batch raw\nforecast feature construction by consecutive session and reuse verified index\nand learned date slices without sharing mutable forecast-provider state.\nRetain an optimization only after equivalence and real-input performance checks.\nSee ADR 0029 and the evaluation implementation contract. Scientific configuration,\ntrained artifacts, estimands, and cross-source result isolation remain unchanged.\n"
+        },
+        {
+          "start": 308,
+          "end": 318,
+          "original": "",
+          "replacement": "\n### 2026-09-12 — operational artifact boundaries (ADR 0030)\n\nConstruct complete encoded-cache identities consistently at publication and\nretirement. Verify every cache partition before cleanup. Restrict trusted resume\ndeserialization to the existing tensor and NumPy RNG contract. Publish receipts\nthrough unique same-directory temporary files and construct detached commands\nfrom parsed arguments. Lock fresh CI dependencies without replacing the qualified\nhistorical environment. Exact frozen-parameter equality remains mandatory.\nSee ADR 0030. These safeguards do not change scientific inputs or estimands.\n"
+        },
+        {
+          "start": 318,
+          "end": 328,
+          "original": "",
+          "replacement": "\n### 2026-09-12 — exact evaluation fast paths (ADR 0031)\n\nIndex immutable preflight rows once, retain per-case softmax reduction order,\nand bypass metric merges only after exact key alignment is established. Slice\nlearned forecast volumes only against a verified private minute grid; preserve\nthe dictionary fallback for general requests. Keep all validation and numerical\ngates in their original order. Benchmark bounded workloads before retaining a\nfast path; do not extrapolate historical completion from synthetic timings.\nSee ADR 0031. Scientific configuration and result provenance remain unchanged.\n"
         }
       ]
     },
     "repo_manifest.yaml": {
       "frozen_sha256": "ba17e716f73b8ef82c1e3c0309911572ec8ca2662725d023b1c48a4a393a1d4f",
-      "current_sha256": "b4d5ec6b603918630ee31ab26b9c83139f0b1a31981e07279946917f1bd8d580",
+      "current_sha256": "ebcb5ae307d38a006487a45a99506d2a2996489a28e1a7183d52c6ee74ee0eba",
       "edits": [
         {
           "start": 81,
           "end": 82,
           "original": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper]\n",
-          "replacement": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py]\n"
+          "replacement": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py, scripts/benchmark_tca_preflight.py, scripts/benchmark_evaluation_preparation.py, scripts/runpod.py, scripts/setup_runpod.sh]\n"
         },
         {
           "start": 83,
           "end": 84,
           "original": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n",
-          "replacement": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n"
+          "replacement": "    specifications: [docs/standards/implementation.md, docs/PAPER_DESIGN.md, docs/PAPER_IMPLEMENTATION_REPORT.md, docs/EVALUATION_IMPLEMENTATION.md, docs/RUNPOD_EXECUTION.md, docs/MATHEMATICAL_MODEL.md, docs/ADRs/0008-redirect-paper-to-representation-accessibility.md, docs/ADRs/0009-separate-data-quality-by-resolution.md]\n"
         }
       ]
     }

@@ -46,6 +46,13 @@ def test_cached_probe_outputs_match_reference(tmp_path: Path, geometry: str) -> 
     state = copy.deepcopy(model.state_dict())
     loaders = [batches(partition) for partition in ("train", "validation", "test")]
     options = FrozenProbeOptions(mlp_epochs=2)
+    coordinate_identity = {
+        "schema_version": "paper-representation-coordinate-v1",
+        "coordinate": f"fold-1-{geometry}-13",
+        "checkpoint": "checkpoint-sha",
+        "sequence": "sequence-sha",
+    }
+    cache_base_identity = {**coordinate_identity, "batch_size": 5, "num_workers": 0}
     reference = evaluate_frozen_capacity_streaming(
         model,
         *loaders,
@@ -60,8 +67,21 @@ def test_cached_probe_outputs_match_reference(tmp_path: Path, geometry: str) -> 
         seed=13,
         options=options,
         cache_root=tmp_path / "probe",
-        cache_identity={"fixture": geometry},
+        cache_identity=cache_base_identity,
     )
+    import pandas as pd
+
+    from execsim.ml.paper.evaluation_artifacts import publish_frames
+    from execsim.ml.representations.probe_cache import discard_completed_probe_cache
+
+    publish_frames(
+        tmp_path / "published-coordinate",
+        identity=coordinate_identity,
+        frames={"capacity.parquet": pd.DataFrame(cached[0])},
+    )
+    discard_completed_probe_cache(tmp_path / "probe", identity=cache_base_identity, device="cpu")
+    assert not (tmp_path / "probe").exists()
+    assert (tmp_path / "published-coordinate" / "manifest.json").is_file()
     for before_rows, after_rows in zip(reference, cached, strict=True):
         assert len(before_rows) == len(after_rows)
         for before, after in zip(before_rows, after_rows, strict=True):
@@ -151,18 +171,69 @@ def test_cache_preserves_loader_generator_and_reuses_without_encoding(tmp_path: 
 
 
 def test_completed_cache_cleanup_rejects_wrong_identity(tmp_path: Path) -> None:
-    from execsim.ml.representations.probe_cache import discard_completed_probe_cache
+    from execsim.ml.representations.probe_cache import (
+        discard_completed_probe_cache,
+        encoded_probe_identity,
+    )
 
     model = PredictiveRepresentationModel(RepresentationConfig("dense")).eval()
     root = tmp_path / "coordinate"
     materialize_probe_batches(
         root / "train",
-        identity={"source": "A"},
+        identity=encoded_probe_identity({"source": "A"}, partition="train", device="cpu"),
         loader=batches("train"),
         encode=lambda batch: _encoded_batch(model, batch, "cpu"),
     )
     with pytest.raises(ValueError, match="identity"):
-        discard_completed_probe_cache(root, identity={"source": "B"})
+        discard_completed_probe_cache(root, identity={"source": "B"}, device="cpu")
     assert root.exists()
-    discard_completed_probe_cache(root, identity={"source": "A"})
+    discard_completed_probe_cache(root, identity={"source": "A"}, device="cpu")
     assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "coordinate",
+        "checkpoint",
+        "sequence",
+        "batch_size",
+        "num_workers",
+        "schema_version",
+        "partition",
+        "device",
+        "torch_version",
+    ],
+)
+def test_cleanup_checks_exact_partition_identity(tmp_path: Path, field: str) -> None:
+    from execsim.data.paper.manifests import read_json, write_json_atomic
+    from execsim.ml.representations.probe_cache import (
+        discard_completed_probe_cache,
+        encoded_probe_identity,
+    )
+
+    base = {
+        "schema_version": "paper-representation-coordinate-v1",
+        "coordinate": "fold-1-dense-13",
+        "checkpoint": "sha-checkpoint",
+        "sequence": "sha-sequence",
+        "batch_size": 5,
+        "num_workers": 0,
+    }
+    model = PredictiveRepresentationModel(RepresentationConfig("dense")).eval()
+    root = tmp_path / "cache"
+    for partition in ("train", "validation", "test"):
+        materialize_probe_batches(
+            root / partition,
+            identity=encoded_probe_identity(base, partition=partition, device="cpu"),
+            loader=batches(partition),
+            encode=lambda batch: _encoded_batch(model, batch, "cpu"),
+        )
+    manifest = root / "test" / "manifest.json"
+    receipt = read_json(manifest)
+    receipt["identity"][field] = "wrong"
+    write_json_atomic(manifest, receipt)
+    with pytest.raises(ValueError, match="identity"):
+        discard_completed_probe_cache(root, identity=base, device="cpu")
+    # All partitions must be validated before any deletion occurs.
+    assert all((root / p / "features.bin").is_file() for p in ("train", "validation", "test"))

@@ -15,7 +15,20 @@ from execsim.data.paper.manifests import file_sha256, read_json, write_json_atom
 FIELDS = ("features", "targets", "observable", "complete")
 
 
-def discard_completed_probe_cache(root: Path, *, identity: dict[str, Any]) -> None:
+def encoded_probe_identity(base: dict[str, Any], *, partition: str, device: str) -> dict[str, Any]:
+    """Construct the same exact partition identity for publication and retirement."""
+    import torch
+
+    return {
+        **base,
+        "schema_version": "paper-encoded-probe-cache-v1",
+        "partition": partition,
+        "device": device,
+        "torch_version": torch.__version__,
+    }
+
+
+def discard_completed_probe_cache(root: Path, *, identity: dict[str, Any], device: str) -> None:
     """Remove only verified disposable tensors after the caller seals a coordinate."""
     if not root.exists():
         return
@@ -28,10 +41,8 @@ def discard_completed_probe_cache(root: Path, *, identity: dict[str, Any]) -> No
     for partition in directories:
         if partition.is_symlink() or any(p.is_symlink() for p in partition.iterdir()):
             raise ValueError("Probe cache cleanup rejects symbolic links.")
-        recorded = read_json(partition / "manifest.json")["identity"]
-        if any(recorded.get(key) != value for key, value in identity.items()):
-            raise ValueError("Completed probe cache identity mismatch.")
-        EncodedProbeBatches(partition, recorded, [])
+        expected = encoded_probe_identity(identity, partition=partition.name, device=device)
+        EncodedProbeBatches(partition, expected, [])
         files.extend(partition.iterdir())
     for path in files:
         path.unlink()

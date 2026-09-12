@@ -52,20 +52,17 @@ def evaluate_frozen_capacity_streaming(
         parameter.requires_grad_(False)
 
     if cache_root is not None:
-        from execsim.ml.representations.probe_cache import materialize_probe_batches
+        from execsim.ml.representations.probe_cache import (
+            encoded_probe_identity,
+            materialize_probe_batches,
+        )
 
         if not cache_identity:
             raise ValueError("Encoded probe caches require an explicit immutable identity.")
         cached = [
             materialize_probe_batches(
                 cache_root / partition,
-                identity={
-                    **cache_identity,
-                    "schema_version": "paper-encoded-probe-cache-v1",
-                    "partition": partition,
-                    "device": device,
-                    "torch_version": torch.__version__,
-                },
+                identity=encoded_probe_identity(cache_identity, partition=partition, device=device),
                 loader=loader,
                 encode=lambda batch: _encoded_batch(model, batch, device),
             )

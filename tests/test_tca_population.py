@@ -77,6 +77,32 @@ def _run_with_fake_replay(
     )
 
 
+@pytest.mark.parametrize(
+    ("parameter", "frozen_value"),
+    [
+        ("planned_participation", 0.10),
+        ("hard_participation", 0.10),
+        ("risk_aversion", 0.0),
+        ("tracking_penalty", 0.0),
+        ("half_spread_arrival_fraction", 5e-5),
+        ("temporary_impact_arrival_fraction", 1e-3),
+    ],
+)
+def test_tca_rejects_even_one_ulp_change_to_frozen_contract(parameter, frozen_value):
+    def unexpected_provider(*args):
+        pytest.fail("Changed protocol must fail before provider access")
+
+    with pytest.raises(ValueError, match="contradict the locked experiment"):
+        run_historical_tca(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {"ewma": unexpected_provider},
+            required_methods=("ewma",),
+            **{parameter: float(np.nextafter(frozen_value, np.inf))},
+        )
+
+
 def test_early_close_is_not_a_tca_case_and_does_not_lookup_provider(monkeypatch):
     bars = _session(periods=210, session_start="2024-11-29 09:30")
     quality = assess_session_resolution_quality(bars)
@@ -333,6 +359,39 @@ def _publish_multi_session_preflight_ledgers(tmp_path):
         },
     )
     return learned, learned_identity, ewma, ewma_identity, minute_rows
+
+
+def test_tca_preflight_indexed_slices_equal_original_filters(tmp_path, monkeypatch):
+    from execsim.ml.paper import tca_workers
+
+    learned, identity, ewma, ewma_identity, _ = _publish_multi_session_preflight_ledgers(tmp_path)
+    full_scale = pd.read_parquet(learned / "scale.parquet")
+    full_shape = pd.read_parquet(learned / "shape.parquet")
+    validate = tca_workers._validate_learned_case
+    compared = []
+
+    def compare(directory, **kwargs):
+        expected_scale = full_scale.loc[
+            pd.to_datetime(full_scale["session_date"]).dt.date == kwargs["session_date"]
+        ]
+        expected_shape = full_shape.loc[
+            full_shape["case_id"].astype(str).isin(expected_scale["sample_id"].astype(str))
+        ]
+        pd.testing.assert_frame_equal(kwargs["scale_frame"], expected_scale)
+        pd.testing.assert_frame_equal(kwargs["shape_frame"], expected_shape)
+        validate(directory, **kwargs)
+        validate(directory, **{**kwargs, "scale_frame": full_scale, "shape_frame": full_shape})
+        compared.append(kwargs["session_date"])
+
+    monkeypatch.setattr(tca_workers, "_validate_learned_case", compare)
+    preflight_tca_ledgers(
+        ledger_records=(("raw", None, learned, identity),),
+        ewma_records={"A": (ewma, ewma_identity)},
+        eligible_cases={date(2024, 11, 27): ("A",)},
+        training_cutoff=date(2024, 6, 28),
+        tca_config={"window": ["10:30", "15:30"]},
+    )
+    assert compared == [date(2024, 11, 27)]
 
 
 def test_tca_ledger_preflight_scopes_ewma_to_current_multi_session(tmp_path):

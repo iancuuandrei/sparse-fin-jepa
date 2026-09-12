@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from execsim.reporting import aggregate_results, paired_strategy_differences
+from execsim.reporting.statistics import bootstrap_mean_interval
+
+
+@pytest.mark.parametrize("values", [[], [np.nan, np.inf, -np.inf]])
+def test_empty_finite_bootstrap_population_returns_nan_bounds(values):
+    assert all(np.isnan(value) for value in bootstrap_mean_interval(values))
+
+
+def test_nonempty_bootstrap_population_reaches_resampling():
+    assert bootstrap_mean_interval([7.0, 7.0], samples=20) == (7.0, 7.0)
 
 
 def _results() -> pd.DataFrame:

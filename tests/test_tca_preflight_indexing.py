@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
-from datetime import date, time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -51,62 +50,20 @@ def test_benchmark_rejects_non_commit_arguments_before_git(revision, monkeypatch
 _INSTRUMENT_ID = "SYNTH"
 _FOLD_ID = "fold-synthetic"
 _TRAINING_CUTOFF = date(2039, 12, 31)
-_ORIGINS = tuple(range(4, 26))
 _TCA_CONFIG = {"window": ["10:30", "16:00"]}
 
 
-def _synthetic_frames() -> tuple[dict[str, Any], dict[str, pd.DataFrame]]:
-    """Build complete, deterministic two-date forecast ledgers."""
-    learned_scale_rows: list[dict[str, Any]] = []
-    learned_shape_rows: list[dict[str, Any]] = []
-    ewma_scale_rows: list[dict[str, Any]] = []
-    minute_rows: list[dict[str, Any]] = []
+def _publish_case(
+    root: Path, corruption: str | None = None
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
+    from scripts import benchmark_tca_preflight
 
-    for session_date in _SESSION_DATES:
-        opened = pd.Timestamp.combine(session_date, time(9, 30)).tz_localize("America/New_York")
-        for origin in _ORIGINS:
-            sample_id = f"{session_date.isoformat()}-{_INSTRUMENT_ID}-{origin:02d}"
-            learned_scale_rows.append(
-                {
-                    "sample_id": sample_id,
-                    "fold_id": _FOLD_ID,
-                    "instrument_id": _INSTRUMENT_ID,
-                    "symbol": "SYNTH",
-                    "session_date": session_date.isoformat(),
-                    "as_of": origin,
-                    "training_cutoff": _TRAINING_CUTOFF.isoformat(),
-                }
-            )
-            ewma_scale_rows.append(
-                {
-                    "sample_id": sample_id,
-                    "instrument_id": _INSTRUMENT_ID,
-                    "symbol": "SYNTH",
-                    "session_date": session_date.isoformat(),
-                    "as_of": origin,
-                }
-            )
-            buckets = np.arange(origin, 26)
-            learned_shape_rows.extend(
-                {
-                    "case_id": sample_id,
-                    "target_bucket": int(bucket),
-                    "conditional_share": 1.0 / len(buckets),
-                }
-                for bucket in buckets
-            )
-            for offset in range(15):
-                minute_rows.append(
-                    {
-                        "sample_id": sample_id,
-                        "generated_at": opened + pd.Timedelta(minutes=15 * origin + offset),
-                        "end_token": 24,
-                    }
-                )
-
-    learned_scale = pd.DataFrame(learned_scale_rows)
-    learned_shape = (
-        pd.DataFrame(learned_shape_rows).sample(frac=1, random_state=41).reset_index(drop=True)
+    frames = benchmark_tca_preflight.synthetic_ledger_frames(
+        session_dates=_SESSION_DATES,
+        origins=tuple(range(4, 26)),
+        instrument_id=_INSTRUMENT_ID,
+        fold_id=_FOLD_ID,
+        training_cutoff=_TRAINING_CUTOFF,
     )
     learned_identity = {
         "fold_id": _FOLD_ID,
@@ -125,37 +82,6 @@ def _synthetic_frames() -> tuple[dict[str, Any], dict[str, pd.DataFrame]]:
         "instrument_id": _INSTRUMENT_ID,
         "fixture": "synthetic-ewma",
     }
-    ewma_unavailable = pd.DataFrame(
-        {
-            "sample_id": pd.Series(dtype="string"),
-            "generated_at": pd.Series(dtype="datetime64[ns, America/New_York]"),
-            "end_token": pd.Series(dtype="int64"),
-            "status": pd.Series(dtype="string"),
-            "session_date": pd.Series(dtype="string"),
-            "reason": pd.Series(dtype="string"),
-        }
-    )
-    return (
-        {"learned": learned_identity, "ewma": ewma_identity},
-        {
-            "learned_scale": learned_scale,
-            "learned_shape": learned_shape,
-            "learned_metrics": pd.DataFrame({"metric": pd.Series(dtype="string")}),
-            "ewma_scale": pd.DataFrame(ewma_scale_rows),
-            "ewma_shape": pd.DataFrame(
-                {"case_id": pd.Series(dtype="string"), "target_bucket": pd.Series(dtype="int64")}
-            ),
-            "ewma_metrics": pd.DataFrame({"metric": pd.Series(dtype="string")}),
-            "ewma_minutes": pd.DataFrame(minute_rows),
-            "ewma_unavailable": ewma_unavailable,
-        },
-    )
-
-
-def _publish_case(
-    root: Path, corruption: str | None = None
-) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
-    identities, frames = _synthetic_frames()
     learned_scale = frames["learned_scale"]
     learned_shape = frames["learned_shape"]
     target_date = _SESSION_DATES[-1].isoformat()
@@ -197,7 +123,7 @@ def _publish_case(
     learned = root / "learned"
     publish_frames(
         learned,
-        identity=identities["learned"],
+        identity=learned_identity,
         frames={
             "scale.parquet": learned_scale,
             "shape.parquet": learned_shape,
@@ -207,7 +133,7 @@ def _publish_case(
     ewma = root / "ewma"
     publish_frames(
         ewma,
-        identity=identities["ewma"],
+        identity=ewma_identity,
         frames={
             "scale.parquet": frames["ewma_scale"],
             "shape.parquet": frames["ewma_shape"],
@@ -216,49 +142,34 @@ def _publish_case(
             "unavailable.parquet": frames["ewma_unavailable"],
         },
     )
-    return learned, identities["learned"], ewma, identities["ewma"]
+    return learned, learned_identity, ewma, ewma_identity
 
 
 def _legacy_learned_preflight(
     *,
-    ledger_records: tuple[tuple[str, int | None, Path, dict[str, Any]], ...],
-    eligible_cases: dict[date, tuple[str, ...]],
+    directory: Path,
+    identity: dict[str, Any],
+    instrument_id: str,
+    session_dates: tuple[date, ...],
     training_cutoff: date,
     tca_config: dict[str, list[str]],
 ) -> None:
-    """Apply the former whole-instrument-frame filtering before each date check."""
-    if not eligible_cases:
-        return
+    """Validate dates from whole instrument frames, as the pre-index path did."""
+    verify_artifact(directory, identity=identity, names=LEARNED_LEDGER_FILES)
     origins = tca_workers._tca_as_of_origins(tca_config)
-    eligible_by_instrument: dict[str, list[date]] = {}
-    for session_date, instruments in sorted(eligible_cases.items()):
-        for instrument_id in sorted(set(instruments)):
-            eligible_by_instrument.setdefault(str(instrument_id), []).append(session_date)
-
-    for _, _, directory, identity in ledger_records:
-        verify_artifact(directory, identity=identity, names=LEARNED_LEDGER_FILES)
-        for instrument_id, session_dates in eligible_by_instrument.items():
-            scale = pd.read_parquet(
-                directory / "scale.parquet", filters=[("instrument_id", "==", instrument_id)]
-            )
-            if "sample_id" in scale.columns and not scale.empty:
-                sample_ids = scale["sample_id"].astype(str).drop_duplicates().tolist()
-                shape = pd.read_parquet(
-                    directory / "shape.parquet", filters=[("case_id", "in", sample_ids)]
-                )
-            else:
-                shape = pd.DataFrame(columns=["case_id", "target_bucket", "conditional_share"])
-            for session_date in session_dates:
-                tca_workers._validate_learned_case(
-                    directory,
-                    instrument_id=instrument_id,
-                    session_date=session_date,
-                    fold_id=str(identity["fold_id"]),
-                    training_cutoff=training_cutoff,
-                    origins=origins,
-                    scale_frame=scale,
-                    shape_frame=shape,
-                )
+    scale = pd.read_parquet(directory / "scale.parquet")
+    shape = pd.read_parquet(directory / "shape.parquet")
+    for session_date in session_dates:
+        tca_workers._validate_learned_case(
+            directory,
+            instrument_id=instrument_id,
+            session_date=session_date,
+            fold_id=str(identity["fold_id"]),
+            training_cutoff=training_cutoff,
+            origins=origins,
+            scale_frame=scale,
+            shape_frame=shape,
+        )
 
 
 def _outcome(call: Callable[[], None]) -> tuple[type[BaseException], str] | None:
@@ -304,8 +215,10 @@ def test_indexed_tca_preflight_matches_legacy_fail_closed_behavior(
 
     reference = _outcome(
         lambda: _legacy_learned_preflight(
-            ledger_records=records,
-            eligible_cases=eligible_cases,
+            directory=learned,
+            identity=identity,
+            instrument_id=_INSTRUMENT_ID,
+            session_dates=_SESSION_DATES,
             training_cutoff=_TRAINING_CUTOFF,
             tca_config=_TCA_CONFIG,
         )
@@ -322,6 +235,18 @@ def test_indexed_tca_preflight_matches_legacy_fail_closed_behavior(
     assert actual == reference
     assert actual is not None
     assert actual[0] is ValueError
+    expected_error = {
+        "duplicate_scale": "duplicate learned as-of rows",
+        "missing_origin": "incomplete learned as-of grid",
+        "invalid_date": "invalid learned date identities",
+        "cutoff_mismatch": "learned ledger cutoff mismatch",
+        "instrument_mismatch": "learned instrument identity mismatch",
+        "fold_mismatch": "learned ledger fold mismatch",
+        "missing_shape_bucket": "incomplete learned future-bucket grid",
+        "duplicate_shape_bucket": "duplicate learned shape rows",
+        "invalid_shape_share": "incomplete learned future-bucket grid",
+    }[corruption]
+    assert expected_error in actual[1]
 
 
 def test_indexed_tca_preflight_preserves_shape_order_and_stays_pre_worker(

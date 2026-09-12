@@ -36,7 +36,7 @@ def _model_with_logits(logits: list[float] | np.ndarray) -> LightGBMVolumeModel:
     return model
 
 
-def _legacy_shape_prediction(
+def _legacy_grouped_shape_prediction(
     logits: np.ndarray,
     shape: pd.DataFrame,
     *,
@@ -77,7 +77,7 @@ def test_segmented_softmax_preserves_exact_order_mask_and_reduction() -> None:
         shape,
         group_columns=("case_id", "fold_id"),
     )
-    expected = _legacy_shape_prediction(
+    expected = _legacy_grouped_shape_prediction(
         logits,
         shape,
         group_columns=("case_id", "fold_id"),
@@ -111,7 +111,9 @@ def test_segmented_softmax_falls_back_for_interleaved_groups() -> None:
     model = _model_with_logits(logits.tolist())
 
     _, actual = model.predict_frames(scale, shape, group_columns=("case_id",))
-    expected = _legacy_shape_prediction(logits, shape, group_columns=("case_id",), valid=valid)
+    expected = _legacy_grouped_shape_prediction(
+        logits, shape, group_columns=("case_id",), valid=valid
+    )
 
     pd.testing.assert_frame_equal(actual, expected, check_exact=True)
     assert _contiguous_group_boundaries(shape, ("case_id",)) is None
@@ -195,24 +197,51 @@ def _legacy_metric_frame(
     distances = (cumulative["actual_share"] - cumulative["conditional_share"]).abs()
     errors = distances.groupby(joined["case_id"], sort=False).mean()
     scale = base.scale.reset_index(drop=True)
-    return pd.DataFrame(
-        {
-            "fold_id": fold_id,
-            "method": method,
-            "seed": seed,
-            "sample_id": scale["sample_id"],
-            "instrument_id": scale["instrument_id"],
-            "session_date": scale["session_date"],
-            "as_of_token": scale["as_of"].astype(int),
-            "actual_remaining_volume": base.scale_target,
-            "causal_baseline_remaining_volume": scale["baseline_remaining_volume"],
-            "predicted_remaining_volume": totals,
-            "log_remaining_volume_absolute_error": np.abs(
-                np.log1p(totals) - np.log1p(base.scale_target)
-            ),
-            "conditional_curve_wasserstein": scale["sample_id"].map(errors),
-        }
+    result = (
+        scale.rename(
+            columns={
+                "baseline_remaining_volume": "causal_baseline_remaining_volume",
+            }
+        )
+        .loc[
+            :,
+            [
+                "sample_id",
+                "instrument_id",
+                "session_date",
+                "as_of",
+                "causal_baseline_remaining_volume",
+            ],
+        ]
+        .copy()
     )
+    result = result.assign(
+        as_of_token=scale["as_of"].astype(int),
+        fold_id=fold_id,
+        method=method,
+        seed=seed,
+        actual_remaining_volume=base.scale_target,
+        predicted_remaining_volume=totals,
+        log_remaining_volume_absolute_error=np.abs(np.log1p(totals) - np.log1p(base.scale_target)),
+        conditional_curve_wasserstein=result["sample_id"].map(errors),
+    )
+    return result.loc[
+        :,
+        [
+            "fold_id",
+            "method",
+            "seed",
+            "sample_id",
+            "instrument_id",
+            "session_date",
+            "as_of_token",
+            "actual_remaining_volume",
+            "causal_baseline_remaining_volume",
+            "predicted_remaining_volume",
+            "log_remaining_volume_absolute_error",
+            "conditional_curve_wasserstein",
+        ],
+    ]
 
 
 def test_aligned_metric_keys_skip_merge_and_sort_without_changing_results(monkeypatch):
@@ -451,17 +480,12 @@ def _legacy_predict_frames(
         else np.ones(len(shape), dtype=bool)
     )
     logits = np.asarray(model.shape_model.predict(shape), dtype=float)
-    output = metadata.loc[:, [*group_columns, "target_bucket"]].copy()
-    output["conditional_share"] = 0.0
-    grouping: str | list[str] = group_columns[0] if len(group_columns) == 1 else list(group_columns)
-    for _, indexes in output.groupby(grouping, sort=False).groups.items():
-        positions = np.asarray(list(indexes), dtype=int)
-        selected = positions[valid[positions]]
-        if not len(selected):
-            raise ValueError("A shape case has no valid future target buckets.")
-        centered = logits[selected] - np.max(logits[selected])
-        probabilities = np.exp(centered)
-        output.loc[selected, "conditional_share"] = probabilities / probabilities.sum()
+    output = _legacy_grouped_shape_prediction(
+        logits,
+        metadata,
+        group_columns=group_columns,
+        valid=valid,
+    )
     baseline = scale_features["baseline_remaining_volume"].to_numpy(dtype=float)
     residual = np.asarray(model.scale_model.predict(scale), dtype=float)
     totals = np.maximum((1.0 + baseline) * np.exp(residual) - 1.0, 0.0)

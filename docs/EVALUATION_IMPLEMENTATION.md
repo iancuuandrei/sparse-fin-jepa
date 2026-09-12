@@ -545,7 +545,9 @@ DataLoader instances is not adopted because it can change generator state.
 
 For 97,877 synthetic method rows and three complete-case comparisons, narrowing
 columns before copying took 0.181 seconds versus 0.171 seconds for the existing
-matcher. That prototype is not retained. Peak RSS was unavailable in this local
+matcher. That prototype is not retained; the current benchmark measures the
+canonical matcher and verifies repeat-exact rows and drop counts rather than
+maintaining a second copy of the rejected matcher. Peak RSS was unavailable in this local
 benchmark; it is not reported as zero. These bounded observations do not rule
 out larger-corpus bottlenecks or replace the required full-coordinate runtime
 observation. Cross-process checksum verification remains unchanged.

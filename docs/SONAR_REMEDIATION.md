@@ -71,3 +71,11 @@ sync step. The benchmark accepts only a full lowercase commit SHA and places
 it after Git's end-of-options marker. Its default is an immutable baseline,
 not `HEAD`. Tests reject option-like and mutable revision arguments before
 subprocess execution. A new hosted analysis must verify these corrections.
+
+The next analysis confirmed zero new issues and hotspots, but reported 6.8%
+new-code duplication. Synthetic learned/EWMA ledgers now have one shared fixture
+builder. Test references retain independent legacy operations and exact-output
+assertions without duplicating metadata construction. The rejected projected
+matcher prototype was removed rather than maintained as a second statistics
+implementation. These changes do not exclude files from analysis or relax the
+3% gate; the next exact-head hosted analysis must confirm the measured density.

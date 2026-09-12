@@ -92,6 +92,87 @@ def _load_legacy_preflight(
     return namespace["preflight_tca_ledgers"], resolved_revision
 
 
+def synthetic_ledger_frames(
+    *,
+    session_dates: tuple[date, ...],
+    origins: tuple[int, ...],
+    instrument_id: str,
+    fold_id: str,
+    training_cutoff: date,
+) -> dict[str, pd.DataFrame]:
+    """Build complete learned and EWMA fixtures for tests and timing runs."""
+    learned_scale_rows: list[dict[str, Any]] = []
+    learned_shape_rows: list[dict[str, Any]] = []
+    ewma_scale_rows: list[dict[str, Any]] = []
+    minute_rows: list[dict[str, Any]] = []
+
+    for session_date in session_dates:
+        opened = pd.Timestamp.combine(session_date, time(9, 30)).tz_localize("America/New_York")
+        for origin in origins:
+            sample_id = f"{session_date.isoformat()}-{instrument_id}-{origin:02d}"
+            learned_scale_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "fold_id": fold_id,
+                    "instrument_id": instrument_id,
+                    "symbol": instrument_id,
+                    "session_date": session_date.isoformat(),
+                    "as_of": origin,
+                    "training_cutoff": training_cutoff.isoformat(),
+                }
+            )
+            ewma_scale_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "instrument_id": instrument_id,
+                    "symbol": instrument_id,
+                    "session_date": session_date.isoformat(),
+                    "as_of": origin,
+                }
+            )
+            buckets = np.arange(origin, 26)
+            learned_shape_rows.extend(
+                {
+                    "case_id": sample_id,
+                    "target_bucket": int(bucket),
+                    "conditional_share": 1.0 / len(buckets),
+                }
+                for bucket in buckets
+            )
+            minute_rows.extend(
+                {
+                    "sample_id": sample_id,
+                    "generated_at": opened + pd.Timedelta(minutes=15 * origin + offset),
+                    "end_token": 24,
+                }
+                for offset in range(15)
+            )
+
+    return {
+        "learned_scale": pd.DataFrame(learned_scale_rows),
+        "learned_shape": pd.DataFrame(learned_shape_rows)
+        .sample(frac=1, random_state=41)
+        .reset_index(drop=True),
+        "learned_metrics": pd.DataFrame({"metric": pd.Series(dtype="string")}),
+        "ewma_scale": pd.DataFrame(ewma_scale_rows),
+        "ewma_shape": pd.DataFrame(
+            {"case_id": pd.Series(dtype="string"), "target_bucket": pd.Series(dtype="int64")}
+        ),
+        "ewma_metrics": pd.DataFrame({"metric": pd.Series(dtype="string")}),
+        "ewma_minutes": pd.DataFrame(minute_rows),
+        "ewma_unavailable": pd.DataFrame(
+            {
+                "sample_id": pd.Series(dtype="string"),
+                "generated_at": pd.Series(dtype="datetime64[ns, America/New_York]"),
+                "end_token": pd.Series(dtype="int64"),
+                "status": pd.Series(dtype="string"),
+                "session_date": pd.Series(dtype="string"),
+                "reason": pd.Series(dtype="string"),
+            }
+        ),
+    }
+
+
 def _synthetic_ledgers(
     root: Path,
     *,
@@ -111,56 +192,12 @@ def _synthetic_ledgers(
     end_offset = 10 * 60 + 30 + 15 * origins_count
     end_time = time(end_offset // 60, end_offset % 60).strftime("%H:%M")
     tca_config = {"window": ["10:30", end_time]}
-    learned_scale_rows: list[dict[str, Any]] = []
-    learned_shape_rows: list[dict[str, Any]] = []
-    ewma_scale_rows: list[dict[str, Any]] = []
-    minute_rows: list[dict[str, Any]] = []
-
-    for session_date in dates:
-        opened = pd.Timestamp.combine(session_date, time(9, 30)).tz_localize("America/New_York")
-        for origin in origins:
-            sample_id = f"{session_date.isoformat()}-{_INSTRUMENT_ID}-{origin:02d}"
-            learned_scale_rows.append(
-                {
-                    "sample_id": sample_id,
-                    "fold_id": _FOLD_ID,
-                    "instrument_id": _INSTRUMENT_ID,
-                    "symbol": "SYNTH",
-                    "session_date": session_date.isoformat(),
-                    "as_of": origin,
-                    "training_cutoff": _CUTOFF.isoformat(),
-                }
-            )
-            ewma_scale_rows.append(
-                {
-                    "sample_id": sample_id,
-                    "instrument_id": _INSTRUMENT_ID,
-                    "symbol": "SYNTH",
-                    "session_date": session_date.isoformat(),
-                    "as_of": origin,
-                }
-            )
-            buckets = np.arange(origin, 26)
-            learned_shape_rows.extend(
-                {
-                    "case_id": sample_id,
-                    "target_bucket": int(bucket),
-                    "conditional_share": 1.0 / len(buckets),
-                }
-                for bucket in buckets
-            )
-            for offset in range(15):
-                minute_rows.append(
-                    {
-                        "sample_id": sample_id,
-                        "generated_at": opened + pd.Timedelta(minutes=15 * origin + offset),
-                        "end_token": 24,
-                    }
-                )
-
-    learned_scale = pd.DataFrame(learned_scale_rows)
-    learned_shape = (
-        pd.DataFrame(learned_shape_rows).sample(frac=1, random_state=41).reset_index(drop=True)
+    frames = synthetic_ledger_frames(
+        session_dates=dates,
+        origins=origins,
+        instrument_id=_INSTRUMENT_ID,
+        fold_id=_FOLD_ID,
+        training_cutoff=_CUTOFF,
     )
     learned_records: list[tuple[str, int | None, Path, dict[str, Any]]] = []
     for ledger_number in range(learned_ledger_count):
@@ -181,9 +218,9 @@ def _synthetic_ledgers(
             learned_directory,
             identity=identity,
             frames={
-                "scale.parquet": learned_scale,
-                "shape.parquet": learned_shape,
-                "metrics.parquet": pd.DataFrame({"metric": pd.Series(dtype="string")}),
+                "scale.parquet": frames["learned_scale"],
+                "shape.parquet": frames["learned_shape"],
+                "metrics.parquet": frames["learned_metrics"],
             },
         )
         learned_records.append(
@@ -200,22 +237,11 @@ def _synthetic_ledgers(
         ewma_directory,
         identity=ewma_identity,
         frames={
-            "scale.parquet": pd.DataFrame(ewma_scale_rows),
-            "shape.parquet": pd.DataFrame(
-                {"case_id": pd.Series(dtype="string"), "target_bucket": pd.Series(dtype="int64")}
-            ),
-            "metrics.parquet": pd.DataFrame({"metric": pd.Series(dtype="string")}),
-            "minute-forecasts.parquet": pd.DataFrame(minute_rows),
-            "unavailable.parquet": pd.DataFrame(
-                {
-                    "sample_id": pd.Series(dtype="string"),
-                    "generated_at": pd.Series(dtype="datetime64[ns, America/New_York]"),
-                    "end_token": pd.Series(dtype="int64"),
-                    "status": pd.Series(dtype="string"),
-                    "session_date": pd.Series(dtype="string"),
-                    "reason": pd.Series(dtype="string"),
-                }
-            ),
+            "scale.parquet": frames["ewma_scale"],
+            "shape.parquet": frames["ewma_shape"],
+            "metrics.parquet": frames["ewma_metrics"],
+            "minute-forecasts.parquet": frames["ewma_minutes"],
+            "unavailable.parquet": frames["ewma_unavailable"],
         },
     )
 

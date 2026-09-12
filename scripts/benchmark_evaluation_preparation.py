@@ -413,92 +413,72 @@ def _synthetic_report_rows(case_count: int) -> pd.DataFrame:
     return pd.concat(pieces, ignore_index=True)
 
 
-def _projected_complete_case_differences(
-    rows: pd.DataFrame,
-    *,
-    baseline: str,
-    candidate: str,
-    value_column: str,
-    identity_columns: tuple[str, ...],
-    method_column: str = "method",
-) -> Any:
-    """Benchmark candidate: project columns in the selected-row copy only."""
-    from execsim.ml.paper.statistics import CompleteCaseResult
+def _run_single_matching(frame: pd.DataFrame, candidate: str) -> Any:
+    """Run the canonical complete-case matcher on one synthetic contrast."""
+    from execsim.ml.paper.statistics import construct_complete_case_differences
 
-    required = {method_column, value_column, *identity_columns}
-    missing = required.difference(rows.columns)
-    if missing:
-        raise ValueError(f"Complete-case ledger missing columns: {sorted(missing)}")
-    selected_columns = [method_column, *identity_columns, value_column]
-    if "status" in rows and "status" not in selected_columns:
-        selected_columns.append("status")
-    selected = rows.loc[rows[method_column].isin((baseline, candidate)), selected_columns].copy()
-    if selected.duplicated([method_column, *identity_columns]).any():
-        raise ValueError("Complete-case ledger contains duplicated method/case rows.")
-    requested = selected
-    if "status" in selected:
-        if not selected["status"].isin(("AVAILABLE", "EWMA_UNAVAILABLE")).all():
-            raise ValueError("Complete-case ledger has unknown availability status.")
-        unavailable = selected["status"].eq("EWMA_UNAVAILABLE")
-        if (
-            not selected.loc[unavailable, method_column].eq("ewma").all()
-            or selected.loc[unavailable, value_column].notna().any()
-        ):
-            raise ValueError("Unavailable cases must be EWMA rows without a metric.")
-        selected = selected.loc[~unavailable]
-    if not np.isfinite(selected[value_column].to_numpy(dtype=float)).all():
-        raise ValueError("Available complete-case metrics must be finite.")
-    base = selected.loc[selected[method_column] == baseline, [*identity_columns, value_column]]
-    other = selected.loc[selected[method_column] == candidate, [*identity_columns, value_column]]
-    paired = base.merge(
-        other,
-        on=list(identity_columns),
-        how="inner",
-        suffixes=("_baseline", "_candidate"),
-        validate="one_to_one",
-    )
-    paired["difference"] = paired[f"{value_column}_candidate"] - paired[f"{value_column}_baseline"]
-    return CompleteCaseResult(
-        paired_rows=paired,
-        baseline_rows=int(requested[method_column].eq(baseline).sum()),
-        candidate_rows=int(requested[method_column].eq(candidate).sum()),
-        matched_rows=len(paired),
-        dropped_baseline_rows=int(requested[method_column].eq(baseline).sum()) - len(paired),
-        dropped_candidate_rows=int(requested[method_column].eq(candidate).sum()) - len(paired),
+    return construct_complete_case_differences(
+        frame,
+        baseline="lightgbm_raw",
+        candidate=candidate,
+        value_column="normalized_allocation_regret",
+        identity_columns=_IDENTITY_COLUMNS,
     )
 
 
-def _assert_matching_equal(expected: Any, observed: Any) -> None:
-    """Require exact paired rows and all availability/drop counts to agree."""
-    pd.testing.assert_frame_equal(expected.paired_rows, observed.paired_rows, check_exact=True)
-    for name in (
-        "baseline_rows",
-        "candidate_rows",
-        "matched_rows",
-        "dropped_baseline_rows",
-        "dropped_candidate_rows",
-    ):
-        if getattr(expected, name) != getattr(observed, name):
-            raise AssertionError(f"Projected matcher changed {name}.")
+def _assert_synthetic_matching_integrity(
+    result: Any, *, candidate: str, frame: pd.DataFrame, case_count: int
+) -> None:
+    """Check canonical synthetic coverage and paired values."""
+    candidate_mask = frame["method"].eq(candidate)
+    candidate_rows = int(candidate_mask.sum())
+    unavailable_rows = int((candidate_mask & frame["status"].eq("EWMA_UNAVAILABLE")).sum())
+    expected_matched = candidate_rows - unavailable_rows
+    expected_counts = (
+        case_count,
+        candidate_rows,
+        expected_matched,
+        case_count - expected_matched,
+        candidate_rows - expected_matched,
+    )
+    actual_counts = (
+        result.baseline_rows,
+        result.candidate_rows,
+        result.matched_rows,
+        result.dropped_baseline_rows,
+        result.dropped_candidate_rows,
+    )
+    if actual_counts != expected_counts or len(result.paired_rows) != expected_matched:
+        raise AssertionError(f"Canonical matcher changed synthetic coverage for {candidate}.")
+    if result.paired_rows.duplicated(list(_IDENTITY_COLUMNS)).any():
+        raise AssertionError("Canonical matcher emitted duplicate complete-case identities.")
+    expected_differences = (
+        result.paired_rows["normalized_allocation_regret_candidate"].to_numpy()
+        - result.paired_rows["normalized_allocation_regret_baseline"].to_numpy()
+    )
+    np.testing.assert_array_equal(result.paired_rows["difference"].to_numpy(), expected_differences)
+
+
+def _assert_duplicate_rejected(frame: pd.DataFrame) -> None:
+    """Ensure duplicate method/case rows still fail closed in the production matcher."""
+    selected = frame.loc[frame["method"].isin(("lightgbm_raw", "candidate_dense"))]
+    first_baseline = selected.loc[selected["method"] == "lightgbm_raw"].iloc[[0]]
+    duplicated = pd.concat((selected, first_baseline), ignore_index=True)
+    try:
+        _run_single_matching(duplicated, "candidate_dense")
+    except ValueError as exc:
+        if "duplicated method/case" not in str(exc):
+            raise AssertionError("Duplicate case failed for an unexpected reason.") from exc
+    else:
+        raise AssertionError("Canonical matcher accepted a duplicated synthetic case.")
 
 
 def _run_matching_comparisons(
-    frame: pd.DataFrame, candidates: tuple[str, ...], projected: bool
+    frame: pd.DataFrame, candidates: tuple[str, ...]
 ) -> tuple[tuple[str, int, int, int], ...]:
-    from execsim.ml.paper.statistics import construct_complete_case_differences
-
-    matcher = (
-        _projected_complete_case_differences if projected else construct_complete_case_differences
-    )
     results: list[tuple[str, int, int, int]] = []
     for candidate in candidates:
-        matched = matcher(
-            frame,
-            baseline="lightgbm_raw",
-            candidate=candidate,
-            value_column="normalized_allocation_regret",
-            identity_columns=_IDENTITY_COLUMNS,
-        )
+        matched = _run_single_matching(frame, candidate)
         results.append(
             (
                 candidate,
@@ -513,45 +493,44 @@ def _run_matching_comparisons(
 def _run_report_benchmark(case_count: int, repeats: int) -> dict[str, Any]:
     frame = _synthetic_report_rows(case_count)
     candidates = ("candidate_dense", "candidate_sparse", "ewma")
-    from execsim.ml.paper.statistics import construct_complete_case_differences
-
     for candidate in candidates:
-        current = construct_complete_case_differences(
-            frame,
-            baseline="lightgbm_raw",
-            candidate=candidate,
-            value_column="normalized_allocation_regret",
-            identity_columns=_IDENTITY_COLUMNS,
+        first = _run_single_matching(frame, candidate)
+        second = _run_single_matching(frame, candidate)
+        pd.testing.assert_frame_equal(first.paired_rows, second.paired_rows, check_exact=True)
+        _assert_synthetic_matching_integrity(
+            first, candidate=candidate, frame=frame, case_count=case_count
         )
-        projected = _projected_complete_case_differences(
-            frame,
-            baseline="lightgbm_raw",
-            candidate=candidate,
-            value_column="normalized_allocation_regret",
-            identity_columns=_IDENTITY_COLUMNS,
-        )
-        _assert_matching_equal(current, projected)
+        for name in (
+            "baseline_rows",
+            "candidate_rows",
+            "matched_rows",
+            "dropped_baseline_rows",
+            "dropped_candidate_rows",
+        ):
+            if getattr(first, name) != getattr(second, name):
+                raise AssertionError(f"Repeated canonical matching changed {name}.")
 
-    current_summary = _run_matching_comparisons(frame, candidates, projected=False)
-    projected_summary = _run_matching_comparisons(frame, candidates, projected=True)
-    if current_summary != projected_summary:
-        raise AssertionError("Projected report matching changed exact intersection counts.")
-
-    current_timing = _timed_repeats(
-        lambda: _run_matching_comparisons(frame, candidates, projected=False), repeats
-    )
-    projected_timing = _timed_repeats(
-        lambda: _run_matching_comparisons(frame, candidates, projected=True), repeats
-    )
+    _assert_duplicate_rejected(frame)
+    canonical_summary = _run_matching_comparisons(frame, candidates)
+    repeated_summary = _run_matching_comparisons(frame, candidates)
+    if canonical_summary != repeated_summary:
+        raise AssertionError("Repeated canonical report matching changed coverage counts.")
+    canonical_timing = _timed_repeats(lambda: _run_matching_comparisons(frame, candidates), repeats)
     return {
         "status": "PASS",
         "synthetic_case_count": case_count,
         "synthetic_method_rows": len(frame),
         "ledger_columns": len(frame.columns),
         "comparisons_per_pass": len(candidates),
-        "current_full_row_copy_timing": current_timing,
-        "projected_selected_row_copy_timing": projected_timing,
-        "exact_paired_rows_and_drop_counts": True,
+        "canonical_complete_case_timing": canonical_timing,
+        "exact_repeat_rows_differences_and_drop_counts": True,
+        "duplicate_case_rejection": True,
+        "projection_prototype": {
+            "status": "REJECTED",
+            "reason": (
+                "Measured slower than canonical matching; duplicated matcher code was removed."
+            ),
+        },
         "matched_counts": [
             {
                 "candidate": candidate,
@@ -559,7 +538,7 @@ def _run_report_benchmark(case_count: int, repeats: int) -> dict[str, Any]:
                 "dropped_baseline": dropped_baseline,
                 "dropped_candidate": dropped_candidate,
             }
-            for candidate, matched, dropped_baseline, dropped_candidate in current_summary
+            for candidate, matched, dropped_baseline, dropped_candidate in canonical_summary
         ],
         "bootstrap_timed": False,
     }

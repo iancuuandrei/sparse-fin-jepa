@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, time
 from statistics import median
 from time import perf_counter
@@ -54,20 +55,15 @@ def _reference_truncate(
     volumes = np.asarray([cached_by_time[timestamp] for timestamp in requested], dtype=float)
     remaining_sum = float(volumes.sum())
     shares = volumes / remaining_sum if remaining_sum > 0 else np.zeros_like(volumes)
-    return VolumeForecast(
-        symbol=cached.symbol,
-        session_date=cached.session_date,
+    # Preserve metadata independently of production's field-by-field constructor.
+    return replace(
+        cached,
         generated_at=generated_at,
         first_forecast_bucket=requested[0],
         bucket_timestamps=requested,
         expected_volumes=tuple(map(float, volumes)),
         normalized_shares=tuple(map(float, shares)),
         expected_remaining_volume=remaining_sum,
-        forecaster_id=cached.forecaster_id,
-        feature_schema_version=cached.feature_schema_version,
-        training_data_cutoff=cached.training_data_cutoff,
-        data_manifest_hash=cached.data_manifest_hash,
-        warnings=cached.warnings,
     )
 
 

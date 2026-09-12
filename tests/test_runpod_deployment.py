@@ -59,6 +59,29 @@ def test_transfer_verification_rejects_corruption_duplicates_and_escape(tmp_path
             runpod.safe_path(tmp_path, name)
 
 
+@pytest.mark.parametrize(
+    "name", ["", ".", "./data.bin", "dir//data.bin", "dir/./data.bin", "dir/", "data\0.bin"]
+)
+def test_transfer_members_require_canonical_file_names(tmp_path, name):
+    with pytest.raises(ValueError, match="Unsafe transfer member"):
+        runpod.safe_path(tmp_path, name)
+
+
+@pytest.mark.parametrize("linked_member", ["alias", "alias/data.bin"])
+def test_transfer_rejects_symbolic_links_in_every_member_component(
+    tmp_path, monkeypatch, linked_member
+):
+    linked_path = tmp_path / linked_member
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == linked_path)
+    with pytest.raises(ValueError, match="symbolic links"):
+        runpod.safe_path(tmp_path, "alias/data.bin")
+
+
+def test_transfer_preserves_relocated_root_and_canonical_member(tmp_path):
+    root = tmp_path / "outside checkout" / "inputs"
+    assert runpod.safe_path(root, "fold-1/data.bin") == root / "fold-1/data.bin"
+
+
 def test_launch_barrier_requires_three_distinct_pods_same_source(tmp_path: Path, monkeypatch):
     identity = {"source_commit": "a" * 40, "source_tree": "b" * 40}
     monkeypatch.setattr(runpod, "source_identity", lambda _: identity)

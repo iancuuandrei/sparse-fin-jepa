@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from dataclasses import replace
 from datetime import date, time
 from pathlib import Path
@@ -24,7 +25,7 @@ from execsim.ml.models.lightgbm_adapter import (
 )
 from execsim.ml.models.random_projection import projection_hash, random_projection_matrix
 from execsim.ml.paper.benchmark import estimate_manifest_resources, predictor_capacity_smoke
-from execsim.ml.paper.configs import load_paper_config, load_runtime_approval
+from execsim.ml.paper.configs import _validate_sections, load_paper_config, load_runtime_approval
 from execsim.ml.paper.features import (
     append_embedding,
     append_untrained_neural_control_frames,
@@ -764,6 +765,80 @@ def test_protocol_freeze_is_complete_and_checksum_bound() -> None:
     assert freeze["parameter_selection_receipt"] == "NOT RUN"
     assert sidecar == [file_sha256(freeze_path), freeze_path.name]
     assert safe_sidecar == [file_sha256(safe_path), safe_path.name]
+
+
+@pytest.mark.parametrize(
+    ("section_path", "frozen_value", "error"),
+    [
+        (("representation", "warmup_fraction"), 0.05, "locked comparison"),
+        (("representation", "sparse_target", "p"), 2.0, "rectified Gaussian"),
+        (
+            ("representation", "sparse_target", "mu"),
+            -0.6744897501960817,
+            "rectified Gaussian",
+        ),
+        (("representation", "sparse_target", "sigma"), 1.0, "rectified Gaussian"),
+        (("lightgbm", "learning_rate"), 0.03, "locked grid"),
+        (("evaluation", "confidence"), 0.95, "locked inference"),
+        (("tca", "quantity_fraction_adv20"), 0.03, "locked experiment"),
+        (("tca", "planned_participation_rate"), 0.10, "locked experiment"),
+        (("tca", "hard_participation_rate"), 0.10, "locked experiment"),
+        (("tca", "risk_aversion"), 0.0, "locked experiment"),
+        (("tca", "tracking_penalty"), 0.0, "locked experiment"),
+    ],
+)
+@pytest.mark.parametrize("protocol", ["sparse_jepa", "sparse_jepa_v2"])
+@pytest.mark.parametrize("direction", [-np.inf, np.inf])
+def test_frozen_scalar_float_values_reject_one_ulp_mutations(
+    section_path: tuple[str, ...], frozen_value: float, error: str, protocol: str, direction: float
+) -> None:
+    loaded = load_paper_config(Path("configs/paper") / protocol)
+    sections = deepcopy(loaded.sections)
+    parent = sections
+    for key in section_path[:-1]:
+        parent = parent[key]
+    parent[section_path[-1]] = float(np.nextafter(frozen_value, direction))
+
+    with pytest.raises(ValueError, match=error):
+        _validate_sections(sections)
+
+
+@pytest.mark.parametrize(
+    ("section_path", "missing_field", "error"),
+    [
+        (("representation",), "warmup_fraction", "locked comparison"),
+        (("representation", "sparse_target"), "mu", "rectified Gaussian"),
+        (("lightgbm",), "learning_rate", "locked grid"),
+        (("evaluation",), "confidence", "locked inference"),
+        (("tca",), "risk_aversion", "locked experiment"),
+    ],
+)
+def test_frozen_expected_fields_are_required(
+    section_path: tuple[str, ...], missing_field: str, error: str
+) -> None:
+    loaded = load_paper_config(Path("configs/paper/sparse_jepa"))
+    sections = deepcopy(loaded.sections)
+    parent = sections
+    for key in section_path:
+        parent = parent[key]
+    del parent[missing_field]
+
+    with pytest.raises(ValueError, match=error):
+        _validate_sections(sections)
+
+
+@pytest.mark.parametrize("protocol", ["sparse_jepa", "sparse_jepa_v2"])
+def test_paper_config_validation_ignores_unrelated_keys(protocol: str) -> None:
+    loaded = load_paper_config(Path("configs/paper") / protocol)
+    sections = deepcopy(loaded.sections)
+    for section in sections.values():
+        section["unrelated_test_metadata"] = "allowed"
+    sections["representation"]["sparse_target"]["unrelated_test_metadata"] = "allowed"
+    sections["representation"]["future_difficulty_adaptation"]["unrelated_test_metadata"] = (
+        "allowed"
+    )
+
+    _validate_sections(sections)
 
 
 def test_locked_test_parameter_freeze_requires_the_exact_model_matrix(

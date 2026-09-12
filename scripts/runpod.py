@@ -39,13 +39,22 @@ def source_identity(repo: Path) -> dict:
 
 
 def safe_path(root: Path, name: str) -> Path:
+    """Resolve one canonical member below an operator-selected transfer root."""
     pure = PurePosixPath(name)
-    if pure.is_absolute() or ".." in pure.parts or "\\" in name or ":" in name:
+    if (
+        not pure.parts
+        or name != pure.as_posix()
+        or pure.is_absolute()
+        or ".." in pure.parts
+        or any(character in name for character in ("\\", ":", "\0"))
+    ):
         raise ValueError(f"Unsafe transfer member: {name}")
-    path = root.joinpath(*pure.parts)
+    path = root
+    for part in pure.parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError("Transfer members cannot contain symbolic links.")
     path.resolve().relative_to(root.resolve())
-    if path.is_symlink():
-        raise ValueError("Transfer members cannot be symbolic links.")
     return path
 
 

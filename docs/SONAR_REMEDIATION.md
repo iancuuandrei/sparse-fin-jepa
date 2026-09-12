@@ -1,5 +1,22 @@
 # Sonar finding review
 
+## Consolidated-main follow-up
+
+The public API at consolidated main `8f50c86` reports 32 remaining findings:
+19 `S1244`, two `S2583`, one `S8705`, and ten `S8707`. Reading findings does not
+require authentication; the attempted issue transition returned HTTP 401.
+
+The follow-up code change makes frozen section comparisons explicit expected-field
+mappings with exact equality and one-ULP rejection tests. A transfer-boundary audit
+also identified noncanonical member aliases and intermediate symbolic links that
+the former final-component check did not reject. ADR 0033 records the repair and
+its local-filesystem assumptions. Neither change suppresses rules or changes
+scientific configuration. Operator-selected paths, fixed shell-free child argv,
+discrete target parameters, and binary diagnostic checks retain their documented
+semantics. Their remaining analyzer dispositions still require exact-head hosted
+analysis and, for false positives, authenticated review. This is not a claim that
+all 32 findings have been resolved.
+
 This review covers the 53 unresolved project findings returned by SonarCloud on
 2026-09-12 while the corrective branch starts from `3eb221b`. It is not a claim
 that a new hosted analysis has resolved them. Exact-head CI and Sonar analysis

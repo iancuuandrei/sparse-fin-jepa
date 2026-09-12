@@ -445,6 +445,11 @@ def _validate_archived_v1_receipts(freeze_path: Path) -> None:
         raise ValueError("Archived v1 terminal evidence is invalid.")
 
 
+def _mismatched_fields(section: dict[str, Any], expected: dict[str, Any]) -> list[str]:
+    """Return frozen fields that differ exactly, while ignoring unrecognized keys."""
+    return [name for name, value in expected.items() if section.get(name) != value]
+
+
 def _validate_sections(sections: dict[str, dict[str, Any]]) -> None:
     data = sections["data"]
     sequence = sections["sequences"]
@@ -462,7 +467,7 @@ def _validate_sections(sections: dict[str, dict[str, Any]]) -> None:
         "extended_hours": False,
         "universe_size": 100,
     }
-    contradictions = [name for name, value in expected.items() if data.get(name) != value]
+    contradictions = _mismatched_fields(data, expected)
     if contradictions:
         raise ValueError(f"Paper data configuration contradicts locked design: {contradictions}")
     if (
@@ -492,67 +497,75 @@ def _validate_sections(sections: dict[str, dict[str, Any]]) -> None:
         raise ValueError("Evaluation folds do not match locked PAPER_FOLDS.")
     if lightgbm.get("main_rows") != ["ewma", "raw", "untrained_neural", "dense", "sparse"]:
         raise ValueError("LightGBM main rows contradict the locked comparison.")
-    if (
-        representation.get("geometries") != ["dense", "sparse"]
-        or representation.get("predictor_family") != "mlp"
-        or representation.get("observed_feature_dim") != 18
-        or representation.get("feature_dim") != 13
-        or representation.get("conditioning_dim") != 5
-        or representation.get("seeds") != [13, 29, 47]
-        or representation.get("max_epochs") != 40
-        or representation.get("early_stopping_patience") != 6
-        or representation.get("warmup_fraction") != 0.05
-        or representation.get("rdm_lambda_candidates") != [0.1, 1.0, 10.0]
-        or representation.get("probe_capacity_ladder") != ["affine_ridge", "mlp_64", "mlp_256"]
-        or representation.get("probe_ridge_alphas") != [0.1, 1.0, 10.0]
-        or representation.get("probe_mlp_epochs") != 20
-        or representation.get("checkpoint_interval_steps") != 500
-        or representation.get("rdm_diagnostic_sample_rows") != 2048
-        or representation.get("safe_resource_bounds")
-        != {
+    expected_representation = {
+        "geometries": ["dense", "sparse"],
+        "predictor_family": "mlp",
+        "observed_feature_dim": 18,
+        "feature_dim": 13,
+        "conditioning_dim": 5,
+        "seeds": [13, 29, 47],
+        "max_epochs": 40,
+        "early_stopping_patience": 6,
+        "warmup_fraction": 0.05,
+        "rdm_lambda_candidates": [0.1, 1.0, 10.0],
+        "probe_capacity_ladder": ["affine_ridge", "mlp_64", "mlp_256"],
+        "probe_ridge_alphas": [0.1, 1.0, 10.0],
+        "probe_mlp_epochs": 20,
+        "checkpoint_interval_steps": 500,
+        "rdm_diagnostic_sample_rows": 2048,
+        "safe_resource_bounds": {
             "maximum_representation_runs": 29,
             "maximum_jepa_steps": 10_000_000,
             "maximum_shape_rows": 25_000_000,
             "maximum_embedding_bytes": 200_000_000_000,
-        }
+        },
+    }
+    if (
+        _mismatched_fields(representation, expected_representation)
         or representation.get("future_difficulty_adaptation", {}).get("paper_matrix") is not False
     ):
         raise ValueError("Representation configuration contradicts the locked comparison.")
     sparse_target = representation.get("sparse_target", {})
-    if (
-        sparse_target.get("p") != 2.0
-        or sparse_target.get("mu") != -0.6744897501960817
-        or sparse_target.get("sigma") != 1.0
-    ):
+    expected_sparse_target = {
+        "p": 2.0,
+        "mu": -0.6744897501960817,
+        "sigma": 1.0,
+    }
+    if _mismatched_fields(sparse_target, expected_sparse_target):
         raise ValueError("Primary sparse target must be the locked rectified Gaussian.")
-    if (
-        lightgbm.get("num_leaves") != [15, 31]
-        or lightgbm.get("min_child_samples") != [50, 200]
-        or lightgbm.get("reg_lambda") != [1.0, 10.0]
-        or lightgbm.get("learning_rate") != 0.03
-        or lightgbm.get("n_estimators") != 2000
-        or lightgbm.get("early_stopping_rounds") != 100
-    ):
+    expected_lightgbm = {
+        "num_leaves": [15, 31],
+        "min_child_samples": [50, 200],
+        "reg_lambda": [1.0, 10.0],
+        "learning_rate": 0.03,
+        "n_estimators": 2000,
+        "early_stopping_rounds": 100,
+    }
+    if _mismatched_fields(lightgbm, expected_lightgbm):
         raise ValueError("LightGBM configuration contradicts the locked grid.")
+    expected_evaluation = {
+        "bootstrap_block_dates": 5,
+        "bootstrap_block_sensitivity_dates": [1, 10],
+        "bootstrap_repetitions": 10_000,
+        "confidence": 0.95,
+        "multiple_testing": "holm",
+    }
     if (
-        evaluation.get("bootstrap_block_dates") != 5
-        or evaluation.get("bootstrap_block_sensitivity_dates") != [1, 10]
-        or evaluation.get("bootstrap_repetitions") != 10_000
-        or evaluation.get("confidence") != 0.95
-        or evaluation.get("multiple_testing") != "holm"
+        _mismatched_fields(evaluation, expected_evaluation)
         or len(evaluation.get("confirmatory_contrast_definitions", ())) != 5
     ):
         raise ValueError("Evaluation configuration contradicts locked inference.")
     if tca.get("forecast_update_minutes") != 15 or tca.get("fill_minutes") != 1:
         raise ValueError("TCA update/fill clocks contradict the locked design.")
-    if (
-        tca.get("window") != ["10:30", "15:30"]
-        or tca.get("quantity_fraction_adv20") != 0.03
-        or tca.get("planned_participation_rate") != 0.10
-        or tca.get("hard_participation_rate") != 0.10
-        or tca.get("risk_aversion") != 0.0
-        or tca.get("tracking_penalty") != 0.0
-    ):
+    expected_tca = {
+        "window": ["10:30", "15:30"],
+        "quantity_fraction_adv20": 0.03,
+        "planned_participation_rate": 0.10,
+        "hard_participation_rate": 0.10,
+        "risk_aversion": 0.0,
+        "tracking_penalty": 0.0,
+    }
+    if _mismatched_fields(tca, expected_tca):
         raise ValueError("TCA configuration contradicts the locked experiment.")
     if data.get("allow_full_paper_run") and not data.get("allow_historical_training"):
         raise ValueError("Full paper evaluation requires historical-training authorization.")
@@ -562,34 +575,40 @@ def _validate_sections(sections: dict[str, dict[str, Any]]) -> None:
 
 def _validate_v2_quality_sections(data: dict[str, Any], sequence: dict[str, Any]) -> None:
     """Reject any silent relaxation of the v2 daily/token/minute hierarchy."""
-    if (
-        data.get("formation_frequency") != "1Day"
-        or data.get("target_frequency") != "1min"
-        or not math.isclose(
-            float(data.get("formation_daily_completeness_minimum", float("nan"))),
-            0.95,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or data.get("quality_hierarchy")
-        != ["daily_formation", "token_15min_representation", "exact_minute_tca_window"]
-        or data.get("missing_minute_policy") != "never_zero_fill_or_interpolate"
-        or data.get("tca_required_minutes")
-        != {"start_inclusive": "10:30", "end_exclusive": "15:30", "count": 300}
+    expected_data = {
+        "formation_frequency": "1Day",
+        "target_frequency": "1min",
+        "quality_hierarchy": [
+            "daily_formation",
+            "token_15min_representation",
+            "exact_minute_tca_window",
+        ],
+        "missing_minute_policy": "never_zero_fill_or_interpolate",
+        "tca_required_minutes": {
+            "start_inclusive": "10:30",
+            "end_exclusive": "15:30",
+            "count": 300,
+        },
+    }
+    if _mismatched_fields(data, expected_data) or not math.isclose(
+        float(data.get("formation_daily_completeness_minimum", float("nan"))),
+        0.95,
+        rel_tol=0.0,
+        abs_tol=1e-12,
     ):
         raise ValueError("V2 data configuration contradicts the resolution-quality protocol.")
-    if (
-        sequence.get("quality_protocol") != "resolution-aware-v2"
-        or sequence.get("minimum_observed_bars_per_token") != 2
-        or sequence.get("token_aggregation") != "observed_provider_bars_only"
-        or sequence.get("realized_volatility") != "observed_close_log_return_sum_of_squares"
-        or sequence.get("missing_minute_policy") != "never_zero_fill_or_interpolate"
-        or sequence.get("primary_session_rule") != "all_26_tokens_valid_and_standard_xnys_session"
-        or sequence.get("token_completeness_bands")
-        != {
+    expected_sequence = {
+        "quality_protocol": "resolution-aware-v2",
+        "minimum_observed_bars_per_token": 2,
+        "token_aggregation": "observed_provider_bars_only",
+        "realized_volatility": "observed_close_log_return_sum_of_squares",
+        "missing_minute_policy": "never_zero_fill_or_interpolate",
+        "primary_session_rule": "all_26_tokens_valid_and_standard_xnys_session",
+        "token_completeness_bands": {
             "high_minimum": 0.95,
             "medium_minimum": 0.80,
             "low_maximum_exclusive": 0.80,
-        }
-    ):
+        },
+    }
+    if _mismatched_fields(sequence, expected_sequence):
         raise ValueError("V2 sequence configuration contradicts the token-quality protocol.")

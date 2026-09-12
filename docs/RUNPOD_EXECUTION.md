@@ -23,6 +23,12 @@ SCP/SFTP or rsync over SSH. Transfer only the matching fold. Interrupted rsync t
 resume; the launch command always verifies all bytes again. Do not edit upstream JSON to
 change paths: relative sequence paths are resolved below the imported root.
 
+Transfer members must use nonempty canonical relative POSIX paths, without dot
+components, repeated separators, trailing separators, NUL characters, or symbolic
+links in any member component. Verification rejects aliases instead of silently
+normalizing them. Operator-selected roots may remain outside the repository.
+Keep the local staging directory unchanged while verification or copying runs.
+
 Copy `.runtime/source.bundle` to `/workspace/source.bundle` on each pod; it contains the
 committed source and avoids depending on an unpublished GitHub revision.
 Copy the already-authorized runtime approval JSON to

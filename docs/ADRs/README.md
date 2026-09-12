@@ -61,6 +61,10 @@ ADR [0028](0028-chained-resealed-evaluation-provenance.md) is accepted: bind a
 new reseal to both the immutable root TEST authorization and the immediate prior
 resealed execution with a typed supersession receipt.
 
+ADR [0029](0029-reuse-immutable-evaluation-inputs.md) is accepted: reuse frozen
+encoded probe batches, session-batched forecast features, and verified TCA date
+slices without changing scientific ordering or mutable simulation state.
+
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 
 Do not rewrite an accepted decision to hide its history. Add a new ADR that supersedes it, then update the old record's status and link to the replacement. Update `docs/standards/implementation.md` in the same change when the decision changes the active direction.

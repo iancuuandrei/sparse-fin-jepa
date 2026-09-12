@@ -294,3 +294,15 @@ is part of the history artifact identity. New reseals preserve v2 evidence but
 use a typed supersession receipt and v3 execution identity to distinguish the
 root TEST authorization from the immediate prior evaluator. See ADRs 0027 and
 0028.
+
+### 2026-09-12 — bounded reuse of immutable evaluation inputs (ADR 0029)
+
+Frozen probe tensors may be encoded once and replayed with their original batch
+boundaries, dtypes, masks, and RNG transitions. Temporary caches are checksummed,
+source-bound, atomically published, and retired after coordinate publication.
+Use cgroup-aware native thread limits for representation evaluation. Batch raw
+forecast feature construction by consecutive session and reuse verified index
+and learned date slices without sharing mutable forecast-provider state.
+Retain an optimization only after equivalence and real-input performance checks.
+See ADR 0029 and the evaluation implementation contract. Scientific configuration,
+trained artifacts, estimands, and cross-source result isolation remain unchanged.

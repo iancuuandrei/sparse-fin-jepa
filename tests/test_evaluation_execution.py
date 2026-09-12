@@ -350,7 +350,10 @@ def test_reseal_rejects_foreign_jepa_source_commit_before_publishing(frozen_run)
     assert not (frozen_run.runtime_evaluation_root / "execution.json").exists()
 
 
-def test_chained_reseal_binds_original_authorization_and_immediate_prior(frozen_run):
+@pytest.mark.parametrize("mutated_ancestor", ["execution", "supersession"])
+def test_chained_reseal_binds_original_authorization_and_immediate_prior(
+    frozen_run, mutated_ancestor
+):
     config = frozen_run
     first = seal_evaluation_execution(
         config,
@@ -382,6 +385,37 @@ def test_chained_reseal_binds_original_authorization_and_immediate_prior(frozen_
         verify_evaluation_execution(config, source_commit="evaluator-c", source_tree="tree-c")
         == second
     )
+    second_root = config.runtime_evaluation_root
+    (second_root / "partial-forecast.parquet").write_bytes(b"preserved old output")
+    next_supersession = config.artifact_root / "superseded-c.json"
+    write_evaluation_supersession_receipt(
+        config,
+        superseded_execution=second_root,
+        output=next_supersession,
+        replacement_source_commit="evaluator-d",
+        replacement_source_tree="tree-d",
+        reason="operator performance abort; immutable predecessors retained",
+    )
+    config.runtime_evaluation_root = config.artifact_root / "evaluation-executions/third"
+    third = seal_evaluation_execution(
+        config, source_commit="evaluator-d", source_tree="tree-d", supersession=next_supersession
+    )
+    assert third["root_evaluation_source"] == second["root_evaluation_source"]
+    assert third["previous_evaluation_source"] == second["evaluation_source"]
+    assert not (config.runtime_evaluation_root / "partial-forecast.parquet").exists()
+    assert (second_root / "partial-forecast.parquet").read_bytes() == b"preserved old output"
+    assert (
+        verify_evaluation_execution(config, source_commit="evaluator-d", source_tree="tree-d")
+        == third
+    )
+    # The third generation must continue checking the first resealed ancestor.
+    ancestor_path = (
+        first_root / "execution.json" if mutated_ancestor == "execution" else supersession_path
+    )
+    with ancestor_path.open("a") as handle:
+        handle.write(" ")
+    with pytest.raises(ValueError, match="checksum"):
+        verify_evaluation_execution(config, source_commit="evaluator-d", source_tree="tree-d")
 
 
 def test_chained_reseal_rejects_mutated_prior_execution(frozen_run):

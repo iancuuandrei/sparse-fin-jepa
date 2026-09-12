@@ -419,11 +419,13 @@ def test_document_amendment_cannot_hide_changed_scientific_or_unrecorded_text(tm
         load_paper_config(copied)
 
 
-def test_forecast_ledger_matches_direct_provider_at_boundaries_and_partial_tokens(tmp_path):
+def test_forecast_ledger_matches_direct_provider_at_boundaries_and_partial_tokens(
+    tmp_path, monkeypatch
+):
     from datetime import date
 
-    from execsim.ml.paper.evaluation_artifacts import publish_frames
-    from execsim.ml.paper.forecast_ledger import PaperForecastLedgerProvider
+    from execsim.ml.paper.evaluation_artifacts import VerifiedArtifact, publish_frames
+    from execsim.ml.paper.forecast_ledger import ForecastLedgerDate, PaperForecastLedgerProvider
     from execsim.ml.paper.forecast_provider import PaperLightGBMForecastProvider
 
     day, cutoff = date(2024, 4, 2), date(2023, 12, 29)
@@ -476,6 +478,22 @@ def test_forecast_ledger_matches_direct_provider_at_boundaries_and_partial_token
         sequence_hash="sequence",
     )
     ledger = PaperForecastLedgerProvider(directory, **options)
+    verified = VerifiedArtifact(
+        directory, identity=identity, names=("scale.parquet", "shape.parquet", "metrics.parquet")
+    )
+    sliced = ForecastLedgerDate.read(verified, day, ("A",))
+    with monkeypatch.context() as guarded:
+
+        def no_read(*args, **kwargs):
+            raise AssertionError("A cached session provider must not reopen Parquet.")
+
+        guarded.setattr(pd, "read_parquet", no_read)
+        cached = [
+            PaperForecastLedgerProvider(
+                directory, **options, verified_artifact=verified, date_slice=sliced
+            )
+            for _ in range(3)
+        ]
 
     class Model:
         def predict_frames(self, active_scale, active_shape, **kwargs):
@@ -504,6 +522,8 @@ def test_forecast_ledger_matches_direct_provider_at_boundaries_and_partial_token
             bucket_timestamps=pd.date_range(stamp, start + pd.Timedelta(minutes=29), freq="min"),
         )
         assert ledger.forecast(**request) == direct.forecast(**request)
+        for provider in cached:
+            assert provider.forecast(**request) == ledger.forecast(**request)
     for field, wrong in (
         ("fold_id", "fold-2"),
         ("seed", 29),

@@ -103,6 +103,7 @@ def _validate_prior_execution(
     execution_path: Path,
     *,
     expected_sha256: str | None = None,
+    verified_paths: set[Path] | None = None,
 ) -> dict[str, Any]:
     """Validate an immediately prior execution receipt without copying its outputs."""
     if not execution_path.is_file() or execution_path.name != "execution.json":
@@ -110,6 +111,8 @@ def _validate_prior_execution(
     actual_sha = file_sha256(execution_path)
     if expected_sha256 is not None and actual_sha != expected_sha256:
         raise ValueError("Superseded evaluation receipt checksum mismatch.")
+    if verified_paths is not None:
+        verified_paths.add(execution_path)
     prior = read_json(execution_path)
     if prior.get("status") != "EVALUATION_RESEALED" or prior.get("schema_version") not in {
         SCHEMA,
@@ -149,6 +152,8 @@ def _validate_prior_execution(
         upstream_path = _safe_child(config.artifact_root, relative)
         if not upstream_path.is_file() or file_sha256(upstream_path) != digest:
             raise ValueError("Superseded execution immutable inventory checksum mismatch.")
+        if verified_paths is not None:
+            verified_paths.add(upstream_path)
     if prior.get("schema_version") == CHAINED_SCHEMA:
         prior_supersession = prior.get("supersession_path")
         if not isinstance(prior_supersession, str):
@@ -162,6 +167,7 @@ def _validate_prior_execution(
             config,
             prior_supersession_path,
             replacement_source=prior.get("evaluation_source"),
+            verified_paths=verified_paths,
         )
     return prior
 
@@ -171,11 +177,14 @@ def _validate_chained_supersession(
     supersession_path: Path,
     *,
     replacement_source: dict[str, str] | None = None,
+    verified_paths: set[Path] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], Path]:
     """Validate a typed receipt linking the root authorization to one prior execution."""
     if not supersession_path.resolve().is_relative_to(config.artifact_root.resolve()):
         raise ValueError("Supersession receipt must remain inside the artifact root.")
     receipt = read_json(supersession_path)
+    if verified_paths is not None:
+        verified_paths.add(supersession_path)
     freeze_path = config.artifact_root / "selection" / "parameter-freeze-v1.json"
     if (
         receipt.get("schema_version") != SUPERSESSION_SCHEMA
@@ -208,6 +217,7 @@ def _validate_chained_supersession(
         config,
         prior_path,
         expected_sha256=receipt.get("superseded_execution_receipt_sha256"),
+        verified_paths=verified_paths,
     )
     if receipt.get("superseded_evaluation_source") != prior.get("evaluation_source"):
         raise ValueError("Typed supersession prior evaluator identity mismatch.")
@@ -580,10 +590,12 @@ def verify_evaluation_execution(
         extra_paths = []
         if valid and supersession_path is not None:
             try:
-                typed, prior, prior_path = _validate_chained_supersession(
+                verified_provenance: set[Path] = set()
+                typed, prior, _prior_path = _validate_chained_supersession(
                     config,
                     supersession_path,
                     replacement_source={"commit": source_commit, "tree": source_tree},
+                    verified_paths=verified_provenance,
                 )
                 valid = valid and (
                     payload.get("previous_evaluation_source") == prior["evaluation_source"]
@@ -596,7 +608,7 @@ def verify_evaluation_execution(
                     == typed["superseded_execution_namespace"]
                     and payload.get("supersession_sha256") == file_sha256(supersession_path)
                 )
-                extra_paths = [supersession_path, prior_path]
+                extra_paths = sorted(verified_provenance)
             except (OSError, TypeError, ValueError):
                 valid = False
         else:

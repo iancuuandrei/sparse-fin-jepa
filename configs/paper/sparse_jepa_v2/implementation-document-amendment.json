@@ -35,7 +35,7 @@
     },
     "docs/standards/implementation.md": {
       "frozen_sha256": "ead3b21f1de2cd19e0bfba30946ef1a47b9e72b4089576f9cc4bcbc3272d8397",
-      "current_sha256": "5790180e34a8cb629fcbfa53b0a09b3a0bae39354a92b802535f5f86d90d346c",
+      "current_sha256": "177c2617a68015cb2944672cab41c9bdb26890d975030d55bc6f527ffdab3e0c",
       "edits": [
         {
           "start": 23,
@@ -66,13 +66,25 @@
           "end": 296,
           "original": "",
           "replacement": "\n### 2026-09-12 — execution-share ADV20 and chained reseal provenance (ADRs 0027 and 0028)\n\nTCA history builders now restate each prior daily volume into the target\nsession's raw execution-share basis using the existing point-in-time split\nfactor and the 10:30 quantity-decision information clock. Replay bars remain\nraw, the 20-session lag is strict, and the corporate-action manifest identity\nis part of the history artifact identity. New reseals preserve v2 evidence but\nuse a typed supersession receipt and v3 execution identity to distinguish the\nroot TEST authorization from the immediate prior evaluator. See ADRs 0027 and\n0028.\n"
+        },
+        {
+          "start": 296,
+          "end": 308,
+          "original": "",
+          "replacement": "\n### 2026-09-12 — bounded reuse of immutable evaluation inputs (ADR 0029)\n\nFrozen probe tensors may be encoded once and replayed with their original batch\nboundaries, dtypes, masks, and RNG transitions. Temporary caches are checksummed,\nsource-bound, atomically published, and retired after coordinate publication.\nUse cgroup-aware native thread limits for representation evaluation. Batch raw\nforecast feature construction by consecutive session and reuse verified index\nand learned date slices without sharing mutable forecast-provider state.\nRetain an optimization only after equivalence and real-input performance checks.\nSee ADR 0029 and the evaluation implementation contract. Scientific configuration,\ntrained artifacts, estimands, and cross-source result isolation remain unchanged.\n"
         }
       ]
     },
     "repo_manifest.yaml": {
       "frozen_sha256": "ba17e716f73b8ef82c1e3c0309911572ec8ca2662725d023b1c48a4a393a1d4f",
-      "current_sha256": "2ff93f83a50c91a6fd467699f9a31f3dba1759256eeb315b2bccb39ed7683da5",
+      "current_sha256": "b4d5ec6b603918630ee31ab26b9c83139f0b1a31981e07279946917f1bd8d580",
       "edits": [
+        {
+          "start": 81,
+          "end": 82,
+          "original": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper]\n",
+          "replacement": "    roots: [src/execsim/ml/paper, configs/paper, reports/paper, scripts/benchmark_frozen_probes.py]\n"
+        },
         {
           "start": 83,
           "end": 84,

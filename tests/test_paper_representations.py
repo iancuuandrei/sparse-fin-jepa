@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import pickle
 import random
-from dataclasses import replace
+from dataclasses import asdict, replace
+from datetime import datetime
 
 import numpy as np
 import pytest
 import torch
 from torch.nn import functional
 
-from execsim.data.paper.manifests import read_json
+from execsim.data.paper.manifests import file_sha256, read_json, stable_hash
 from execsim.ml.representations.checkpoints import (
     load_checkpoint,
     load_trusted_resume_state,
@@ -402,7 +404,7 @@ def test_diagnostics_difficulty_and_embedding_are_deterministic(tmp_path) -> Non
         checkpoint_hash="4" * 64,
         torch_version=torch.__version__,
     )
-    assert embedding_cache_identity(key) == embedding_cache_identity(key)
+    assert embedding_cache_identity(key) == "embedding-" + stable_hash(asdict(key))[:20]
     assert embedding_cache_identity(key) != embedding_cache_identity(replace(key, seed=29))
 
 
@@ -557,6 +559,20 @@ def test_safetensors_checkpoint_is_compatible_and_historical_fit_is_guarded(tmp_
     )
     calibrated = calibrate_from_training_batches(calibration_model, [tensor_batch] * 32, seed=13)
     assert 1e-3 <= calibrated <= 1e3
+
+
+def test_resume_rejects_non_allowlisted_objects_with_valid_checksum(tmp_path) -> None:
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    before = optimizer.state_dict()
+    path = tmp_path / "unsupported.pt"
+    # Benign unsupported type proves the boundary without an executable payload.
+    torch.save({"trusted_local_only": True, "unexpected": datetime(2024, 1, 1)}, path)
+    with pytest.raises(pickle.UnpicklingError):
+        load_trusted_resume_state(
+            path, optimizer, expected_sha256=file_sha256(path), trusted_local=True
+        )
+    assert optimizer.state_dict() == before
 
 
 def test_trusted_resume_reproduces_the_next_optimizer_step(tmp_path) -> None:

@@ -132,6 +132,7 @@ def fit_representation_arrays(
     if best_state is None or last_target is None:
         raise RuntimeError("Representation training produced no validated epoch.")
     model.load_state_dict(best_state)
+    model.eval()
     zero_fraction = float((last_target == 0).to(torch.float32).mean())
     return model, RepresentationTrainingResult(
         losses[0], losses[-1], finite, zero_fraction, len(losses)

@@ -182,7 +182,38 @@ two cutoffs. It also executes the real preparation/orchestration with the former
 full-corpus loader made unavailable, verifies each emitted date input, and checks
 resume and changed-cutoff rejection. Replay-worker equivalence is tested separately.
 
+Before any TCA worker is launched, the orchestrator resolves each selected
+instrument/session through the existing `resolution-aware-v2` assessor and keeps
+only `tca_window_exact` cases. An early close or an instrument-specific consumed-
+window gap removes that case only; `balanced_sides` receives the surviving
+date-level population, and dates with no surviving cases create no task. A bounded
+preflight then verifies every required learned ledger, EWMA availability ledger,
+fold/cutoff/sequence identity, exact as-of grid, and future-bucket grid. Missing or
+incompatible derived evidence aborts before replay rather than silently changing
+the scientific population. EWMA validation treats the artifact manifest as the
+fold authority (the published scale rows intentionally have no `fold_id` column)
+and scopes both `minute-forecasts.parquet` and `unavailable.parquet` to the
+current session and `end_token == 24` before checking identities and coverage.
+Preflight groups eligible dates by instrument and reuses one bounded read of each
+ledger while validating that instrument, rather than rereading the same files for
+every date. See the existing resolution-quality contract and
+`docs/ADRs/0009-separate-data-quality-by-resolution.md`.
+
 ## Evaluator reseal and isolated output namespace
+
+To supersede an existing resealed execution, first create the typed chain
+receipt (for example, with `prepare-evaluation-supersession`) and then pass it
+to `reseal-evaluation`:
+
+```text
+execsim ml paper prepare-evaluation-supersession \
+  --superseded-execution artifacts/paper/protocols/sparse-jepa-v2/evaluation-executions/b7eee96 \
+  --supersession-output artifacts/paper/protocols/sparse-jepa-v2/superseded/SECOND_RESEAL/supersession.json \
+  --reason "corrected pre-evaluation provenance contract"
+```
+
+The command records a typed, checksum-bound predecessor; it does not copy or
+reuse any predecessor result artifacts.
 
 `execsim ml paper reseal-evaluation` accepts `--evaluation-root` and a required
 `--supersession-receipt`. It requires locked-evaluation runtime approval and clean
@@ -245,6 +276,45 @@ interruption, unchanged reuse, changed source, corrupted output, and changed inp
 Historical restart remains PLANNED. Existing unit checks
 do not establish completion of these runtime stages. See ADR 0022 for rationale.
 
+Before a resealed TEST execution can consume runtime data, forecast and TCA
+stages resolve the universe and target corpus with `PaperRunConfig.data_path`.
+The runtime universe must have the exact byte hash recorded by every fold's
+sequence manifest, and all sequence manifests must agree on that identity.
+Reseal also checks the complete configured primary JEPA final inventory: every
+manifest must provide a non-empty training `code_commit`, and all coordinates
+must share one commit.  Final-result-freeze retains the same check as defense
+in depth.  For TCA, exact-window eligibility remains independent of ADV
+availability, but every eligible case must have exactly one finite, positive
+causal ADV20 row before worker launch; direct historical replay repeats this
+check and raises rather than silently dropping a case.  These are fail-closed
+identity and derived-evidence checks; they do not open TEST or change the
+frozen estimand.
+
+TCA ADV20 histories bind the runtime corporate-action manifest and use the
+existing point-in-time split-factor convention to express every prior daily
+volume in the target session's raw execution-share basis. The target volume is
+excluded by the strict 20-session lag, and raw replay bars are not restated.
+Action-bound histories use a new artifact identity, so a history built from
+different corporate-action bytes cannot be reused.
+
+First-generation reseals remain `paper-evaluation-execution-v2` for immutable
+historical compatibility. A reseal that supersedes an existing resealed
+execution uses a typed `paper-evaluation-supersession-v1` receipt and publishes
+`paper-evaluation-execution-v3`. The v3 identity records both the original
+TEST-open source and the immediate predecessor; validation checks the prior
+`execution.json`, its checksum, and its immutable inventory before publishing
+the new empty namespace.
+
+Reseal cross-links the immutable inventory before publishing `execution.json`.
+Each fold's sequence manifest must be the sequence named by every LightGBM
+coordinate, JEPA checkpoint, compatibility record, and embedding export.  The
+checkpoint universe identity and representation source commit must match the
+parameter freeze; embedding normalization and paper configuration identities
+must match the checkpoint; and hybrid LightGBM manifests must name the exact
+TRAIN and VALIDATION embedding bytes that are present in the export.  A
+complete but cross-coordinate-swapped artifact set is rejected before forecast
+construction.
+
 Learned inference materializes at most 2,048 scale samples and their complete
 future shape rows per wide batch. A compact embedding partition is read once per
 coordinate and attached by exact sample ID to each batch, rather than expanded
@@ -265,3 +335,219 @@ and VALIDATION. All 144 requested forecasts matched the original prefix oracle
 exactly across mean, median, previous, EWMA, pooled/unpooled scope, and three
 requested minute windows. The local receipt records input SHA-256 values; this
 was not a speed benchmark, model fit, or TEST effectiveness evaluation.
+
+## Frozen input reuse (ADR 0029)
+
+The representation evaluator can materialize the exact `_encoded_batch` output
+once per coordinate and partition. Four contiguous files retain feature,
+latent-target, observable-target, and complete-mask dtypes. A metadata stream
+records the original batch boundaries, sample IDs, dates, and as-of positions.
+Memory-mapped replay copies only the active batch to the execution device.
+No incomplete rows are dropped during materialization. Statistics and probe
+updates still perform their original mask selection and reduction order.
+
+Cache manifests bind the evaluator coordinate identity, checkpoint and sequence,
+device, PyTorch version, partition, and batching. All data files are checksummed;
+missing checksums, changed bytes, unaligned shapes, or different identities fail
+closed. Publication is atomic. Cache materialization restores the loader's RNG
+state; replay consumes the same DataLoader iterator seed transition. Completed
+scientific coordinate artifacts retain their existing independent publication
+and resume contract. Disposable cache files are retired after publication so
+storage does not grow with the full coordinate matrix.
+
+The representation-stage thread policy accounts for affinity and cgroup v1/v2
+quota, limits native pools, and sets inter-op parallelism to one. This is local
+execution configuration, not a change to batch size or any scientific setting.
+
+Forecast raw features are constructed in consecutive session groups, preserving
+sample order, values, categorical inputs, and target/weight calculations. Existing
+manifest-bound index caches replace repeated tiny-index reads. TCA workers read
+one verified learned date slice and construct independent provider states for
+each simulation. Identity/file-state checks remain active; old evaluation result
+namespaces are never imported as completed outputs in a new execution.
+
+These changes require real bounded benchmark evidence and exact fixture
+equivalence. They do not imply empirical effectiveness or authorize evaluation.
+
+TCA date inputs are published during the first population pass, after exact-window
+and positive unique ADV20 validation. Dataframes remain bounded to one date.
+All fold ledger preflights must pass before any worker launches. A failed
+preflight may leave valid atomic input artifacts, never completed TCA results;
+the same source-bound execution verifies those inputs on retry. This eliminates
+the second history read and repeated window assessment without changing the
+surviving cases or their order.
+
+### Bounded probe benchmark
+
+On the qualified Linux/CUDA host, run the reference and cached paths with the
+same source, inputs, geometry, seed, row count, and native thread limit:
+
+```bash
+PYTHONPATH="$SOURCE/src" "$PYTHON" "$SOURCE/scripts/benchmark_frozen_probes.py" \
+  --source "$SOURCE" --artifact-root "$ARTIFACT_ROOT" \
+  --work "$BENCHMARK_ROOT" --mode reference --geometry sparse --rows 8192 --threads 4
+PYTHONPATH="$SOURCE/src" "$PYTHON" "$SOURCE/scripts/benchmark_frozen_probes.py" \
+  --source "$SOURCE" --artifact-root "$ARTIFACT_ROOT" \
+  --work "$BENCHMARK_ROOT" --mode cached --geometry sparse --rows 8192 --threads 4
+```
+
+The script reads TRAIN/VALIDATION only, runs the unchanged 20-epoch probe ladder,
+and uses a second VALIDATION loader in place of TEST for timing/scoring. It emits
+only timings, resource measurements, and a digest of mathematical outputs.
+Source bytes bind benchmark cache reuse. The reported evaluator wall time
+includes cache construction but excludes initial checkpoint/index loading.
+These are operational qualification outputs, not paper results.
+
+The execution-verification memoization guard includes every receipt and upstream
+file reached during recursive supersession verification, not only the immediate
+predecessor. After an initial successful verification, changing an older ancestor
+execution or supersession receipt still fails closed. This enforces the existing
+ADR 0028 chain contract for third and later generations without altering schemas
+or copying old results.
+
+### Performance qualification evidence
+
+On the retained RTX 3090 host (27.2 effective cgroup CPUs), the isolated
+TRAIN/VALIDATION benchmark at source `44a12b2` used 8,192 sparse TRAIN samples,
+512 VALIDATION samples, a second 512-row VALIDATION scoring loader, batch size
+256, and the unchanged 20-epoch probe ladder. With four native threads, reference
+evaluation took 131.164 seconds and cached evaluation, including materialization,
+took 26.775 seconds (4.90 times faster). CPU time fell from 187.939 to 26.619
+seconds. Peak RSS was 2,919,992 versus 2,962,944 KiB. Both mathematical-output
+digests were exactly
+`dc1a0e698ae6cd229088f32224ac8abb6bc9c7c0c7c60ce8cdea7bd9c7633d26`.
+These evaluator timings exclude initial checkpoint and index loading and do not
+predict a full-coordinate completion time. Total OS threads were 84, including
+idle native/CUDA pools; four is the computational pool limit, not a claim that
+the process contains only four threads.
+
+A later bounded real-pod qualification at source
+`4eabe206a61e2e334f73fbb46568eaa30393a551` used frozen TRAIN/VALIDATION inputs:
+8,192 TRAIN rows, 512 VALIDATION rows, and a second VALIDATION loader for
+scoring. Reference evaluation took 125.556818787 seconds and cached evaluation
+took 26.735507892 seconds (about 4.70 times faster), with the same output
+SHA-256, `dc1a0e698ae6cd229088f32224ac8abb6bc9c7c0c7c60ce8cdea7bd9c7633d26`.
+Each run used 24 OS threads, four native threads, and one Torch inter-op thread.
+Peak RSS was 2,905,764 KiB for reference and 2,951,296 KiB for cached. The run
+log SHA-256 is `555f0b0c958313ccf0d3f7ea87be6cf4604fc3b7e35ab7359de2e8f8e928ecce`.
+No historical TEST data was used, and no JEPA or LightGBM retraining occurred.
+
+A subsequent cached-input comparison at one, two, four, and eight native threads
+preserved all nonnumeric identities and both selected ridge alphas. The maximum
+absolute mathematical-output difference was 1.7764e-15; comparisons used
+`rtol=1e-10, atol=1e-12`, excluding telemetry. No TEST samples were consumed.
+Warm-cache timings are not substituted for the cold-materialization comparison
+above. The four-thread default remains the fully paired reference/cached policy.
+
+Other bounded input-only checks found exact frame equality for session-batched
+forecast preparation (42.45 to 24.86 seconds for 128 sessions), verified index
+reuse (6,136 reads to one for 134,992 rows), and shared learned ledger date reads
+(60 reads to two). Single-pass TCA input preparation on ten TRAIN dates preserved
+the exact inputs while reducing reads from 38 to 20. These checks did not score
+historical model effectiveness.
+
+An OSQP workspace-reuse prototype was rejected: it failed integer-capacity
+projection on a bounded TRAIN replay, while the unchanged solver passed. Solver
+setup represented less than one percent of the measured replay profile, so no
+production solver change was retained. Result-frame construction was also less
+than one percent; a summary-only simulator was not introduced. A synthetic
+10,000-replicate block-bootstrap timing was under two seconds and did not justify
+changing the report estimator. These observations are bounded profiling evidence,
+not a full historical TCA or reporting performance claim.
+
+### Operational artifact safeguards
+
+The coordinate-result schema and encoded-cache schema are distinct. Construct
+the complete cache identity with `encoded_probe_identity` for both creation and
+retirement, including batching, partition, device, and PyTorch version. Retirement
+verifies all partition identities and file checksums before deleting any cache
+file; it never ignores the schema to permit cleanup. The published coordinate
+remains the scientific result and must exist before retirement.
+
+Trusted resume loading verifies the exact bytes passed to PyTorch's restricted
+weights-only loader. Only the existing NumPy MT19937 reconstruction types are
+additionally allowed, within a scoped context. Unsupported object types fail;
+existing safetensors and continuation files are not rewritten. JSON publication
+uses unique same-directory temporary files and atomic replacement, preserving
+the prior receipt if replacement fails. See ADR 0030.
+
+Learned TCA ledger preflight builds date and case-position indexes once per
+instrument. It passes physically ordered date slices through the existing
+identity, cutoff, origin, duplicate, future-bucket, and share checks. Indexing is
+operational: it does not remove an eligible case or replace preflight with trust
+in a cache. A missing eligible date still fails before workers launch.
+
+The [Sonar review](SONAR_REMEDIATION.md) accounts for the full project finding
+inventory and distinguishes operational corrections from intentional exact
+identity and runtime-path contracts. It does not replace exact-head hosted gates.
+
+### Indexed preflight benchmark
+
+Run the bounded synthetic comparison from the repository root:
+
+```powershell
+.venv/Scripts/python.exe scripts/benchmark_tca_preflight.py --baseline-revision 3eb221bf787421fd4d5397b725397861b403fdaa --dates 128 --origins 22 --repeats 2
+```
+
+The benchmark uses eight learned ledgers and one EWMA ledger for one synthetic
+instrument, preserves all preflight checks, and extracts the old validator from
+the specified Git revision. It never reads historical TEST data or calls a
+forecast provider. After correcting the end-window boundary, two paired runs
+with 128 dates and all 22 configured origins on the local Python 3.13 environment
+gave median elapsed times of 21.772753 seconds for legacy preflight and 13.740527
+seconds for indexed preflight. Learned validator time was 16.584558 versus
+8.169671 seconds. Both paths made 19 Parquet reads and returned 326,656 rows.
+The benchmark ran concurrently with the full test suite, so these measurements
+are informative and are not an isolated performance estimate.
+
+The benchmark imposes no CI timing threshold. These results quantify only
+preflight work on the declared fixture, not historical replay, report matching,
+or end-to-end completion time. Exact-output and adversarial regressions remain
+separate gates.
+
+### Guarded forecast fast paths
+
+Contiguous shape groups retain the original per-group NumPy max, exponential,
+sum, and assignment order while avoiding pandas group-index and row-write
+overhead. Interleaved, categorical, or missing keys retain the original path.
+Metric inputs bypass merge/sort only when unique typed keys align exactly and
+future buckets ascend within contiguous cases. Fallback share validation stays
+before sorting. Tests include near-tolerance sums and malformed populations.
+
+Learned forecast providers retain private immutable metadata for the minute grid
+they construct. Truncation slices only if the cached timestamp tuple is that
+grid object and the entire requested tuple matches a contiguous slice. Generic
+requests, including unsorted or duplicate timestamps, retain dictionary semantics.
+The normalization reduction and returned forecast fields are unchanged. See ADR
+0031.
+
+The synthetic helper benchmarks in `test_forecast_fast_paths.py` assert exact
+outputs before timing. For 10,000 cases and 80,000 shape rows, stub-model
+`predict_frames` took 1.237 seconds on the reference path and 0.069 seconds on
+the guarded path. Full metric construction took 0.078 versus 0.063 seconds.
+These timings exclude real LightGBM prediction cost. The 300-minute truncation
+helper took 0.334 versus 0.194 seconds; the full synthetic simulation parity test
+also passes. No historical effectiveness was inspected for these comparisons.
+
+### Other preparation costs
+
+Run the bounded preparation audit from the repository root:
+
+```powershell
+.venv/Scripts/python.exe scripts/benchmark_evaluation_preparation.py --ewma-samples 128 --sequence-samples 100000 --report-cases 25000 --repeats 3
+```
+
+On the local environment, 2,048 exact EWMA requests took a median 0.994 seconds.
+Each offset retains its independently eligible historical window; substituting
+truncation would not preserve the estimator. Fixed-grid construction for 100,000
+samples took 1.427 seconds, with 0.094 seconds in grouping/sorting. Reusing
+DataLoader instances is not adopted because it can change generator state.
+
+For 97,877 synthetic method rows and three complete-case comparisons, narrowing
+columns before copying took 0.181 seconds versus 0.171 seconds for the existing
+matcher. That prototype is not retained; the current benchmark measures the
+canonical matcher and verifies repeat-exact rows and drop counts rather than
+maintaining a second copy of the rejected matcher. Peak RSS was unavailable in this local
+benchmark; it is not reported as zero. These bounded observations do not rule
+out larger-corpus bottlenecks or replace the required full-coordinate runtime
+observation. Cross-process checksum verification remains unchanged.

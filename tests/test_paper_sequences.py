@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -78,10 +79,12 @@ def test_sequence_is_one_fixed_session_with_causal_complete_grid(tmp_path) -> No
     window = extract_window(record, samples[0])
     assert window["context"].shape == (8, 18)
     assert window["context_mask"].sum() == 4
-    assert sample_training_positions(samples, epoch=2, seed=13) == sample_training_positions(
-        samples, epoch=2, seed=13
-    )
-    assert len(sample_training_positions(samples, epoch=2, seed=13)) == 2
+    digest = hashlib.sha256(f"{samples[0].session_id}|2|13".encode()).digest()
+    generator = np.random.default_rng(int.from_bytes(digest[:8], "little"))
+    expected_positions = sorted(generator.choice(len(samples), size=2, replace=False))
+    selected = sample_training_positions(samples, epoch=2, seed=13)
+    assert selected == tuple(samples[position] for position in expected_positions)
+    assert len(selected) == 2
     artifact = write_sequence_record(record, tmp_path)
     restored = read_sequence_record(artifact)
     assert restored.session_id == record.session_id

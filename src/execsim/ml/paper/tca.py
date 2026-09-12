@@ -271,6 +271,7 @@ def run_historical_tca(
     """Run matched 10:30-15:30 deterministic MPC cases with only provider variation."""
     from execsim.costs import CostParameter, LinearTemporaryImpactModel
     from execsim.forecasting.historical import HistoricalForecastUnavailable
+    from execsim.ml.paper.tca_inputs import filter_tca_window_exact, validate_tca_adv20
     from execsim.orders import ParentOrder
     from execsim.policies import ExecutionConstraints
     from execsim.simulator import simulate_policy
@@ -281,25 +282,47 @@ def run_historical_tca(
         raise ValueError("Paper TCA supports only primary 3% and appendix 1%/5% ADV sizes.")
     start_time = time.fromisoformat(start)
     end_time = time.fromisoformat(end)
-    if (
-        start_time != time(10, 30)
-        or end_time != time(15, 30)
-        or planned_participation != 0.10
-        or hard_participation != 0.10
-        or risk_aversion != 0.0
-        or tracking_penalty != 0.0
-        or half_spread_arrival_fraction != 5e-5
-        or temporary_impact_arrival_fraction != 1e-3
-    ):
+    # This is exact protocol identity, not comparison of estimated quantities.
+    # A tolerance would incorrectly authorize a different execution experiment.
+    actual_contract = {
+        "start": start_time,
+        "end": end_time,
+        "planned_participation": planned_participation,
+        "hard_participation": hard_participation,
+        "risk_aversion": risk_aversion,
+        "tracking_penalty": tracking_penalty,
+        "half_spread_arrival_fraction": half_spread_arrival_fraction,
+        "temporary_impact_arrival_fraction": temporary_impact_arrival_fraction,
+    }
+    frozen_contract = {
+        "start": time(10, 30),
+        "end": time(15, 30),
+        "planned_participation": 0.10,
+        "hard_participation": 0.10,
+        "risk_aversion": 0.0,
+        "tracking_penalty": 0.0,
+        "half_spread_arrival_fraction": 5e-5,
+        "temporary_impact_arrival_fraction": 1e-3,
+    }
+    if actual_contract != frozen_contract:
         raise ValueError("Historical TCA parameters contradict the locked experiment.")
     instruments = select_liquidity_spaced_instruments(universe, size=liquidity_size)
     required_adv = {"instrument_id", "session_date", "adv20"}
     if missing := required_adv.difference(adv20.columns):
         raise ValueError(f"ADV20 input missing columns: {sorted(missing)}")
-    selected = bars.loc[bars["instrument_id"].astype(str).isin(instruments)].copy()
+    adv_session_dates = pd.to_datetime(adv20["session_date"], errors="coerce").dt.date
+    selected = filter_tca_window_exact(bars, instruments)
     selected["session_date"] = (
         pd.to_datetime(selected["timestamp"]).dt.tz_convert("America/New_York").dt.date
     )
+    # Validate the complete exact-window population before invoking any provider
+    # or replay.  ADV availability is derived evidence, not a population filter.
+    eligible_cases = {
+        session_date: tuple(sorted(date_bars["instrument_id"].astype(str).unique()))
+        for session_date, date_bars in selected.groupby("session_date", sort=True)
+    }
+    validate_tca_adv20(adv20, eligible_cases)
+
     rows = []
     for session_date, date_bars in selected.groupby("session_date", sort=True):
         available = tuple(sorted(date_bars["instrument_id"].astype(str).unique()))
@@ -311,10 +334,15 @@ def run_historical_tca(
             symbol = str(instrument_bars["symbol"].iloc[0])
             adv_match = adv20.loc[
                 (adv20["instrument_id"].astype(str) == instrument_id)
-                & (pd.to_datetime(adv20["session_date"]).dt.date == session_date)
+                & adv_session_dates.eq(session_date)
             ]
-            if len(adv_match) != 1:
-                continue
+            # validate_tca_adv20 above makes this a defensive assertion rather
+            # than a silent population change if this path is edited later.
+            if len(adv_match) != 1:  # pragma: no cover - guarded by preflight
+                raise ValueError(
+                    "ADV20 required for eligible TCA case "
+                    f"{instrument_id}/{session_date}: expected exactly one row."
+                )
             quantity = max(1, round(order_fraction * float(adv_match["adv20"].iloc[0])))
             arrival = float(
                 instrument_bars.loc[

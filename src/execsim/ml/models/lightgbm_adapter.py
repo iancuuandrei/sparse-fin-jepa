@@ -8,7 +8,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass
-from itertools import product
+from itertools import pairwise, product
 from pathlib import Path
 from typing import Any, Literal
 
@@ -245,18 +245,31 @@ class LightGBMVolumeModel:
         )
         logits = np.asarray(self.shape_model.predict(shape), dtype=float)
         output = metadata.loc[:, [*group_columns, "target_bucket"]].copy()
-        output["conditional_share"] = 0.0
-        grouping: str | list[str] = (
-            group_columns[0] if len(group_columns) == 1 else list(group_columns)
-        )
-        for _, indexes in output.groupby(grouping, sort=False).groups.items():
-            positions = np.asarray(list(indexes), dtype=int)
-            selected = positions[valid[positions]]
-            if not len(selected):
-                raise ValueError("A shape case has no valid future target buckets.")
-            centered = logits[selected] - np.max(logits[selected])
-            probabilities = np.exp(centered)
-            output.loc[selected, "conditional_share"] = probabilities / probabilities.sum()
+        boundaries = _contiguous_group_boundaries(metadata, group_columns)
+        if boundaries is None:
+            output["conditional_share"] = 0.0
+            grouping: str | list[str] = (
+                group_columns[0] if len(group_columns) == 1 else list(group_columns)
+            )
+            for _, indexes in output.groupby(grouping, sort=False).groups.items():
+                positions = np.asarray(list(indexes), dtype=int)
+                selected = positions[valid[positions]]
+                if not len(selected):
+                    raise ValueError("A shape case has no valid future target buckets.")
+                centered = logits[selected] - np.max(logits[selected])
+                probabilities = np.exp(centered)
+                output.loc[selected, "conditional_share"] = probabilities / probabilities.sum()
+        else:
+            conditional_shares = np.zeros(len(output), dtype=float)
+            for start, stop in pairwise(boundaries):
+                positions = np.arange(start, stop, dtype=int)
+                selected = positions[valid[positions]]
+                if not len(selected):
+                    raise ValueError("A shape case has no valid future target buckets.")
+                centered = logits[selected] - np.max(logits[selected])
+                probabilities = np.exp(centered)
+                conditional_shares[selected] = probabilities / probabilities.sum()
+            output["conditional_share"] = conditional_shares
         baseline = _baseline_remaining(scale_features)
         residual = np.asarray(self.scale_model.predict(scale), dtype=float)
         totals = np.maximum((1.0 + baseline) * np.exp(residual) - 1.0, 0.0)
@@ -669,6 +682,37 @@ def _prepare_frame(
     if not np.isfinite(numeric.to_numpy(dtype=float)).all():
         raise ValueError("LightGBM numeric features must be finite.")
     return result
+
+
+def _contiguous_group_boundaries(
+    frame: pd.DataFrame, group_columns: tuple[str, ...]
+) -> np.ndarray | None:
+    """Return run boundaries for ordinary, non-null contiguous shape keys.
+
+    Missing or categorical keys retain pandas' established grouping behavior via
+    the caller's fallback. Factorization only identifies runs; each run keeps the
+    same NumPy max, exp, and sum operations as the original per-group path.
+    """
+    if not group_columns:
+        return None
+    keys = frame.loc[:, list(group_columns)]
+    if any(isinstance(dtype, pd.CategoricalDtype) for dtype in keys.dtypes):
+        return None
+    try:
+        if keys.isna().to_numpy().any():
+            return None
+        if len(group_columns) == 1:
+            codes, _ = pd.factorize(keys.iloc[:, 0], sort=False)
+        else:
+            codes, _ = pd.MultiIndex.from_frame(keys).factorize(sort=False)
+    except (TypeError, ValueError):
+        return None
+    if not len(codes):
+        return np.asarray([0], dtype=int)
+    if np.any(codes < 0) or np.any(codes[1:] < codes[:-1]):
+        return None
+    starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
+    return np.concatenate((starts, np.asarray([len(codes)], dtype=int)))
 
 
 def _validate_scale_frame(

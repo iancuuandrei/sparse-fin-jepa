@@ -1,6 +1,6 @@
 # ADR 0029: Reuse immutable evaluation inputs
 
-Status: proposed pending exact-head qualification
+Status: accepted
 
 ## Context
 
@@ -33,6 +33,13 @@ evaluator identities.
 Limit representation native pools using the minimum CPU affinity and cgroup
 quota, with one PyTorch inter-op thread. The operational default must be supported
 by frozen-input benchmarks before qualification; it is not a probe hyperparameter.
+
+The qualified default is four native threads, capped by effective CPU capacity.
+The bounded old/new CUDA benchmark including materialization demonstrated a
+4.90-fold speedup with identical mathematical-output digests. Additional
+one-, two-, and eight-thread runs preserved sample identities and selected ridge
+alphas; maximum output differences were below 1.8e-15. This is floating-point
+reduction roundoff, not a new numerical approximation or model-selection rule.
 
 Build raw forecast features for consecutive session groups without reordering
 samples. Reuse the existing manifest-bound sequence index cache. In a TCA worker,

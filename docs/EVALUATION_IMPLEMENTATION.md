@@ -404,3 +404,42 @@ predecessor. After an initial successful verification, changing an older ancesto
 execution or supersession receipt still fails closed. This enforces the existing
 ADR 0028 chain contract for third and later generations without altering schemas
 or copying old results.
+
+### Performance qualification evidence
+
+On the retained RTX 3090 host (27.2 effective cgroup CPUs), the isolated
+TRAIN/VALIDATION benchmark at source `44a12b2` used 8,192 sparse TRAIN samples,
+512 VALIDATION samples, a second 512-row VALIDATION scoring loader, batch size
+256, and the unchanged 20-epoch probe ladder. With four native threads, reference
+evaluation took 131.164 seconds and cached evaluation, including materialization,
+took 26.775 seconds (4.90 times faster). CPU time fell from 187.939 to 26.619
+seconds. Peak RSS was 2,919,992 versus 2,962,944 KiB. Both mathematical-output
+digests were exactly
+`dc1a0e698ae6cd229088f32224ac8abb6bc9c7c0c7c60ce8cdea7bd9c7633d26`.
+These evaluator timings exclude initial checkpoint and index loading and do not
+predict a full-coordinate completion time. Total OS threads were 84, including
+idle native/CUDA pools; four is the computational pool limit, not a claim that
+the process contains only four threads.
+
+A subsequent cached-input comparison at one, two, four, and eight native threads
+preserved all nonnumeric identities and both selected ridge alphas. The maximum
+absolute mathematical-output difference was 1.7764e-15; comparisons used
+`rtol=1e-10, atol=1e-12`, excluding telemetry. No TEST samples were consumed.
+Warm-cache timings are not substituted for the cold-materialization comparison
+above. The four-thread default remains the fully paired reference/cached policy.
+
+Other bounded input-only checks found exact frame equality for session-batched
+forecast preparation (42.45 to 24.86 seconds for 128 sessions), verified index
+reuse (6,136 reads to one for 134,992 rows), and shared learned ledger date reads
+(60 reads to two). Single-pass TCA input preparation on ten TRAIN dates preserved
+the exact inputs while reducing reads from 38 to 20. These checks did not score
+historical model effectiveness.
+
+An OSQP workspace-reuse prototype was rejected: it failed integer-capacity
+projection on a bounded TRAIN replay, while the unchanged solver passed. Solver
+setup represented less than one percent of the measured replay profile, so no
+production solver change was retained. Result-frame construction was also less
+than one percent; a summary-only simulator was not introduced. A synthetic
+10,000-replicate block-bootstrap timing was under two seconds and did not justify
+changing the report estimator. These observations are bounded profiling evidence,
+not a full historical TCA or reporting performance claim.

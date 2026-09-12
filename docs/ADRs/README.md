@@ -61,7 +61,7 @@ ADR [0028](0028-chained-resealed-evaluation-provenance.md) is accepted: bind a
 new reseal to both the immutable root TEST authorization and the immediate prior
 resealed execution with a typed supersession receipt.
 
-ADR [0029](0029-reuse-immutable-evaluation-inputs.md) is proposed: reuse frozen
+ADR [0029](0029-reuse-immutable-evaluation-inputs.md) is accepted: reuse frozen
 encoded probe batches, session-batched forecast features, and verified TCA date
 slices without changing scientific ordering or mutable simulation state.
 

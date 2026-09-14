@@ -1,5 +1,12 @@
 # RunPod fold execution
 
+This is the reusable TRAIN/VALIDATION deployment procedure, not the current
+experiment status or a record of the hosts ultimately used. The frozen study
+has completed training and evaluation; see the [experiment record](EXPERIMENT_RESULTS.md).
+Do not run this procedure to inspect completed results. Its commands require
+fresh, separately scoped authorization and do not reproduce results merely by
+using the latest repository commit.
+
 Use three Ubuntu 22.04/24.04 NVIDIA RTX 3090 Community pods, one GPU and approximately
 16 vCPU / 125 GB RAM / 24 GB VRAM each. All pods use the same committed repository tree.
 The commands below perform TRAIN/VALIDATION fitting only. TEST files are excluded from input

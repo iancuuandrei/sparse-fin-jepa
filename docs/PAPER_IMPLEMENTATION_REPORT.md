@@ -1,5 +1,30 @@
 # Sparse-JEPA paper implementation report
 
+## Current status — 14 September 2026
+
+The authorized `sparse-jepa-v2` historical evaluation is complete. Its terminal
+receipt is `FINAL-RESULTS-FROZEN`, produced by evaluator `8d83f84`. The
+[experiment record](EXPERIMENT_RESULTS.md) identifies the exact freeze, stage
+producers, evidence limits, and measured confirmatory contrasts.
+
+| Stage | Current evidence |
+|---|---|
+| V2 formation and target corpus | Completed for the frozen study |
+| Primary JEPA training and embedding export | 18/18 checkpoints; 18/18 exports |
+| Selected LightGBM matrix | 24/24 coordinates |
+| Locked forecast and representation evaluation | Completed; original producer `6402e40` |
+| Historical TCA | Completed; producer `d0f8877`, 250 date shards |
+| Report and final result freeze | Completed; producer `8d83f84` |
+| General sparse-representation superiority | Not established; endpoint-specific mixed evidence |
+
+The sections below retain earlier implementation and acceptance snapshots. Their
+`NOT RUN`, `BLOCKED`, and approval statements describe the named historical phase,
+not the current v2 run. V1 remains blocked under its own unchanged formation rule.
+Completion of the frozen v2 study does not authorize new acquisition, fitting,
+evaluation, or parameter selection.
+
+## Historical deployment snapshot — before RunPod fitting
+
 The RunPod execution correction is specified in [ADR 0021](ADRs/0021-run-independent-lightgbm-folds-on-runpod.md)
 and [the executable deployment procedure](RUNPOD_EXECUTION.md). The local LightGBM attempt
 was interrupted gracefully at 0/24. Pod provisioning, Ubuntu setup, RTX 3090 qualification
@@ -34,7 +59,7 @@ reused under the corrected downstream source identity. Historical LightGBM
 matrix status remains **INCOMPLETE**; parameter freeze, locked TEST evaluation,
 historical TCA, and confirmatory inference remain **NOT RUN**.
 
-## Status
+## Historical formation status
 
 | Evidence class | Status |
 |---|---|
@@ -71,7 +96,7 @@ last close, summed volume and trade count, and volume-weighted VWAP. Direct SIP
 `1Day` retrieval is available. Source links and the observed-grid volatility
 convention are recorded in `docs/RESEARCH_REFERENCES.md`.
 
-## V2 evidence boundary
+## Historical v2 formation evidence boundary
 
 | Stage | Status |
 |---|---|
@@ -260,7 +285,7 @@ paired allocation regret with measured intervals. Support/regime, sparsity,
 Laplace, block-length, order-size, and optional ensemble material remains in
 the appendix.
 
-## Executed software evidence
+## Historical software acceptance evidence
 
 The deterministic acceptance corpus contains four synthetic stocks plus SPY,
 40 sessions spanning two paper folds, causal seasonal history, a known-before-
@@ -306,7 +331,7 @@ manifests exist.
 - Executable evidence: paper data, sequence, representation, and pipeline test
   modules. Ordinary ExecSim modules and behavior remain outside this change.
 
-## Privileged stages still not run
+## Privileged stages not run at the original acceptance checkpoint
 
 - Alpaca authentication, SIP entitlement, formation download, and target-period
   download: **DATA NOT ACQUIRED**.

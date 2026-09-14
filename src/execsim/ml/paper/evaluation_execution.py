@@ -13,6 +13,7 @@ from execsim.ml.paper.configs import PaperRunConfig
 
 SCHEMA = "paper-evaluation-execution-v2"
 CHAINED_SCHEMA = "paper-evaluation-execution-v3"
+STAGE_INHERITED_SCHEMA = "paper-evaluation-execution-v4"
 SUPERSESSION_SCHEMA = "paper-evaluation-supersession-v1"
 SUPERSESSION_STATUS = "SUPERSEDED_RESEALED_EVALUATION"
 SCIENTIFIC_PRESERVATION = [
@@ -117,6 +118,7 @@ def _validate_prior_execution(
     if prior.get("status") != "EVALUATION_RESEALED" or prior.get("schema_version") not in {
         SCHEMA,
         CHAINED_SCHEMA,
+        STAGE_INHERITED_SCHEMA,
     }:
         raise ValueError("Superseded receipt is not a resealed evaluation execution.")
     freeze_path = config.artifact_root / "selection" / "parameter-freeze-v1.json"
@@ -144,7 +146,7 @@ def _validate_prior_execution(
     ):
         raise ValueError("Superseded execution is missing evaluator source identity.")
     upstream_files = prior.get("upstream_files")
-    if not isinstance(upstream_files, dict):
+    if not isinstance(upstream_files, dict) or not upstream_files:
         raise ValueError("Superseded execution is missing its immutable inventory.")
     for relative, digest in upstream_files.items():
         if not isinstance(relative, str) or not isinstance(digest, str):
@@ -154,7 +156,7 @@ def _validate_prior_execution(
             raise ValueError("Superseded execution immutable inventory checksum mismatch.")
         if verified_paths is not None:
             verified_paths.add(upstream_path)
-    if prior.get("schema_version") == CHAINED_SCHEMA:
+    if prior.get("schema_version") in {CHAINED_SCHEMA, STAGE_INHERITED_SCHEMA}:
         prior_supersession = prior.get("supersession_path")
         if not isinstance(prior_supersession, str):
             raise ValueError("Superseded chained execution is missing its supersession receipt.")
@@ -169,6 +171,39 @@ def _validate_prior_execution(
             replacement_source=prior.get("evaluation_source"),
             verified_paths=verified_paths,
         )
+    if prior.get("schema_version") == STAGE_INHERITED_SCHEMA:
+        inheritance_name = prior.get("stage_inheritance_path")
+        inheritance_path = (
+            _safe_child(config.artifact_root, inheritance_name)
+            if isinstance(inheritance_name, str)
+            else None
+        )
+        if inheritance_path is None or not inheritance_path.is_file():
+            raise ValueError("Superseded v4 execution is missing its stage-inheritance receipt.")
+        inheritance_sha = file_sha256(inheritance_path)
+        if (
+            prior.get("stage_inheritance_sha256") != inheritance_sha
+            or prior.get("stage_inheritance_receipt_sha256", inheritance_sha) != inheritance_sha
+        ):
+            raise ValueError("Superseded v4 stage-inheritance receipt checksum mismatch.")
+        from execsim.ml.paper.stage_inheritance import (
+            stage_inheritance_paths,
+            verify_stage_inheritance,
+        )
+
+        predecessor_namespace = prior.get("superseded_execution_namespace")
+        predecessor_sha = prior.get("superseded_execution_receipt_sha256")
+        if not isinstance(predecessor_namespace, str) or not isinstance(predecessor_sha, str):
+            raise ValueError("Superseded v4 execution is missing its predecessor identity.")
+
+        verify_stage_inheritance(
+            config,
+            inheritance_path,
+            replacement_source=prior["evaluation_source"],
+            expected_predecessor=(predecessor_namespace, predecessor_sha),
+        )
+        if verified_paths is not None:
+            verified_paths.update(stage_inheritance_paths(config, inheritance_path))
     return prior
 
 
@@ -451,6 +486,7 @@ def seal_evaluation_execution(
     source_commit: str,
     source_tree: str,
     supersession: Path,
+    inheritance: Path | None = None,
 ) -> dict[str, Any]:
     """Create a new, empty, source-bound execution; never overwrite upstream receipts."""
     directory = evaluation_root(config).resolve()
@@ -478,11 +514,32 @@ def seal_evaluation_execution(
         superseded_path = None
         root_source = None
         previous_source = None
+    stage_receipt: dict[str, Any] | None = None
+    if inheritance is not None:
+        # Keep this import local: stage_inheritance deliberately does not
+        # import the execution module, avoiding a package-import cycle.
+        from execsim.ml.paper.stage_inheritance import verify_stage_inheritance
+
+        if supersession_receipt is None or superseded_path is None:
+            raise ValueError("Typed stage inheritance requires a chained supersession receipt.")
+        predecessor_namespace = supersession_receipt.get("superseded_execution_namespace")
+        predecessor_sha = supersession_receipt.get("superseded_execution_receipt_sha256")
+        if not isinstance(predecessor_namespace, str) or not isinstance(predecessor_sha, str):
+            raise ValueError("Supersession receipt is missing its predecessor identity.")
+        expected_predecessor = (predecessor_namespace, predecessor_sha)
+        stage_receipt = verify_stage_inheritance(
+            config,
+            inheritance,
+            replacement_source={"commit": source_commit, "tree": source_tree},
+            expected_predecessor=expected_predecessor,
+        )
     inventory = frozen_inventory(config)
     freeze = read_json(freeze_path)
     opened = read_json(config.artifact_root / "selection/locked-test-opened-v1.json")
     identity = {
-        "schema_version": CHAINED_SCHEMA if chained else SCHEMA,
+        "schema_version": STAGE_INHERITED_SCHEMA
+        if stage_receipt is not None
+        else (CHAINED_SCHEMA if chained else SCHEMA),
         "status": "EVALUATION_RESEALED",
         "protocol_id": "sparse-jepa-v2",
         "paper_config_hash": config.config_hash,
@@ -516,6 +573,18 @@ def seal_evaluation_execution(
                 "supersession_path": _relative_artifact_path(
                     config.artifact_root.resolve(), supersession.resolve()
                 ),
+            }
+        )
+    if stage_receipt is not None and inheritance is not None:
+        identity.update(
+            {
+                "stage_inheritance_path": _relative_artifact_path(
+                    config.artifact_root.resolve(), inheritance.resolve()
+                ),
+                "stage_inheritance_sha256": file_sha256(inheritance),
+                "stage_inheritance_receipt_sha256": file_sha256(inheritance),
+                "inherited_stages": list(stage_receipt["inherited_stages"]),
+                "invalidation_frontier": stage_receipt["invalidation_frontier"],
             }
         )
     receipt = directory / "execution.json"
@@ -579,7 +648,7 @@ def verify_evaluation_execution(
             "tree": opened["evaluation_git_tree"],
         }
         extra_paths: list[Path] = []
-    elif payload.get("schema_version") == CHAINED_SCHEMA:
+    elif payload.get("schema_version") in {CHAINED_SCHEMA, STAGE_INHERITED_SCHEMA}:
         supersession_name = payload.get("supersession_path")
         if not isinstance(supersession_name, str):
             # The path is derived from the immutable receipt hash and remains
@@ -613,6 +682,51 @@ def verify_evaluation_execution(
                 valid = False
         else:
             valid = False
+        if valid and payload.get("schema_version") == STAGE_INHERITED_SCHEMA:
+            try:
+                from execsim.ml.paper.stage_inheritance import (
+                    stage_inheritance_paths,
+                    verify_stage_inheritance,
+                )
+
+                inheritance_name = payload.get("stage_inheritance_path")
+                inheritance_path = (
+                    _safe_child(root, inheritance_name)
+                    if isinstance(inheritance_name, str)
+                    else None
+                )
+                if inheritance_path is None or not inheritance_path.is_file():
+                    raise ValueError("v4 execution is missing its stage-inheritance receipt.")
+                inheritance_sha = file_sha256(inheritance_path)
+                if (
+                    payload.get("stage_inheritance_sha256") != inheritance_sha
+                    or payload.get("stage_inheritance_receipt_sha256", inheritance_sha)
+                    != inheritance_sha
+                ):
+                    raise ValueError("Stage-inheritance receipt checksum mismatch.")
+                predecessor_namespace = payload.get("superseded_execution_namespace")
+                predecessor_sha = payload.get("superseded_execution_receipt_sha256")
+                if not isinstance(predecessor_namespace, str) or not isinstance(
+                    predecessor_sha, str
+                ):
+                    raise ValueError("v4 execution is missing its predecessor identity.")
+                expected_predecessor = (predecessor_namespace, predecessor_sha)
+                typed = verify_stage_inheritance(
+                    config,
+                    inheritance_path,
+                    replacement_source={"commit": source_commit, "tree": source_tree},
+                    expected_predecessor=expected_predecessor,
+                )
+                valid = (
+                    valid
+                    and payload.get("inherited_stages") == typed.get("inherited_stages")
+                    and payload.get("invalidation_frontier") == typed.get("invalidation_frontier")
+                )
+                # Bind the execution cache to the complete stage and ancestry
+                # state, not only to the small receipt itself.
+                extra_paths.extend(stage_inheritance_paths(config, inheritance_path))
+            except (OSError, TypeError, ValueError):
+                valid = False
     else:
         valid = False
         extra_paths = []

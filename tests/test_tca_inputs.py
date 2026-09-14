@@ -171,7 +171,7 @@ def test_compact_tca_history_preserves_bars_adv_profiles_and_resumes(tmp_path, m
         monkeypatch.setattr(orchestration, name, lambda *args: {})
     for name in ("_git_head", "_git_tree"):
         monkeypatch.setattr(orchestration, name, lambda: "fixture")
-    monkeypatch.setattr(orchestration, "_learned_ledger_identity", lambda *args: {})
+    monkeypatch.setattr(orchestration, "_learned_ledger_identity", lambda *args, **kwargs: {})
 
     def forbidden(*args):
         raise AssertionError("TCA must not load the entire corpus")

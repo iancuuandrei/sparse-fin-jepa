@@ -75,12 +75,23 @@ def _stage_config(tmp_path: Path, source: Path) -> SimpleNamespace:
 
 
 def _publish_synthetic_forecasts(
-    config: SimpleNamespace, bars: pd.DataFrame, training_cutoff: date, session_date: date
+    config: SimpleNamespace,
+    bars: pd.DataFrame,
+    training_cutoff: date,
+    session_date: date,
+    *,
+    forecast_root: Path | None = None,
+    producer_source: dict[str, str] | None = None,
 ) -> None:
+    root = forecast_root or config.artifact_root
+    producer = producer_source or {
+        "commit": orchestration._git_head(),
+        "tree": orchestration._git_tree(),
+    }
     base, origins, baseline, history_shape = _forecast_inputs(
         bars, training_cutoff=training_cutoff, session_date=session_date
     )
-    base_directory = config.artifact_root / "evaluation-v2" / "bases" / "fold-1"
+    base_directory = root / "evaluation-v2" / "bases" / "fold-1"
     base_scale = base.scale.copy()
     base_scale["fold_id"] = "fold-1"
     base_scale = base_scale.assign(__evaluation_target=base.scale_target)
@@ -95,7 +106,14 @@ def _publish_synthetic_forecasts(
         ("raw", 1.0, 1.0),
         ("untrained_neural", 0.97, 0.85),
     ):
-        identity = orchestration._learned_ledger_identity(config, "fold-1", method, None)
+        identity = orchestration._learned_ledger_identity(
+            config,
+            "fold-1",
+            method,
+            None,
+            forecast_root=root,
+            producer_source=producer,
+        )
         totals = baseline * total_factor
         predicted_chunks = []
         offset = 0
@@ -130,9 +148,7 @@ def _publish_synthetic_forecasts(
         ].copy()
         scale["fold_id"] = "fold-1"
         scale["predicted_remaining_volume"] = totals
-        directory = (
-            config.artifact_root / "evaluation-v2" / "forecasts" / "fold-1" / method / "shared"
-        )
+        directory = root / "evaluation-v2" / "forecasts" / "fold-1" / method / "shared"
         publish_frames(
             directory,
             identity=identity,
@@ -226,3 +242,133 @@ def test_tca_stage_runs_real_preflight_ewma_providers_replay_and_merge(tmp_path,
         "untrained_neural",
     ]
     assert set(shard_manifest["identity"]["ewma_ledgers"]) == {"instrument-contract"}
+
+
+def test_tca_stage_inherits_forecast_inputs_and_publishes_fresh_tca(tmp_path, monkeypatch):
+    """Reuse a sealed forecast tree while writing only a current TCA tree."""
+    bars = _market_bars()
+    source = tmp_path / "source" / "bars.parquet"
+    source.parent.mkdir(parents=True)
+    bars.to_parquet(source, index=False)
+    session_dates = sorted(pd.to_datetime(bars["timestamp"]).dt.date.unique())
+    training_cutoff, session_date = session_dates[-2:]
+    config = _stage_config(tmp_path, source)
+    _write_stage_identity_inputs(config)
+
+    inherited_root = tmp_path / "inherited-source-a"
+    inherited_source = {"commit": "source-a-commit", "tree": "source-a-tree"}
+    _publish_synthetic_forecasts(
+        config,
+        bars,
+        training_cutoff,
+        session_date,
+        forecast_root=inherited_root,
+        producer_source=inherited_source,
+    )
+    freeze_hash = file_sha256(config.artifact_root / "selection" / "parameter-freeze-v1.json")
+    inherited_profiles = compact_profile_corpus(
+        source,
+        inherited_root / "evaluation-v2" / "profile-corpus",
+        identity={
+            "source_commit": inherited_source["commit"],
+            "source_tree": inherited_source["tree"],
+            "paper_config_hash": config.config_hash,
+            "parameter_freeze_sha256": freeze_hash,
+        },
+    )
+    run_ewma_work(
+        EWMAWork(
+            inherited_root / "evaluation-v2" / "bases" / "fold-1",
+            inherited_profiles["instrument-contract"],
+            inherited_root
+            / "evaluation-v2"
+            / "forecasts"
+            / "fold-1"
+            / "ewma"
+            / instrument_key("instrument-contract"),
+            "instrument-contract",
+            {
+                "source_commit": inherited_source["commit"],
+                "source_tree": inherited_source["tree"],
+                "paper_config_hash": config.config_hash,
+                "parameter_freeze_sha256": freeze_hash,
+                "fold_id": "fold-1",
+            },
+        )
+    )
+
+    old_bytes = {
+        path.relative_to(inherited_root).as_posix(): file_sha256(path)
+        for path in inherited_root.rglob("*")
+        if path.is_file()
+    }
+    current_source = {"commit": orchestration._git_head(), "tree": orchestration._git_tree()}
+
+    def inherited_stage_root(_config, stage):
+        return inherited_root if stage == "forecast" else config.artifact_root
+
+    def inherited_stage_source(_config, stage, *, source_commit, source_tree):
+        return (
+            inherited_source
+            if stage == "forecast"
+            else {
+                "commit": source_commit,
+                "tree": source_tree,
+            }
+        )
+
+    # The resolver is the only routing seam replaced here; preflight, providers,
+    # replay, and result merge all execute through their production implementations.
+    monkeypatch.setattr(orchestration, "stage_input_root", inherited_stage_root)
+    monkeypatch.setattr(orchestration, "stage_source", inherited_stage_source)
+    monkeypatch.setattr(orchestration, "_require_parameter_freeze", lambda _config: {})
+    monkeypatch.setattr(orchestration, "_require_locked_test_opened", lambda _config: {})
+    monkeypatch.setenv("EXECSIM_EVALUATION_WORKERS", "1")
+
+    result = orchestration.run_tca_stage(config, full_run_cli_enabled=True, runtime_approval=None)
+
+    new_bytes = {
+        path.relative_to(inherited_root).as_posix(): file_sha256(path)
+        for path in inherited_root.rglob("*")
+        if path.is_file()
+    }
+    assert new_bytes == old_bytes
+    assert not (config.artifact_root / "evaluation-v2" / "forecasts").exists()
+
+    tca_root = config.artifact_root / "tca"
+    tca_manifest = read_json(tca_root / "manifest.json")
+    assert tca_manifest["evaluation_identity"]["source_commit"] == current_source["commit"]
+    assert tca_manifest["evaluation_identity"]["source_tree"] == current_source["tree"]
+    market_manifest = read_json(
+        config.artifact_root / "evaluation-v2" / "tca-market" / "manifest.json"
+    )
+    assert market_manifest["identity"]["source_commit"] == current_source["commit"]
+    assert market_manifest["identity"]["source_tree"] == current_source["tree"]
+
+    shard_manifest = read_json(
+        config.artifact_root
+        / "evaluation-v2"
+        / "tca-shards"
+        / "fold-1"
+        / session_date.isoformat()
+        / "manifest.json"
+    )
+    shard_identity = shard_manifest["identity"]
+    assert shard_identity["source_commit"] == current_source["commit"]
+    assert shard_identity["source_tree"] == current_source["tree"]
+    assert {entry["source_commit"] for entry in shard_identity["ledgers"]} == {
+        inherited_source["commit"]
+    }
+    assert {entry["source_tree"] for entry in shard_identity["ledgers"]} == {
+        inherited_source["tree"]
+    }
+    assert {entry["source_commit"] for entry in shard_identity["ewma_ledgers"].values()} == {
+        inherited_source["commit"]
+    }
+    assert {entry["source_tree"] for entry in shard_identity["ewma_ledgers"].values()} == {
+        inherited_source["tree"]
+    }
+
+    main = pd.read_parquet(result["main"])
+    assert set(main["method"]) == {"ewma", "lightgbm_raw", "raw_untrained_neural"}
+    assert len(main) == 3

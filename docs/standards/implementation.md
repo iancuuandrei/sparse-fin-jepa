@@ -328,3 +328,14 @@ the dictionary fallback for general requests. Keep all validation and numerical
 gates in their original order. Benchmark bounded workloads before retaining a
 fast path; do not extrapolate historical completion from synthetic timings.
 See ADR 0031. Scientific configuration and result provenance remain unchanged.
+
+### 2026-09-14 — numerical acceptance and explicit stage inheritance
+
+Separate original-share-unit solver feasibility from the fixed integer rounding
+epsilon. Preserve exact integer totals and capacities, use exact unique-point
+reductions, and retain numerical failure context across worker processes.
+The specifically authorized recovery may inherit only completed forecast and
+representation stages through a typed, manifest-derived checksum inventory.
+Record their original producer sources; write TCA, reports, and final freeze
+only under the replacement execution. See ADRs 0034 and 0035. No scientific
+configuration, trained artifact, population, or estimator is changed.

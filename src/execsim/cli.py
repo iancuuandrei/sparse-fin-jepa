@@ -102,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
         "evaluate-forecast",
         "evaluate-representation",
         "prepare-evaluation-supersession",
+        "prepare-evaluation-stage-inheritance",
         "reseal-evaluation",
         "run-tca",
         "report",
@@ -122,9 +123,20 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--representation-root", type=Path, default=None)
         if command_name == "reseal-evaluation":
             command.add_argument("--supersession-receipt", type=Path, required=True)
-        if command_name == "prepare-evaluation-supersession":
+            command.add_argument("--stage-inheritance-receipt", type=Path, default=None)
+        if command_name in {
+            "prepare-evaluation-supersession",
+            "prepare-evaluation-stage-inheritance",
+        }:
             command.add_argument("--superseded-execution", type=Path, required=True)
-            command.add_argument("--supersession-output", type=Path, required=True)
+            command.add_argument(
+                "--inheritance-output"
+                if command_name == "prepare-evaluation-stage-inheritance"
+                else "--supersession-output",
+                dest="supersession_output",
+                type=Path,
+                required=True,
+            )
             command.add_argument("--reason", required=True)
         command.add_argument(
             "--paper-artifact-root",
@@ -527,19 +539,28 @@ def _execute_paper_command(
     args: argparse.Namespace, config: Any, runtime_approval: Any
 ) -> dict[str, object] | None:
     """Execute bounded paper operations after the command-level safety checks."""
-    if args.paper_command == "prepare-evaluation-supersession":
+    if args.paper_command in {
+        "prepare-evaluation-supersession",
+        "prepare-evaluation-stage-inheritance",
+    }:
         from execsim.ml.paper.evaluation_execution import write_evaluation_supersession_receipt
         from execsim.ml.paper.orchestration import (
             _git_head,
             _git_tracked_worktree_clean,
             _git_tree,
         )
+        from execsim.ml.paper.stage_inheritance import write_stage_inheritance_receipt
 
         if not _git_tracked_worktree_clean():
             raise RuntimeError(
                 "BLOCKED: supersession receipts require a clean committed evaluator source."
             )
-        return write_evaluation_supersession_receipt(
+        writer = (
+            write_stage_inheritance_receipt
+            if args.paper_command == "prepare-evaluation-stage-inheritance"
+            else write_evaluation_supersession_receipt
+        )
+        return writer(
             config,
             superseded_execution=args.superseded_execution,
             output=args.supersession_output,
@@ -563,6 +584,7 @@ def _execute_paper_command(
             source_commit=_git_head(),
             source_tree=_git_tree(),
             supersession=args.supersession_receipt,
+            inheritance=args.stage_inheritance_receipt,
         )
     if args.paper_command == "run":
         from execsim.ml.paper.orchestration import run_authorized_stages

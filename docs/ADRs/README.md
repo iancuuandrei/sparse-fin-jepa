@@ -81,6 +81,14 @@ ADR [0033](0033-canonical-transfer-member-identities.md) is accepted: reject
 noncanonical transfer-member aliases and symbolic links in member components,
 while preserving operator-selected roots and exact frozen configuration checks.
 
+ADR [0034](0034-separate-solver-acceptance-from-integer-rounding.md) is accepted:
+validate solver output in share units independently of integer rounding, and
+return unique feasible points exactly.
+
+ADR [0035](0035-inherit-completed-evaluation-stages-explicitly.md) is accepted:
+permit only typed, checksum-bound forecast and representation inheritance while
+keeping TCA, reporting, and final freeze in a fresh source-bound namespace.
+
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 
 Do not rewrite an accepted decision to hide its history. Add a new ADR that supersedes it, then update the old record's status and link to the replacement. Update `docs/standards/implementation.md` in the same change when the decision changes the active direction.

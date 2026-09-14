@@ -59,6 +59,28 @@ Every term in `P` is positive semidefinite when inputs are valid. The implementa
 
 Continuous `q` is clipped to numerical bounds, floored, and the residual `Q_f-sum floor(q)` is allocated to eligible buckets in descending fractional-remainder order with ascending bucket index as the tie-break. The projection is valid only if its result is non-negative, within integer capacities, and sums exactly to `Q_f`.
 
+Before clipping, the solver boundary checks finite raw quantities in original
+share units. With `s=max(abs(sum(q)), max(abs(q)), Q_f)`, the deliberately explicit
+acceptance budget is `tau=eps_abs+eps_rel*s`. Both the completion residual and
+each lower/upper box violation must be within `tau`; completion uses `rtol=0`.
+This application check remains required when OSQP uses scaled termination.
+Only admissible box violations are clipped. Clipping several components can
+accumulate a total residual; deterministic integer reconciliation still enforces
+the exact target. The independent QP rounding epsilon remains `1e-5`, not `tau`.
+Epsilon-only excess promotions are undone from the smallest fractional remainder;
+the direct projector still rejects a strict floor exceeding the target. If
+accepted lower-bound clipping itself creates that excess, the sanitizer first
+uses `z_i=max(clipped_i-lambda, 0)` with `sum(z)=Q_f`. This is the unique
+Euclidean projection onto the target-sum nonnegative simplex; it only decreases
+components and therefore preserves upper capacities. It is used exclusively on
+the previously failing strict-floor branch, leaving successful allocations intact.
+
+If `Q_f=0`, the exact vector is zero. If `Q_f=sum(c)`, the exact vector is `c`.
+If there is one bucket, its exact value is `Q_f`. These unique feasible sets do
+not require OSQP, regardless of the objective coefficients. Exact-path diagnostics
+record zero solver iterations. See ADR 0034 and the
+[OSQP convergence contract](https://osqp.org/docs/solver/index.html#convergence).
+
 ## Classical constant-parameter reference
 
 For the simplified objective

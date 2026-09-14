@@ -454,6 +454,7 @@ def run_tca_work(work: TCAWork) -> Path:
         providers[name] = learned
     config = work.tca_config
     options: dict[str, Any] = dict(
+        fold_id=str(work.identity["fold_id"]),
         required_methods=tuple(providers),
         start=str(config["window"][0]),
         end=str(config["window"][1]),

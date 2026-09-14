@@ -138,6 +138,15 @@ def build_parser() -> argparse.ArgumentParser:
                 required=True,
             )
             command.add_argument("--reason", required=True)
+            if command_name == "prepare-evaluation-stage-inheritance":
+                command.add_argument(
+                    "--invalidation-frontier", choices=("run-tca", "report"), default="run-tca"
+                )
+                command.add_argument(
+                    "--expected-tca-inventory",
+                    type=Path,
+                    help="Report-only recovery: audited JSON mapping fold IDs to exact TCA dates.",
+                )
         command.add_argument(
             "--paper-artifact-root",
             type=Path,
@@ -567,6 +576,18 @@ def _execute_paper_command(
             replacement_source_commit=_git_head(),
             replacement_source_tree=_git_tree(),
             reason=args.reason,
+            **(
+                {
+                    "invalidation_frontier": args.invalidation_frontier,
+                    "expected_tca_dates": (
+                        json.loads(args.expected_tca_inventory.read_text(encoding="utf-8"))
+                        if args.expected_tca_inventory is not None
+                        else None
+                    ),
+                }
+                if args.paper_command == "prepare-evaluation-stage-inheritance"
+                else {}
+            ),
         )
     if args.paper_command == "reseal-evaluation":
         from execsim.ml.paper.evaluation_execution import seal_evaluation_execution

@@ -3669,7 +3669,7 @@ def _write_or_verify_timestamped_receipt(
 
 def _verify_final_stage_manifests(config: PaperRunConfig) -> None:
     """Cross-check aggregate stage receipts against their canonical merged outputs."""
-    root = evaluation_root(config)
+    root = stage_input_root(config, "tca")
     representation_input_root = stage_input_root(config, "representation")
     representation = read_json(
         representation_input_root / "evaluation/representation-evaluation-manifest.json"
@@ -3688,9 +3688,10 @@ def _verify_final_stage_manifests(config: PaperRunConfig) -> None:
             representation_input_root / f"evaluation/{name}.parquet"
         ):
             raise ValueError("Final representation manifest output checksum mismatch.")
+    tca_source = stage_source(config, "tca", source_commit=_git_head(), source_tree=_git_tree())
     expected_identity = {
-        "source_commit": _git_head(),
-        "source_tree": _git_tree(),
+        "source_commit": tca_source["commit"],
+        "source_tree": tca_source["tree"],
         "paper_config_hash": config.config_hash,
         "parameter_freeze_sha256": file_sha256(
             config.artifact_root / "selection/parameter-freeze-v1.json"
@@ -3723,7 +3724,7 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
         "forecast_evaluation": stage_input_root(config, "forecast")
         / "evaluation"
         / "forecast-results.manifest.json",
-        "tca": evaluation_root(config) / "tca" / "manifest.json",
+        "tca": stage_input_root(config, "tca") / "tca" / "manifest.json",
         "report_provenance": evaluation_report_root(config)
         / config.paper_run_id
         / "provenance.json",

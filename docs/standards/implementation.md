@@ -355,3 +355,11 @@ semantics for direct producers. Record immediate execution succession separately
 from original stage authorship and verify the ancestor receipt and exact stage
 inventory. Reports and final freezes resolve original producer bytes without
 copying or relabeling them. The frontier remains TCA. See ADR 0037.
+
+### 2026-09-14 — complete serialization and report-only recovery
+
+Serialize all historical table rows using a scoped Styler element limit. For
+the explicitly authorized report-only recovery, inheritance v3 and execution v5
+bind completed TCA shards and merges in addition to the original forecast and
+representation producers. Only report and final freeze run under the replacement
+source. Preserve older schema semantics and every ancestor byte. See ADR 0038.

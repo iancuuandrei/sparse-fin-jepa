@@ -97,6 +97,10 @@ ADR [0037](0037-chain-inherited-stage-producers.md) is accepted:
 retain immediate execution succession separately from original stage authorship
 across multiple checksum-bound inheritance generations.
 
+ADR [0038](0038-inherit-completed-tca-for-report-only-recovery.md) is accepted:
+serialize complete report tables and preserve completed TCA through explicit
+report-only inheritance v3 and execution v5.
+
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 
 Do not rewrite an accepted decision to hide its history. Add a new ADR that supersedes it, then update the old record's status and link to the replacement. Update `docs/standards/implementation.md` in the same change when the decision changes the active direction.

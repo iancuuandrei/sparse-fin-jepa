@@ -1,4 +1,4 @@
-# Sparse Fin-JEPA / ExecSim
+# Sparse Fin-JEPA
 
 Research code for **Do Sparse JEPAs Simplify Intraday Market Dynamics?** The
 `sparse-jepa-v2` historical experiment completed and its results were frozen on
@@ -33,9 +33,15 @@ them by default for a fresh checkout.
 
 ## Execution research framework
 
-ExecSim is an offline, single-asset quantitative research framework for comparing intraday parent-order execution policies. It provides causal volume forecasts, static and adaptive policies, a transparent spread-and-impact model, constrained optimization, transaction-cost analysis (TCA), reproducible experiments, and leakage-safe ML infrastructure.
+Sparse Fin-JEPA uses **ExecSim**, the underlying offline execution-research engine,
+to compare intraday parent-order execution policies. The engine provides causal
+volume forecasts, static and adaptive policies, a transparent spread-and-impact
+model, constrained optimization, transaction-cost analysis (TCA), reproducible
+experiments, and point-in-time ML infrastructure.
 
-ExecSim is educational research software. It is not a live trading system, broker, order router, alpha model, or claim of production readiness.
+The project is research software, not a live trading system, broker, order router,
+alpha model, or claim of production readiness. The package and CLI retain the
+technical name `execsim`; commands and imports below deliberately use that name.
 
 ## Install the project
 

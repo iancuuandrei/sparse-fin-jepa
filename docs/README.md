@@ -4,6 +4,18 @@ Start with the completed experiment, then follow the scientific or engineering
 references needed for your task. Operational procedures are not instructions to
 restart the completed study.
 
+## Project and engine names
+
+**Sparse Fin-JEPA** names the research project and repository. **ExecSim** names
+the underlying execution engine. The Python package, CLI, source directory, and
+environment-variable prefix remain `execsim`, `src/execsim`, and `EXECSIM_*`.
+Do not substitute the project name into executable commands or artifact paths.
+
+Accepted ADRs and frozen specifications retain their original wording, including
+the former project name. Those records are historical or checksum-bound evidence;
+they are not renamed retroactively for branding. An ExecSim reference in them
+does not mean the current project is unfinished or a different experiment.
+
 ## Understand the research
 
 - [Experiment results and provenance](EXPERIMENT_RESULTS.md): completion, frozen identities, confirmatory results, and limitations.

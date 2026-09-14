@@ -4,6 +4,9 @@ ExecSim uses a small manifest-backed navigation system rather than Nx. The repos
 
 ## Start here
 
+- Reader-oriented documentation index: [Documentation guide](README.md)
+- Completed historical experiment, results, and artifact identities: [Experiment record](EXPERIMENT_RESULTS.md)
+
 - Implementation directions and writing standard: `docs/standards/implementation.md`
 - Architectural decisions and rationale: `docs/ADRs/README.md`
 - Normative implementation behavior and invariants: `docs/SPECIFICATIONS.md`

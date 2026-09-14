@@ -10,7 +10,12 @@ V1 includes canonical minute bars, deterministic scenarios, point-in-time volume
 
 The framework treats optimization as the decision layer. ML may forecast volume inputs but does not directly choose unconstrained trades. Historical model fitting and predictive-performance claims are outside this acceptance run.
 
-The optional sparse predictive-representation paper layer supplies a locked, fixture-qualified research protocol. It does not expand the system into live trading, direct learned execution, or an empirical performance claim. Licensed acquisition and historical training remain separately authorized actions.
+The optional sparse predictive-representation paper layer supplies the frozen
+`sparse-jepa-v2` protocol. Its separately authorized historical experiment is
+complete; the [experiment record](EXPERIMENT_RESULTS.md) distinguishes its mixed
+empirical results from software qualification. It does not expand the system
+into live trading or direct learned execution. Licensed acquisition and
+historical training remain separately authorized actions.
 
 ## Non-goals
 

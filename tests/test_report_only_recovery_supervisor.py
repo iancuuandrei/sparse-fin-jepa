@@ -5,14 +5,15 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import tempfile
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from test_recovery_supervisor import TestRecoverySupervisor as _LegacyRecoverySupervisor
 
 SUPERVISOR_PATH = Path(__file__).parents[1] / "scripts" / "recovery_evaluation_supervisor.py"
 SPEC = importlib.util.spec_from_file_location("report_only_recovery_supervisor", SUPERVISOR_PATH)
@@ -54,6 +55,28 @@ def _receipt_fixture(tmp_path: Path) -> tuple[SimpleNamespace, dict[str, Any], P
         "superseded_execution_receipt_sha256": "c" * 64,
     }
     return config, execution, inheritance_path
+
+
+def _report_only_preflight(
+    _args: argparse.Namespace,
+    *,
+    lineage_validated: bool = True,
+    missing: str | None = None,
+) -> dict[str, Any]:
+    """Build the complete production preflight identity used by dispatch tests."""
+    identity: dict[str, Any] = {
+        "execution_schema": SUPERVISOR.REPORT_ONLY_EXECUTION_SCHEMA,
+        "execution_sha256": "e" * 64,
+        "approval_id": "fixture-approval",
+        "approval_sha256": "a" * 64,
+        "inherited_validated": list(SUPERVISOR.REPORT_ONLY_INHERITED_STAGES),
+        "invalidation_frontier": SUPERVISOR.REPORT_ONLY_INVALIDATION_FRONTIER,
+        "recovery_stages": list(SUPERVISOR.REPORT_ONLY_STAGES),
+        "lineage_validated": lineage_validated,
+    }
+    if missing is not None:
+        identity.pop(missing)
+    return identity
 
 
 def test_v5_report_only_preflight_uses_native_verification_and_lineage(tmp_path: Path) -> None:
@@ -167,48 +190,11 @@ def test_v5_report_only_rejects_incompatible_execution_identity(
 
 class TestReportOnlyDispatch:
     def setup_method(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
-        self.source = root / "source"
-        self.artifact_root = root / "artifacts"
-        self.evaluation_root = self.artifact_root / "evaluation-executions" / "replacement"
-        self.runtime_root = root / "runtime"
-        self.data_root = root / "data"
-        self.representation_root = self.artifact_root / "representations"
-        self.config = self.source / "configs" / "paper" / "sparse_jepa_v2" / "data.yaml"
-        self.approval = self.runtime_root / "paper-approvals" / "evaluation.json"
-        for path in (
-            self.source,
-            self.config.parent,
-            self.artifact_root,
-            self.evaluation_root,
-            self.runtime_root,
-            self.runtime_root / "paper-approvals",
-            self.data_root,
-            self.representation_root,
-        ):
-            path.mkdir(parents=True, exist_ok=True)
-        self.config.write_text("fixture only\n", encoding="utf-8")
-        self.approval.write_text("fixture only\n", encoding="utf-8")
-        self.args = argparse.Namespace(
-            command="run",
-            report_only=True,
-            source=self.source,
-            commit="c" * 40,
-            tree="t" * 40,
-            artifact_root=self.artifact_root,
-            data_root=self.data_root,
-            representation_root=self.representation_root,
-            evaluation_root=self.evaluation_root,
-            runtime_root=self.runtime_root,
-            approval=self.approval,
-            config=self.config,
-            operational_workers=3,
-            status_path=None,
-        )
+        _LegacyRecoverySupervisor.setup_method(self)
+        self.args.report_only = True
 
     def teardown_method(self) -> None:
-        self.temp.cleanup()
+        _LegacyRecoverySupervisor.teardown_method(self)
 
     @contextmanager
     def unlocked(self, _runtime_root: Path):
@@ -225,17 +211,7 @@ class TestReportOnlyDispatch:
             next_pid += 1
             return process
 
-        def preflight(_args: argparse.Namespace) -> dict[str, Any]:
-            return {
-                "execution_schema": SUPERVISOR.REPORT_ONLY_EXECUTION_SCHEMA,
-                "execution_sha256": "e" * 64,
-                "approval_id": "fixture-approval",
-                "approval_sha256": "a" * 64,
-                "inherited_validated": list(SUPERVISOR.REPORT_ONLY_INHERITED_STAGES),
-                "invalidation_frontier": SUPERVISOR.REPORT_ONLY_INVALIDATION_FRONTIER,
-                "recovery_stages": list(SUPERVISOR.REPORT_ONLY_STAGES),
-                "lineage_validated": True,
-            }
+        preflight = partial(_report_only_preflight, lineage_validated=True)
 
         supervisor = SUPERVISOR.StageSupervisor(
             self.args,
@@ -261,17 +237,7 @@ class TestReportOnlyDispatch:
             launched.append(command)
             return FakeProcess(5100)
 
-        def preflight(_args: argparse.Namespace) -> dict[str, Any]:
-            return {
-                "execution_schema": SUPERVISOR.REPORT_ONLY_EXECUTION_SCHEMA,
-                "execution_sha256": "e" * 64,
-                "approval_id": "fixture-approval",
-                "approval_sha256": "a" * 64,
-                "inherited_validated": list(SUPERVISOR.REPORT_ONLY_INHERITED_STAGES),
-                "invalidation_frontier": SUPERVISOR.REPORT_ONLY_INVALIDATION_FRONTIER,
-                "recovery_stages": list(SUPERVISOR.REPORT_ONLY_STAGES),
-                "lineage_validated": False,
-            }
+        preflight = partial(_report_only_preflight, lineage_validated=False)
 
         supervisor = SUPERVISOR.StageSupervisor(
             self.args,
@@ -296,17 +262,7 @@ class TestReportOnlyDispatch:
 
         self.args.report_only = False
 
-        def preflight(_args: argparse.Namespace) -> dict[str, Any]:
-            return {
-                "execution_schema": SUPERVISOR.REPORT_ONLY_EXECUTION_SCHEMA,
-                "execution_sha256": "e" * 64,
-                "approval_id": "fixture-approval",
-                "approval_sha256": "a" * 64,
-                "inherited_validated": list(SUPERVISOR.REPORT_ONLY_INHERITED_STAGES),
-                "invalidation_frontier": SUPERVISOR.REPORT_ONLY_INVALIDATION_FRONTIER,
-                "recovery_stages": list(SUPERVISOR.REPORT_ONLY_STAGES),
-                "lineage_validated": True,
-            }
+        preflight = partial(_report_only_preflight, lineage_validated=True)
 
         supervisor = SUPERVISOR.StageSupervisor(
             self.args,
@@ -334,19 +290,7 @@ class TestReportOnlyDispatch:
             launched.append(command)
             return FakeProcess(5300)
 
-        def preflight(_args: argparse.Namespace) -> dict[str, Any]:
-            identity: dict[str, Any] = {
-                "execution_schema": SUPERVISOR.REPORT_ONLY_EXECUTION_SCHEMA,
-                "execution_sha256": "e" * 64,
-                "approval_id": "fixture-approval",
-                "approval_sha256": "a" * 64,
-                "inherited_validated": list(SUPERVISOR.REPORT_ONLY_INHERITED_STAGES),
-                "invalidation_frontier": SUPERVISOR.REPORT_ONLY_INVALIDATION_FRONTIER,
-                "recovery_stages": list(SUPERVISOR.REPORT_ONLY_STAGES),
-                "lineage_validated": True,
-            }
-            identity.pop(missing)
-            return identity
+        preflight = partial(_report_only_preflight, missing=missing)
 
         supervisor = SUPERVISOR.StageSupervisor(
             self.args,

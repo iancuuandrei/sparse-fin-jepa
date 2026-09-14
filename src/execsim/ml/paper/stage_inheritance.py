@@ -1031,16 +1031,8 @@ def _normalize_expected_tca_dates(config: Any, expected: object) -> dict[str, li
     return normalized
 
 
-def _validate_report_receipt(
-    config: Any,
-    receipt_path: Path,
-    payload: Mapping[str, Any],
-    *,
-    replacement_source: dict[str, str] | None = None,
-    expected_predecessor: tuple[str, str] | None = None,
-) -> tuple[dict[str, Any], dict[Path, tuple[int, int, int, int]]]:
-    """Validate the report-only v3 chain and return its complete byte states."""
-    root = _artifact_root(config)
+def _validate_receipt_creation(payload: Mapping[str, Any]) -> None:
+    """Require a reason and timezone-aware creation clock for every generation."""
     created_at = payload.get("created_at_utc")
     if not _nonempty(payload.get("reason")) or not _nonempty(created_at):
         raise ValueError("Stage inheritance receipt reason or creation time is incomplete.")
@@ -1051,6 +1043,40 @@ def _validate_report_receipt(
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         raise ValueError("Stage inheritance receipt creation time must be timezone-aware.")
 
+
+def _validate_receipt_sources(
+    payload: Mapping[str, Any],
+    predecessor: Mapping[str, Any],
+    replacement_source: dict[str, str] | None,
+    expected_predecessor: tuple[str, str] | None,
+) -> dict[str, str]:
+    """Bind original and replacement sources without conflating their roles."""
+    source = _source(payload.get("superseded_evaluation_source"), label="Superseded")
+    if source != _source(predecessor.get("evaluation_source"), label="Predecessor"):
+        raise ValueError("Stage inheritance predecessor source identity mismatch.")
+    replacement = _source(payload.get("replacement_evaluation_source"), label="Replacement")
+    if replacement_source is not None and replacement != replacement_source:
+        raise ValueError("Stage inheritance replacement evaluator identity mismatch.")
+    actual_predecessor = (
+        payload.get("superseded_execution_namespace"),
+        str(payload.get("superseded_execution_receipt_sha256")),
+    )
+    if expected_predecessor is not None and actual_predecessor != expected_predecessor:
+        raise ValueError("Stage inheritance predecessor does not match supersession receipt.")
+    return source
+
+
+def _validate_report_receipt(
+    config: Any,
+    receipt_path: Path,
+    payload: Mapping[str, Any],
+    *,
+    replacement_source: dict[str, str] | None = None,
+    expected_predecessor: tuple[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[Path, tuple[int, int, int, int]]]:
+    """Validate the report-only v3 chain and return its complete byte states."""
+    root = _artifact_root(config)
+    _validate_receipt_creation(payload)
     freeze_sha, opened_sha, root_source, config_hash = _current_metadata(config)
     if (
         payload.get("protocol_id") != "sparse-jepa-v2"
@@ -1082,17 +1108,9 @@ def _validate_report_receipt(
     ):
         raise ValueError("Report-only predecessor does not have the TCA-restart contract.")
 
-    source = _source(payload.get("superseded_evaluation_source"), label="Superseded")
-    if source != _source(predecessor.get("evaluation_source"), label="Predecessor"):
-        raise ValueError("Stage inheritance predecessor source identity mismatch.")
-    replacement = _source(payload.get("replacement_evaluation_source"), label="Replacement")
-    if replacement_source is not None and replacement != replacement_source:
-        raise ValueError("Stage inheritance replacement evaluator identity mismatch.")
-    if (
-        expected_predecessor is not None
-        and (predecessor_ns, str(predecessor_sha)) != expected_predecessor
-    ):
-        raise ValueError("Stage inheritance predecessor does not match supersession receipt.")
+    source = _validate_receipt_sources(
+        payload, predecessor, replacement_source, expected_predecessor
+    )
 
     inventories = payload.get("stage_inventory")
     if not isinstance(inventories, Mapping) or set(inventories) != set(REPORT_INHERITED_STAGES):
@@ -1232,15 +1250,7 @@ def _validate_receipt(
             replacement_source=replacement_source,
             expected_predecessor=expected_predecessor,
         )
-    created_at = payload.get("created_at_utc")
-    if not _nonempty(payload.get("reason")) or not _nonempty(created_at):
-        raise ValueError("Stage inheritance receipt reason or creation time is incomplete.")
-    try:
-        timestamp = datetime.fromisoformat(str(created_at))
-    except ValueError as exc:
-        raise ValueError("Stage inheritance receipt creation time is malformed.") from exc
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("Stage inheritance receipt creation time must be timezone-aware.")
+    _validate_receipt_creation(payload)
     freeze_sha, opened_sha, root_source, config_hash = _current_metadata(config)
     if (
         payload.get("protocol_id") != "sparse-jepa-v2"
@@ -1266,17 +1276,9 @@ def _validate_receipt(
     )
     if _relative(root, namespace_path) != predecessor_ns:
         raise ValueError("Stage inheritance predecessor namespace is not canonical.")
-    source = _source(payload.get("superseded_evaluation_source"), label="Superseded")
-    if source != _source(predecessor.get("evaluation_source"), label="Predecessor"):
-        raise ValueError("Stage inheritance predecessor source identity mismatch.")
-    replacement = _source(payload.get("replacement_evaluation_source"), label="Replacement")
-    if replacement_source is not None and replacement != replacement_source:
-        raise ValueError("Stage inheritance replacement evaluator identity mismatch.")
-    if (
-        expected_predecessor is not None
-        and (predecessor_ns, str(predecessor_sha)) != expected_predecessor
-    ):
-        raise ValueError("Stage inheritance predecessor does not match supersession receipt.")
+    source = _validate_receipt_sources(
+        payload, predecessor, replacement_source, expected_predecessor
+    )
     inventories = payload.get("stage_inventory")
     if not isinstance(inventories, Mapping) or set(inventories) != set(INHERITED_STAGES):
         raise ValueError(

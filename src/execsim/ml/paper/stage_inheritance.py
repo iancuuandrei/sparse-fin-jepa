@@ -1,10 +1,13 @@
 """Typed, read-only inheritance of completed paper-evaluation stages.
 
 The stage receipt is deliberately small and explicit.  It is not a workflow
-engine: v1 can inherit the forecast and representation stages only, and the
-invalidation frontier is always ``run-tca``.  The receipt names every byte
-that is consumed from the predecessor execution so a replacement evaluator
-cannot accidentally reuse a partial TCA result or an unverified directory.
+engine: v1 and v2 can inherit the forecast and representation stages only, and
+the invalidation frontier is always ``run-tca``.  v1 binds those stages to its
+immediate predecessor.  v2 is used when that predecessor already inherited
+the stages and therefore records the immediate predecessor separately from
+the immutable stage producer.  Every receipt and artifact consumed from the
+chain remains checksum-bound; no output is copied into the replacement
+namespace.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ from typing import Any
 from execsim.data.paper.manifests import file_sha256, read_json, stable_hash, write_json_atomic
 
 SCHEMA = "paper-evaluation-stage-inheritance-v1"
+SCHEMA_V2 = "paper-evaluation-stage-inheritance-v2"
+SUPPORTED_SCHEMAS = (SCHEMA, SCHEMA_V2)
 STATUS = "STAGE_INHERITANCE_VALIDATED"
 EXECUTION_SCHEMA = {
     "paper-evaluation-execution-v2",
@@ -234,6 +239,126 @@ def _merge_identity_source(path: Path) -> dict[str, str]:
         },
         label="Merged stage",
     )
+
+
+def _execution_stage_receipt(
+    config: Any,
+    execution_path: Path,
+    execution: Mapping[str, Any],
+    *,
+    source: dict[str, str],
+) -> tuple[dict[str, Any], Path, str] | None:
+    """Verify and return an execution's stage receipt, when it has one.
+
+    A v4 execution can itself be the immediate predecessor of another
+    recovery.  Keeping this link in one helper avoids accidentally treating
+    its evaluator source as the producer of inherited stages.
+    """
+    if execution.get("schema_version") != "paper-evaluation-execution-v4":
+        return None
+    relative = execution.get("stage_inheritance_path")
+    digest = execution.get("stage_inheritance_sha256")
+    receipt_digest = execution.get("stage_inheritance_receipt_sha256")
+    if receipt_digest is not None and receipt_digest != digest:
+        raise ValueError("v4 stage-inheritance receipt aliases disagree.")
+    if not isinstance(relative, str) or not _nonempty(digest):
+        raise ValueError("v4 execution is missing its typed stage-inheritance receipt.")
+    root = _artifact_root(config)
+    receipt_path = _safe_relative(root, relative)
+    if not receipt_path.is_file() or file_sha256(receipt_path) != digest:
+        raise ValueError("v4 stage-inheritance receipt checksum mismatch.")
+    predecessor_namespace = execution.get("superseded_execution_namespace")
+    predecessor_sha = execution.get("superseded_execution_receipt_sha256")
+    if not isinstance(predecessor_namespace, str) or not isinstance(predecessor_sha, str):
+        raise ValueError("v4 execution is missing its predecessor identity.")
+    typed = verify_stage_inheritance(
+        config,
+        receipt_path,
+        replacement_source=source,
+        expected_predecessor=(predecessor_namespace, predecessor_sha),
+    )
+    return typed, receipt_path, str(digest)
+
+
+def _stage_producer_descriptor(
+    root: Path, payload: Mapping[str, Any], stage: str
+) -> tuple[str, str, dict[str, str]]:
+    """Return the immutable producer identity for one inherited stage.
+
+    v1 records intentionally retain their original fields.  v2 uses distinct
+    ``producer_*`` fields so the v1 direct-predecessor meaning is not silently
+    repurposed for a chained receipt.
+    """
+    inventories = payload.get("stage_inventory")
+    if not isinstance(inventories, Mapping):
+        raise ValueError("Stage inheritance stage inventory is incomplete.")
+    record = inventories.get(stage)
+    if not isinstance(record, Mapping):
+        raise ValueError(f"Inherited {stage} inventory is incomplete.")
+    if payload.get("schema_version") == SCHEMA:
+        namespace = record.get("source_execution_namespace")
+        source = _source(
+            {"commit": record.get("source_commit"), "tree": record.get("source_tree")},
+            label=f"Inherited {stage}",
+        )
+        receipt_sha = payload.get("superseded_execution_receipt_sha256")
+    elif payload.get("schema_version") == SCHEMA_V2:
+        namespace = record.get("producer_execution_namespace")
+        source = _source(record.get("producer_evaluation_source"), label=f"Inherited {stage}")
+        receipt_sha = record.get("producer_execution_receipt_sha256")
+    else:
+        raise ValueError("Stage inheritance receipt schema is incompatible.")
+    if not isinstance(namespace, str) or not _nonempty(namespace):
+        raise ValueError(f"Inherited {stage} producer namespace is incomplete.")
+    if not isinstance(receipt_sha, str) or not _nonempty(receipt_sha):
+        raise ValueError(f"Inherited {stage} producer receipt identity is incomplete.")
+    producer_path = _safe_relative(root, f"{namespace}/execution.json")
+    if not producer_path.is_file() or file_sha256(producer_path) != receipt_sha:
+        raise ValueError(f"Inherited {stage} producer receipt checksum mismatch.")
+    return namespace, receipt_sha, source
+
+
+def _validate_ancestor_stage_link(
+    config: Any,
+    payload: Mapping[str, Any],
+    predecessor: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path, str]:
+    """Require v2's explicit link to the immediate predecessor's receipt."""
+    if predecessor.get("schema_version") != "paper-evaluation-execution-v4":
+        raise ValueError("Chained stage inheritance requires a v4 predecessor.")
+    relative = predecessor.get("stage_inheritance_path")
+    digest = predecessor.get("stage_inheritance_sha256")
+    receipt_digest = predecessor.get("stage_inheritance_receipt_sha256")
+    if receipt_digest is not None and receipt_digest != digest:
+        raise ValueError("v4 stage-inheritance receipt aliases disagree.")
+    if not isinstance(relative, str) or not _nonempty(digest):
+        raise ValueError("Chained predecessor is missing its stage-inheritance receipt.")
+    root = _artifact_root(config)
+    expected_path = _safe_relative(root, relative)
+    if not expected_path.is_file() or file_sha256(expected_path) != digest:
+        raise ValueError("Chained predecessor stage-inheritance receipt checksum mismatch.")
+    link = payload.get("ancestor_stage_inheritance")
+    if not isinstance(link, Mapping):
+        raise ValueError("Chained stage inheritance is missing its ancestor receipt link.")
+    if (
+        link.get("path") != relative
+        or link.get("sha256") != digest
+        or not isinstance(link.get("predecessor_namespace"), str)
+        or not isinstance(link.get("predecessor_receipt_sha256"), str)
+        or link.get("predecessor_namespace") != predecessor.get("superseded_execution_namespace")
+        or link.get("predecessor_receipt_sha256")
+        != predecessor.get("superseded_execution_receipt_sha256")
+    ):
+        raise ValueError("Chained stage inheritance ancestor receipt link is inconsistent.")
+    predecessor_namespace = link["predecessor_namespace"]
+    predecessor_sha = link["predecessor_receipt_sha256"]
+    typed = verify_stage_inheritance(
+        config,
+        expected_path,
+        replacement_source=_source(predecessor.get("evaluation_source"), label="Predecessor"),
+        expected_predecessor=(predecessor_namespace, predecessor_sha),
+    )
+    return typed, expected_path, str(digest)
 
 
 def _base_instruments(path: Path) -> tuple[str, ...]:
@@ -680,7 +805,8 @@ def _validate_receipt(
     if not receipt_path.is_file() or not receipt_path.resolve().is_relative_to(root):
         raise ValueError("Stage inheritance receipt is unavailable or outside the artifact root.")
     payload = read_json(receipt_path)
-    if payload.get("schema_version") != SCHEMA or payload.get("status") != STATUS:
+    schema = payload.get("schema_version")
+    if schema not in SUPPORTED_SCHEMAS or payload.get("status") != STATUS:
         raise ValueError("Stage inheritance receipt schema/status is incompatible.")
     created_at = payload.get("created_at_utc")
     if not _nonempty(payload.get("reason")) or not _nonempty(created_at):
@@ -733,29 +859,77 @@ def _validate_receipt(
             "Stage inheritance stage inventory is incomplete or contains extra stages."
         )
     verified_crosslinks: set[Path] = set()
-    expected = {
-        "evaluate-forecast": _validate_forecast(root, namespace_path, config, source),
-        "evaluate-representation": _validate_representation(
-            root,
-            namespace_path,
-            config,
-            source,
-            verified_paths=verified_crosslinks,
-        ),
-    }
-    for stage in INHERITED_STAGES:
-        record = inventories[stage]
-        if (
-            not isinstance(record, Mapping)
-            or record.get("source_execution_namespace") != predecessor_ns
-            or record.get("source_commit") != source["commit"]
-            or record.get("source_tree") != source["tree"]
-            or record.get("files") != expected[stage]
-        ):
-            raise ValueError(f"Inherited {stage} inventory is incomplete or changed.")
-        for relative in expected[stage]:
-            path = _safe_relative(root, relative)
-            states[path] = _state(path)
+    if schema == SCHEMA:
+        # Preserve the v1 contract byte-for-byte: each stage is produced by
+        # the receipt's immediate predecessor and uses the original fields.
+        expected = {
+            "evaluate-forecast": _validate_forecast(root, namespace_path, config, source),
+            "evaluate-representation": _validate_representation(
+                root,
+                namespace_path,
+                config,
+                source,
+                verified_paths=verified_crosslinks,
+            ),
+        }
+        for stage in INHERITED_STAGES:
+            record = inventories[stage]
+            if (
+                not isinstance(record, Mapping)
+                or record.get("source_execution_namespace") != predecessor_ns
+                or record.get("source_commit") != source["commit"]
+                or record.get("source_tree") != source["tree"]
+                or record.get("files") != expected[stage]
+            ):
+                raise ValueError(f"Inherited {stage} inventory is incomplete or changed.")
+            for relative in expected[stage]:
+                path = _safe_relative(root, relative)
+                states[path] = _state(path)
+    else:
+        # v2 is only valid when the immediate predecessor is itself a typed
+        # stage-inherited v4 execution.  Its receipt link is checked in
+        # addition to v4's native execution verification, so an ancestor
+        # cannot be silently replaced by an equivalent-looking directory.
+        ancestor_payload, ancestor_path, _ancestor_sha = _validate_ancestor_stage_link(
+            config, payload, predecessor
+        )
+        states[ancestor_path] = _state(ancestor_path)
+        ancestor_cached = _CACHE.get(_cache_key(config, ancestor_path))
+        if ancestor_cached is not None:
+            states.update(ancestor_cached[1])
+        expected = {}
+        for stage in INHERITED_STAGES:
+            producer_ns, producer_sha, producer_source = _stage_producer_descriptor(
+                root, payload, stage
+            )
+            ancestor_ns, ancestor_sha, ancestor_source = _stage_producer_descriptor(
+                root, ancestor_payload, stage
+            )
+            ancestor_record = ancestor_payload["stage_inventory"][stage]
+            if (
+                producer_ns != ancestor_ns
+                or producer_sha != ancestor_sha
+                or producer_source != ancestor_source
+                or not isinstance(ancestor_record, Mapping)
+                or not isinstance(ancestor_record.get("files"), Mapping)
+            ):
+                raise ValueError(f"Inherited {stage} producer does not match its ancestor.")
+            # The ancestor verifier has already checked every manifest member
+            # and native execution receipt.  Equality to its complete record
+            # prevents a v2 receipt from selecting another valid producer.
+            expected[stage] = dict(ancestor_record["files"])
+            record = inventories[stage]
+            if (
+                not isinstance(record, Mapping)
+                or record.get("producer_execution_namespace") != producer_ns
+                or record.get("producer_execution_receipt_sha256") != producer_sha
+                or record.get("producer_evaluation_source") != producer_source
+                or record.get("files") != expected[stage]
+            ):
+                raise ValueError(f"Inherited {stage} inventory is incomplete or changed.")
+            for relative in expected[stage]:
+                path = _safe_relative(root, relative)
+                states[path] = _state(path)
     states[receipt_path] = _state(receipt_path)
     states[predecessor_receipt] = _state(predecessor_receipt)
     states.update({path: _state(path) for path in verified_crosslinks if path.is_file()})
@@ -763,6 +937,7 @@ def _validate_receipt(
 
 
 _CACHE: dict[str, tuple[dict[str, Any], dict[Path, tuple[int, int, int, int]]]] = {}
+_VALIDATION_STACK: set[Path] = set()
 
 
 def _cache_key(config: Any, receipt: Path) -> str:
@@ -788,6 +963,9 @@ def verify_stage_inheritance(
     expected_predecessor: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Verify a typed receipt and every inherited manifest member/checksum."""
+    receipt = Path(receipt).resolve()
+    if receipt in _VALIDATION_STACK:
+        raise ValueError("Stage inheritance receipt ancestry contains a cycle.")
     key = _cache_key(config, receipt)
     if key in _CACHE:
         cached, states = _CACHE[key]
@@ -808,12 +986,16 @@ def verify_stage_inheritance(
                         return deepcopy(cached)
         except OSError:
             pass
-    payload, states = _validate_receipt(
-        config,
-        receipt,
-        replacement_source=replacement_source,
-        expected_predecessor=expected_predecessor,
-    )
+    _VALIDATION_STACK.add(receipt)
+    try:
+        payload, states = _validate_receipt(
+            config,
+            receipt,
+            replacement_source=replacement_source,
+            expected_predecessor=expected_predecessor,
+        )
+    finally:
+        _VALIDATION_STACK.remove(receipt)
     _CACHE[key] = (deepcopy(payload), states)
     return payload
 
@@ -872,7 +1054,9 @@ def stage_input_root(config: Any, stage: str) -> Path:
     if inherited is None or canonical not in INHERITED_STAGES:
         return current_root
     receipt, _path = inherited
-    namespace = str(receipt["superseded_execution_namespace"])
+    namespace, _receipt_sha, _source_identity = _stage_producer_descriptor(
+        _artifact_root(config), receipt, canonical
+    )
     return _safe_relative(_artifact_root(config), namespace).resolve()
 
 
@@ -888,10 +1072,10 @@ def stage_source(
     if inherited is not None and supplied != inherited[0]["replacement_evaluation_source"]:
         raise ValueError("Current evaluator identity does not match the v4 execution receipt.")
     if inherited is not None and canonical in INHERITED_STAGES:
-        return {
-            "commit": str(inherited[0]["superseded_evaluation_source"]["commit"]),
-            "tree": str(inherited[0]["superseded_evaluation_source"]["tree"]),
-        }
+        _namespace, _receipt_sha, producer_source = _stage_producer_descriptor(
+            _artifact_root(config), inherited[0], canonical
+        )
+        return producer_source
     return supplied
 
 
@@ -906,18 +1090,32 @@ def stage_provenance(config: Any, *, source_commit: str, source_tree: str) -> di
         raise ValueError("Current evaluator identity does not match the v4 execution receipt.")
     current_root = _evaluation_root(config)
     current_namespace = _relative(_artifact_root(config), current_root)
-    old_namespace = str(payload["superseded_execution_namespace"])
-    old_source = payload["superseded_evaluation_source"]
     stage_sources = {}
-    for stage in (*INHERITED_STAGES, "run-tca", "report", "final-result-freeze"):
-        inherited_stage = stage in INHERITED_STAGES
-        namespace = old_namespace if inherited_stage else current_namespace
-        source = old_source if inherited_stage else current_source
+    for stage in INHERITED_STAGES:
+        namespace, _receipt_sha, source = _stage_producer_descriptor(
+            _artifact_root(config), payload, stage
+        )
         stage_sources[stage] = {
             "execution": namespace,
             "execution_namespace": namespace,
             **source,
-            "inherited": inherited_stage,
+            "inherited": True,
+        }
+        if payload.get("schema_version") == SCHEMA_V2:
+            immediate_source = payload["superseded_evaluation_source"]
+            immediate_namespace = str(payload["superseded_execution_namespace"])
+            stage_sources[stage].update(
+                {
+                    "immediate_predecessor": immediate_namespace,
+                    "immediate_predecessor_source": immediate_source,
+                }
+            )
+    for stage in ("run-tca", "report", "final-result-freeze"):
+        stage_sources[stage] = {
+            "execution": current_namespace,
+            "execution_namespace": current_namespace,
+            **current_source,
+            "inherited": False,
         }
     digest = file_sha256(receipt_path)
     return {
@@ -943,6 +1141,24 @@ def _stage_inventory(
     namespace = _relative(root, execution_path.parent.resolve())
     if not namespace.startswith("evaluation-executions/"):
         raise ValueError("Stage inheritance predecessor must be below evaluation-executions.")
+    inherited = _execution_stage_receipt(config, execution_path, predecessor, source=source)
+    if inherited is not None:
+        inherited_payload, _ancestor_path, _ancestor_sha = inherited
+        inventories: dict[str, Any] = {}
+        for stage in INHERITED_STAGES:
+            producer_ns, producer_sha, producer_source = _stage_producer_descriptor(
+                root, inherited_payload, stage
+            )
+            record = inherited_payload["stage_inventory"][stage]
+            if not isinstance(record, Mapping) or record.get("files") is None:
+                raise ValueError(f"Inherited {stage} inventory is incomplete.")
+            inventories[stage] = {
+                "producer_execution_namespace": producer_ns,
+                "producer_execution_receipt_sha256": producer_sha,
+                "producer_evaluation_source": producer_source,
+                "files": record["files"],
+            }
+        return inventories, source
     forecast = _validate_forecast(root, execution_path.parent.resolve(), config, source)
     representation = _validate_representation(root, execution_path.parent.resolve(), config, source)
     return {
@@ -970,7 +1186,7 @@ def write_stage_inheritance_receipt(
     replacement_source_tree: str,
     reason: str,
 ) -> dict[str, Any]:
-    """Write an immutable v1 receipt for forecast/representation inheritance."""
+    """Write an immutable typed receipt for forecast/representation inheritance."""
     root = _artifact_root(config)
     if not output.resolve().is_relative_to(root):
         raise ValueError("Stage inheritance receipt must remain inside the artifact root.")
@@ -1003,8 +1219,10 @@ def write_stage_inheritance_receipt(
         raise ValueError("Stage inheritance predecessor configuration/freeze mismatch.")
     _validate_predecessor(config, execution_path, file_sha256(execution_path))
     inventories, source = _stage_inventory(config, execution_path)
+    predecessor_stage = _execution_stage_receipt(config, execution_path, predecessor, source=source)
+    schema = SCHEMA_V2 if predecessor_stage is not None else SCHEMA
     payload: dict[str, Any] = {
-        "schema_version": SCHEMA,
+        "schema_version": schema,
         "status": STATUS,
         "protocol_id": "sparse-jepa-v2",
         "paper_config_hash": config_hash,
@@ -1025,6 +1243,18 @@ def write_stage_inheritance_receipt(
         "reason": reason,
         "created_at_utc": datetime.now(UTC).isoformat(),
     }
+    if predecessor_stage is not None:
+        _ancestor_payload, ancestor_path, ancestor_sha = predecessor_stage
+        ancestor_namespace = predecessor.get("superseded_execution_namespace")
+        ancestor_receipt_sha = predecessor.get("superseded_execution_receipt_sha256")
+        if not isinstance(ancestor_namespace, str) or not isinstance(ancestor_receipt_sha, str):
+            raise ValueError("Chained predecessor is missing its predecessor identity.")
+        payload["ancestor_stage_inheritance"] = {
+            "path": _relative(root, ancestor_path),
+            "sha256": ancestor_sha,
+            "predecessor_namespace": ancestor_namespace,
+            "predecessor_receipt_sha256": ancestor_receipt_sha,
+        }
     if output.exists():
         existing = read_json(output)
         if {key: value for key, value in existing.items() if key != "created_at_utc"} != {

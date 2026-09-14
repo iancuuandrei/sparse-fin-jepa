@@ -114,6 +114,8 @@ class SolverDiagnostics:
     integer_projection_time_seconds: float = 0.0
     workspace_reused: bool = False
     validation_level: ValidationLevel = "full"
+    coordinate_system: Literal["original", "capacity_complement"] = "original"
+    fallback_used: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,25 +251,53 @@ class OptimalExecutionWorkspace:
             problem, data.matrix, data.linear, lower_bounds, upper_bounds
         )
         did_warm_start = warm_start is not None
+        prepared_warm_start: NDArray[np.float64] | None = None
         if warm_start is not None:
             warm = np.asarray(warm_start, dtype=float)
             if warm.shape != (horizon,) or not np.all(np.isfinite(warm)):
                 raise ValueError("warm_start must be a finite vector matching the horizon.")
-            prepared = _feasible_warm_start(warm, data.capacities, data.feasible)
-            solver.warm_start(x=prepared)
+            prepared_warm_start = _feasible_warm_start(warm, data.capacities, data.feasible)
+            solver.warm_start(x=prepared_warm_start)
         elif reused:
             solver.warm_start(x=np.zeros(horizon), y=np.zeros(horizon + 1))
 
         solve_started = perf_counter()
+        coordinate_system: Literal["original", "capacity_complement"] = "original"
+        fallback_used = False
         try:
             solution = solver.solve(raise_error=True)
         except Exception as exc:
-            raise RuntimeError(
-                "Optimal execution solver failed before producing an acceptable solution: "
-                f"max_iterations={problem.max_iterations}, "
-                f"absolute_tolerance={problem.absolute_tolerance}, "
-                f"relative_tolerance={problem.relative_tolerance}."
-            ) from exc
+            if not (
+                _is_osqp_max_iterations_exception(exc) and _capacity_complement_is_smaller(data)
+            ):
+                raise RuntimeError(
+                    "Optimal execution solver failed before producing an acceptable solution: "
+                    f"max_iterations={problem.max_iterations}, "
+                    f"absolute_tolerance={problem.absolute_tolerance}, "
+                    f"relative_tolerance={problem.relative_tolerance}."
+                ) from exc
+            try:
+                solution, solver, fallback_setup_elapsed, fallback_update_elapsed = (
+                    _solve_capacity_complement(
+                        problem,
+                        data,
+                        horizon,
+                        warm_start=prepared_warm_start,
+                        validation_level=self.validation_level,
+                    )
+                )
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    "Optimal execution solver failed before producing an acceptable solution "
+                    "in both original and capacity-complement coordinates: "
+                    f"max_iterations={problem.max_iterations}, "
+                    f"absolute_tolerance={problem.absolute_tolerance}, "
+                    f"relative_tolerance={problem.relative_tolerance}."
+                ) from fallback_exc
+            setup_elapsed += fallback_setup_elapsed
+            update_elapsed += fallback_update_elapsed
+            coordinate_system = "capacity_complement"
+            fallback_used = True
         solve_elapsed = perf_counter() - solve_started
         info = solution.info
         status = str(info.status).lower()
@@ -277,7 +307,35 @@ class OptimalExecutionWorkspace:
                 f"status={info.status}, primal_residual={info.prim_res}, "
                 f"dual_residual={info.dual_res}"
             )
-        continuous = np.asarray(solution.x, dtype=float)
+        try:
+            raw_solution = np.asarray(solution.x, dtype=float)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "Optimal execution solver returned malformed or non-finite quantities."
+            ) from exc
+        if raw_solution.shape != data.capacities.shape or not np.all(np.isfinite(raw_solution)):
+            raise RuntimeError(
+                "Optimal execution solver returned malformed or non-finite quantities."
+            )
+        continuous = (
+            data.capacities.astype(float) - raw_solution
+            if coordinate_system == "capacity_complement"
+            else raw_solution
+        )
+        objective_value = float(info.obj_val)
+        dual_residual = float(info.dual_res)
+        if fallback_used:
+            # OSQP reports the complement objective, which differs by a constant.
+            # Keep the public diagnostic in the original problem's units.
+            objective_value = float(
+                0.5 * continuous @ data.matrix @ continuous + data.linear @ continuous
+            )
+            dual_residual = _validate_original_dual_residual(
+                problem,
+                data,
+                continuous,
+                solution.y,
+            )
         projection_started = perf_counter()
         try:
             sanitized = _sanitize_solver_quantities(
@@ -300,9 +358,9 @@ class OptimalExecutionWorkspace:
             status_value=int(info.status_val),
             iterations=int(info.iter),
             primal_residual=float(info.prim_res),
-            dual_residual=float(info.dual_res),
+            dual_residual=dual_residual,
             solve_time_seconds=solve_elapsed,
-            objective_value=float(info.obj_val),
+            objective_value=objective_value,
             minimum_eigenvalue=data.minimum_eigenvalue,
             warm_started=did_warm_start,
             absolute_tolerance=problem.absolute_tolerance,
@@ -312,8 +370,10 @@ class OptimalExecutionWorkspace:
             solver_update_time_seconds=update_elapsed,
             eigenvalue_validation_time_seconds=data.eigenvalue_validation_time_seconds,
             integer_projection_time_seconds=projection_elapsed,
-            workspace_reused=reused,
+            workspace_reused=reused and not fallback_used,
             validation_level=self.validation_level,
+            coordinate_system=coordinate_system,
+            fallback_used=fallback_used,
         )
         return OptimizationResult(
             continuous,
@@ -460,6 +520,101 @@ class OptimalExecutionWorkspace:
             problem.quantity - data.feasible,
             diagnostics,
         )
+
+
+_OSQP_MAX_ITERATIONS_STATUS = 7
+
+
+def _is_osqp_max_iterations_exception(exc: Exception) -> bool:
+    """Identify OSQP's status-7 exception without broad exception matching."""
+    try:
+        import osqp
+    except ImportError:  # pragma: no cover - the caller already imported OSQP
+        return False
+    if not isinstance(exc, osqp.OSQPException) or not exc.args:
+        return False
+    try:
+        return int(exc.args[0]) == _OSQP_MAX_ITERATIONS_STATUS
+    except (TypeError, ValueError):
+        return False
+
+
+def _capacity_complement_is_smaller(data: _QpData) -> bool:
+    """Return whether y=c-x has the smaller equality target."""
+    capacity_sum = int(data.capacities.sum())
+    return data.feasible > capacity_sum - data.feasible
+
+
+def _solve_capacity_complement(
+    problem: OptimalExecutionProblem,
+    data: _QpData,
+    horizon: int,
+    *,
+    warm_start: NDArray[np.float64] | None,
+    validation_level: ValidationLevel,
+) -> tuple[Any, Any, float, float]:
+    """Retry a near-saturated QP in equivalent capacity-complement coordinates."""
+    capacities = data.capacities.astype(float)
+    capacity_sum = int(data.capacities.sum())
+    complement_target = capacity_sum - data.feasible
+    if complement_target <= 0:
+        raise ValueError("Capacity complement requires a positive target.")
+    complement_linear = -(data.matrix @ capacities) - data.linear
+    lower_bounds = np.concatenate([np.zeros(horizon), [float(complement_target)]])
+    upper_bounds = np.concatenate([capacities, [float(complement_target)]])
+
+    # A fresh workspace prevents a failed ADMM iterate/rho state from affecting
+    # the retry. It is deliberately not cached as the caller's original solver.
+    workspace = OptimalExecutionWorkspace(horizon, validation_level=validation_level)
+    solver, setup_elapsed, update_elapsed, _ = workspace._configure_solver(
+        problem,
+        data.matrix,
+        complement_linear,
+        lower_bounds,
+        upper_bounds,
+    )
+    if warm_start is not None:
+        solver.warm_start(x=capacities - warm_start)
+    solution = solver.solve(raise_error=True)
+    return solution, solver, setup_elapsed, update_elapsed
+
+
+def _validate_original_dual_residual(
+    problem: OptimalExecutionProblem,
+    data: _QpData,
+    continuous: NDArray[np.float64],
+    dual: object,
+) -> float:
+    """Validate complement duals after mapping them back to original coordinates."""
+    try:
+        values = np.asarray(dual, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("Optimal execution solver returned malformed dual quantities.") from exc
+    horizon = len(continuous)
+    if values.shape != (horizon + 1,) or not np.all(np.isfinite(values)):
+        raise RuntimeError("Optimal execution solver returned malformed dual quantities.")
+    # y=c-x reverses the stationarity sign, so the original dual is -y.
+    original_dual = -values
+    with np.errstate(over="ignore", invalid="ignore"):
+        primal_gradient = data.matrix @ continuous
+        stationarity = (
+            primal_gradient + data.linear + original_dual[:horizon] + original_dual[horizon]
+        )
+    if not np.all(np.isfinite(primal_gradient)) or not np.all(np.isfinite(stationarity)):
+        raise RuntimeError("Optimal execution complement solution has a non-finite dual residual.")
+    residual = float(np.max(np.abs(stationarity)))
+    scale = max(
+        float(np.max(np.abs(primal_gradient))),
+        float(np.max(np.abs(original_dual[:horizon] + original_dual[horizon]))),
+        float(np.max(np.abs(data.linear))),
+    )
+    tolerance = problem.absolute_tolerance + problem.relative_tolerance * scale
+    if not math.isfinite(residual) or not math.isfinite(scale) or residual > tolerance:
+        raise RuntimeError(
+            "Optimal execution complement solution violates original-unit dual "
+            f"acceptance: residual={residual}, dual_tolerance={tolerance}."
+        )
+    return residual
 
 
 def _sanitize_solver_quantities(

@@ -81,6 +81,28 @@ not require OSQP, regardless of the objective coefficients. Exact-path diagnosti
 record zero solver iterations. See ADR 0034 and the
 [OSQP convergence contract](https://osqp.org/docs/solver/index.html#convergence).
 
+## Near-capacity numerical recovery
+
+After an original maximum-iteration failure, and only when
+`sum(c)-Q_f < Q_f`, one fresh OSQP attempt may use `y=c-q`.
+Its Hessian remains `P`, linear term is `-P*c-a`, box is `[0,c]`, and
+completion is `sum(y)=sum(c)-Q_f`. Substitution differs from the original
+objective only by a constant. This makes the small unused-capacity quantity
+explicit without changing the optimizer's mathematical problem.
+
+Both attempts retain the configured tolerances and iteration limit. The
+secondary solve must report solved; recover `q=c-y`, check original share-unit
+feasibility, and apply the same deterministic integer projection. No unsolved
+iterate is accepted. Successful original solves and their workspace behavior
+remain unchanged. Diagnostics distinguish coordinate form and retain the
+original objective value. See ADR 0036.
+
+The original dual vector is the negative of the complement dual. Recompute
+`r_dual=P*q+a+A^T*dual_original` after recovery and require a finite infinity
+norm no greater than `eps_abs+eps_rel*max(||P*q||, ||A^T*dual_original||, ||a||)`.
+This checks stationarity in the original objective units rather than relying
+on a differently scaled transformed termination test.
+
 ## Classical constant-parameter reference
 
 For the simplified objective

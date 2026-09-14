@@ -89,6 +89,14 @@ ADR [0035](0035-inherit-completed-evaluation-stages-explicitly.md) is accepted:
 permit only typed, checksum-bound forecast and representation inheritance while
 keeping TCA, reporting, and final freeze in a fresh source-bound namespace.
 
+ADR [0036](0036-recover-near-capacity-qp-in-complement-coordinates.md) is accepted:
+recover an iteration-limited near-capacity QP through one equivalent
+unused-capacity solve, preserving original-unit acceptance and successful paths.
+
+ADR [0037](0037-chain-inherited-stage-producers.md) is accepted:
+retain immediate execution succession separately from original stage authorship
+across multiple checksum-bound inheritance generations.
+
 Create an ADR when a change materially affects architecture, dependencies, mathematical formulation, information boundaries, artifact compatibility, or a performance design with non-obvious tradeoffs. Copy [the ADR template](0000-template.md), assign the next four-digit number, and add it to the index.
 
 Do not rewrite an accepted decision to hide its history. Add a new ADR that supersedes it, then update the old record's status and link to the replacement. Update `docs/standards/implementation.md` in the same change when the decision changes the active direction.

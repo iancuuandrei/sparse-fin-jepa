@@ -15,12 +15,68 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 SUPERVISOR_PATH = Path(__file__).parents[1] / "scripts" / "recovery_evaluation_supervisor.py"
 SPEC = importlib.util.spec_from_file_location("recovery_evaluation_supervisor", SUPERVISOR_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load supervisor module at {SUPERVISOR_PATH}")
 SUPERVISOR: ModuleType = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SUPERVISOR)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "paper-evaluation-stage-inheritance-v1",
+        "paper-evaluation-stage-inheritance-v2",
+        "unknown-stage-schema",
+    ],
+)
+def test_supervisor_requires_verified_supported_inheritance_schema(tmp_path, schema):
+    from types import SimpleNamespace
+
+    from execsim.data.paper.manifests import file_sha256
+
+    path = tmp_path / "inheritance.json"
+    path.write_text("{}", encoding="utf-8")
+    source = {"commit": "replacement", "tree": "replacement-tree"}
+    stages = list(SUPERVISOR.INHERITED_STAGES)
+    execution = {
+        "schema_version": SUPERVISOR.EXECUTION_SCHEMA,
+        "initial_completed_stages": 0,
+        "evaluation_source": source,
+        "inherited_stages": stages,
+        "invalidation_frontier": "run-tca",
+        "stage_inheritance_path": path.name,
+        "stage_inheritance_sha256": file_sha256(path),
+        "superseded_execution_namespace": "evaluation-executions/prior",
+        "superseded_execution_receipt_sha256": "prior-sha",
+    }
+    typed = {
+        "schema_version": schema,
+        "status": SUPERVISOR.INHERITANCE_STATUS,
+        "inherited_stages": stages,
+        "invalidation_frontier": "run-tca",
+        "replacement_evaluation_source": source,
+        "stage_inventory": {stage: {"files": {"producer/member": "sha"}} for stage in stages},
+    }
+    with patch(
+        "execsim.ml.paper.stage_inheritance.verify_stage_inheritance", return_value=typed
+    ) as verifier:
+        args = (SimpleNamespace(artifact_root=tmp_path), execution, tmp_path / "execution.json")
+        options = {"source_commit": source["commit"], "source_tree": source["tree"]}
+        if schema == "unknown-stage-schema":
+            with pytest.raises(ValueError, match="permitted v4 contract"):
+                SUPERVISOR._require_v4_inheritance(*args, **options)
+        else:
+            assert SUPERVISOR._require_v4_inheritance(*args, **options) == typed
+        verifier.assert_called_once_with(
+            args[0],
+            path,
+            replacement_source=source,
+            expected_predecessor=("evaluation-executions/prior", "prior-sha"),
+        )
 
 
 class FakeProcess:

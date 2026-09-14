@@ -339,3 +339,19 @@ representation stages through a typed, manifest-derived checksum inventory.
 Record their original producer sources; write TCA, reports, and final freeze
 only under the replacement execution. See ADRs 0034 and 0035. No scientific
 configuration, trained artifact, population, or estimator is changed.
+
+### 2026-09-14 — bounded near-capacity convergence recovery
+
+After a maximum-iteration failure in a near-capacity QP, permit one equivalent
+unused-capacity OSQP solve with unchanged tolerances and per-attempt settings.
+Require solved status and original-unit acceptance; never accept the failed
+iterate. Successful original solves remain unchanged. See ADR 0036. This is
+numerical implementation recovery, not a different allocation objective.
+
+### 2026-09-14 — preserve original producers across recovery generations
+
+Use typed inheritance v2 for an already-inherited predecessor, retaining v1
+semantics for direct producers. Record immediate execution succession separately
+from original stage authorship and verify the ancestor receipt and exact stage
+inventory. Reports and final freezes resolve original producer bytes without
+copying or relabeling them. The frontier remains TCA. See ADR 0037.

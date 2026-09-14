@@ -1,14 +1,21 @@
-# ExecSim project context
+# Sparse Fin-JEPA project context
 
 ## Objective
 
-ExecSim is a mathematically explicit, efficient, ML-ready framework for offline research on single-asset intraday parent-order execution. It compares causal policies under the same bars, constraints, benchmarks, and transparent cost assumptions.
+Sparse Fin-JEPA studies whether sparse joint-embedding predictive representations
+simplify intraday market dynamics. Its ExecSim engine supports offline research
+on single-asset parent-order execution, comparing causal policies under the same
+bars, constraints, benchmarks, and transparent cost assumptions. The research
+project is named Sparse Fin-JEPA; the engine, Python package, and CLI retain
+ExecSim / `execsim` for technical compatibility.
 
-## V1 scope
+## Original execution-engine scope
 
 V1 includes canonical minute bars, deterministic scenarios, point-in-time volume forecasts, TWAP, historical VWAP, POV, analytical Almgren–Chriss, constrained optimal, adaptive MPC, an explicit evaluation-only oracle, transaction-cost analysis, experiment grids, statistical reports, and ML data-to-artifact infrastructure.
 
-The framework treats optimization as the decision layer. ML may forecast volume inputs but does not directly choose unconstrained trades. Historical model fitting and predictive-performance claims are outside this acceptance run.
+The framework treats optimization as the decision layer. ML may forecast volume
+inputs but does not directly choose unconstrained trades. Historical model fitting
+and predictive-performance claims were outside the original V1 acceptance run.
 
 The optional sparse predictive-representation paper layer supplies the frozen
 `sparse-jepa-v2` protocol. Its separately authorized historical experiment is

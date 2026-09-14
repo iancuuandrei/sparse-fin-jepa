@@ -1,6 +1,10 @@
 # Repository navigation
 
-ExecSim uses a small manifest-backed navigation system rather than Nx. The repository is a single Python package; adding a Node task graph would duplicate packaging and dependency management without improving current ownership or build performance.
+Sparse Fin-JEPA uses a small manifest-backed navigation system rather than Nx.
+Its execution engine and Python package retain the name ExecSim (`execsim`).
+The repository is a single Python package; adding a Node task graph would
+duplicate packaging and dependency management without improving current
+ownership or build performance.
 
 ## Start here
 

@@ -2,12 +2,13 @@
 
 The stage receipt is deliberately small and explicit.  It is not a workflow
 engine: v1 and v2 can inherit the forecast and representation stages only, and
-the invalidation frontier is always ``run-tca``.  v1 binds those stages to its
+the invalidation frontier is ``run-tca``.  v1 binds those stages to its
 immediate predecessor.  v2 is used when that predecessor already inherited
 the stages and therefore records the immediate predecessor separately from
-the immutable stage producer.  Every receipt and artifact consumed from the
-chain remains checksum-bound; no output is copied into the replacement
-namespace.
+the immutable stage producer.  v3 is a separately typed report-only recovery:
+it can additionally inherit a complete TCA stage, with the report as the
+invalidation frontier.  Every receipt and artifact consumed from the chain
+remains checksum-bound; no output is copied into the replacement namespace.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from execsim.data.paper.manifests import file_sha256, read_json, stable_hash, wr
 
 SCHEMA = "paper-evaluation-stage-inheritance-v1"
 SCHEMA_V2 = "paper-evaluation-stage-inheritance-v2"
-SUPPORTED_SCHEMAS = (SCHEMA, SCHEMA_V2)
+SCHEMA_V3 = "paper-evaluation-stage-inheritance-v3"
+SUPPORTED_SCHEMAS = (SCHEMA, SCHEMA_V2, SCHEMA_V3)
 STATUS = "STAGE_INHERITANCE_VALIDATED"
 EXECUTION_SCHEMA = {
     "paper-evaluation-execution-v2",
@@ -32,7 +34,9 @@ EXECUTION_SCHEMA = {
     "paper-evaluation-execution-v4",
 }
 FRONTIER = "run-tca"
+REPORT_FRONTIER = "report"
 INHERITED_STAGES = ("evaluate-forecast", "evaluate-representation")
+REPORT_INHERITED_STAGES = (*INHERITED_STAGES, "run-tca")
 _STAGE_ALIASES = {
     "forecast": "evaluate-forecast",
     "evaluate-forecast": "evaluate-forecast",
@@ -302,7 +306,7 @@ def _stage_producer_descriptor(
             label=f"Inherited {stage}",
         )
         receipt_sha = payload.get("superseded_execution_receipt_sha256")
-    elif payload.get("schema_version") == SCHEMA_V2:
+    elif payload.get("schema_version") in {SCHEMA_V2, SCHEMA_V3}:
         namespace = record.get("producer_execution_namespace")
         source = _source(record.get("producer_evaluation_source"), label=f"Inherited {stage}")
         receipt_sha = record.get("producer_execution_receipt_sha256")
@@ -763,6 +767,436 @@ def _validate_representation(
     return inventory
 
 
+def _reject_symlink(path: Path, *, label: str) -> None:
+    """Reject reparse/symlink substitutions in the report-only inventory."""
+    if path.is_symlink():
+        raise ValueError(f"Inherited {label} must be a regular path, not a symlink: {path}")
+
+
+def _tca_identity(config: Any, source: Mapping[str, str]) -> dict[str, str]:
+    """Return the identity shared by TCA shards, merges, and their aggregate."""
+    return {
+        "source_commit": source["commit"],
+        "source_tree": source["tree"],
+        "paper_config_hash": str(config.config_hash),
+        "parameter_freeze_sha256": file_sha256(_freeze_path(config)),
+    }
+
+
+def _canonical_tca_shard_path(
+    root: Path, source_root: Path, relative: object, name: str
+) -> tuple[Path, str, str]:
+    """Resolve a merge source and require its canonical fold/day shard layout."""
+    if not isinstance(relative, str) or not _nonempty(relative):
+        raise ValueError("Inherited TCA merge source path is incomplete.")
+    path = _safe_relative(root, relative)
+    _reject_symlink(path, label="TCA shard member")
+    shards_root = source_root / "evaluation-v2" / "tca-shards"
+    if not path.is_relative_to(shards_root) or path.name != name:
+        raise ValueError("Inherited TCA merge source is outside its canonical shard inventory.")
+    relative_to_shards = path.relative_to(shards_root)
+    if len(relative_to_shards.parts) != 3:
+        raise ValueError("Inherited TCA merge source must be fold/day/<result>.parquet.")
+    fold_id, session_date, filename = relative_to_shards.parts
+    if not _nonempty(fold_id) or not _nonempty(session_date) or filename != name:
+        raise ValueError("Inherited TCA merge source has an invalid fold/day identity.")
+    canonical = _relative(root, path)
+    if relative != canonical:
+        raise ValueError("Inherited TCA merge source path is not canonical.")
+    return path, fold_id, session_date
+
+
+def _validate_tca(
+    root: Path,
+    source_root: Path,
+    config: Any,
+    source: Mapping[str, str],
+    expected_tca_dates: object,
+) -> dict[str, str]:
+    """Verify complete TCA merges, aggregate identity, and every date shard.
+
+    Independent qualification supplies the expected dates.  Merge receipts
+    and physical directories must agree with that inventory, so a date removed
+    consistently from both cannot be hidden by a valid merge.
+    """
+    expected_dates = _normalize_expected_tca_dates(config, expected_tca_dates)
+    expected_date_dirs = {
+        (source_root / "evaluation-v2" / "tca-shards" / fold_id / day).resolve()
+        for fold_id, dates in expected_dates.items()
+        for day in dates
+    }
+    tca_root = source_root / "tca"
+    aggregate = tca_root / "manifest.json"
+    shards_root = source_root / "evaluation-v2" / "tca-shards"
+    for path, label in (
+        (tca_root, "TCA root"),
+        (aggregate, "TCA aggregate manifest"),
+        (shards_root, "TCA shard root"),
+    ):
+        _reject_symlink(path, label=label)
+    if not tca_root.is_dir() or not aggregate.is_file() or not shards_root.is_dir():
+        raise ValueError("Inherited TCA stage is incomplete.")
+
+    identity = _tca_identity(config, source)
+    aggregate_payload = read_json(aggregate)
+    if (
+        aggregate_payload.get("schema_version") != "paper-tca-v1"
+        or aggregate_payload.get("paper_config_hash") != config.config_hash
+        or aggregate_payload.get("evaluation_identity") != identity
+    ):
+        raise ValueError("Inherited TCA aggregate manifest identity mismatch.")
+    aggregate_files = aggregate_payload.get("files")
+    if not isinstance(aggregate_files, Mapping) or set(aggregate_files) != {
+        "main",
+        "sensitivity",
+    }:
+        raise ValueError("Inherited TCA aggregate manifest file inventory mismatch.")
+
+    # The TCA directory is itself a closed artifact.  Unexpected reports or
+    # temporary files must not become implicit inputs to the new report.
+    expected_tca_members = {
+        "manifest.json",
+        "main.parquet",
+        "main.manifest.json",
+        "sensitivity.parquet",
+        "sensitivity.manifest.json",
+    }
+    if {child.name for child in tca_root.iterdir()} != expected_tca_members or any(
+        child.is_dir() for child in tca_root.iterdir()
+    ):
+        raise ValueError("Inherited TCA root contains undeclared members.")
+
+    merge_sources: dict[str, dict[str, str]] = {}
+    inventory: dict[str, str] = {}
+    for name in ("main.parquet", "sensitivity.parquet"):
+        output = tca_root / name
+        receipt_path = output.with_suffix(".manifest.json")
+        _reject_symlink(output, label="TCA merged output")
+        _reject_symlink(receipt_path, label="TCA merge receipt")
+        if not output.is_file() or not receipt_path.is_file():
+            raise ValueError(f"Inherited TCA merged output is incomplete: {output}")
+        receipt = read_json(receipt_path)
+        merge_identity = receipt.get("merge_identity")
+        if not isinstance(merge_identity, Mapping):
+            raise ValueError(f"Inherited TCA merge receipt is incomplete: {receipt_path}")
+        sources = merge_identity.get("sources")
+        if not isinstance(sources, Mapping) or not sources:
+            raise ValueError(
+                f"Inherited TCA merge receipt shard inventory is incomplete: {receipt_path}"
+            )
+        normalized_sources: dict[str, str] = {}
+        for relative, digest in sources.items():
+            if not isinstance(digest, str) or not _nonempty(digest):
+                raise ValueError(
+                    f"Inherited TCA merge receipt contains an invalid shard hash: {receipt_path}"
+                )
+            shard_path, _fold, _day = _canonical_tca_shard_path(root, source_root, relative, name)
+            normalized_sources[relative] = digest
+            if not shard_path.is_file() or file_sha256(shard_path) != digest:
+                raise ValueError(f"Inherited TCA shard checksum mismatch: {shard_path}")
+        merge_sources[name] = normalized_sources
+        # _merged_file validates the merge schema, output checksum, Parquet
+        # metadata, source identity, and exact source map.
+        inventory.update(
+            _merged_file(
+                root,
+                tca_root,
+                name,
+                "paper-tca-merged-v3",
+                expected_identity=identity,
+                expected_sources=normalized_sources,
+            )
+        )
+        record = aggregate_files[name.removesuffix(".parquet")]
+        if (
+            not isinstance(record, Mapping)
+            or record.get("path") != str(output)
+            or record.get("sha256") != file_sha256(output)
+        ):
+            raise ValueError("Inherited TCA aggregate output identity/checksum mismatch.")
+
+    main_sources = merge_sources["main.parquet"]
+    sensitivity_sources = merge_sources["sensitivity.parquet"]
+    main_dirs = {_safe_relative(root, relative).parent.resolve() for relative in main_sources}
+    sensitivity_dirs = {
+        _safe_relative(root, relative).parent.resolve() for relative in sensitivity_sources
+    }
+    if main_dirs != sensitivity_dirs:
+        raise ValueError("Inherited TCA main/sensitivity shard inventories differ.")
+
+    merge_dirs: set[Path] = set()
+    for relative in main_sources:
+        path = _safe_relative(root, relative)
+        merge_dirs.add(path.parent.resolve())
+    if merge_dirs != expected_date_dirs:
+        raise ValueError("Inherited TCA merge inventory does not match expected dates.")
+
+    # TCA workers are launched once per complete fold/day input.  Requiring
+    # that input-date inventory to match the merged sources closes the gap in
+    # which both merge receipts could be edited consistently while silently
+    # dropping a date.  Input bytes remain outside the inherited output
+    # inventory; the shard and merge checks below bind the completed results.
+    inputs_root = source_root / "evaluation-v2" / "tca-inputs"
+    _reject_symlink(inputs_root, label="TCA input root")
+    if not inputs_root.is_dir():
+        raise ValueError("Inherited TCA input inventory is missing.")
+    actual_input_dirs: set[Path] = set()
+    for fold in inputs_root.iterdir():
+        _reject_symlink(fold, label="TCA input fold directory")
+        if not fold.is_dir():
+            raise ValueError("Inherited TCA input root contains a non-directory member.")
+        for day in fold.iterdir():
+            _reject_symlink(day, label="TCA input day directory")
+            if not day.is_dir() or not (day / "manifest.json").is_file():
+                raise ValueError("Inherited TCA input date is incomplete.")
+            actual_input_dirs.add(
+                (source_root / "evaluation-v2" / "tca-shards" / fold.name / day.name).resolve()
+            )
+    if actual_input_dirs != expected_date_dirs:
+        raise ValueError("Inherited TCA input-date inventory does not match completed shards.")
+
+    # Every physical shard directory must be represented by both merge
+    # receipts.  Enumerate only the declared two-level fold/day layout and
+    # reject files, nested directories, and undeclared temporary members.
+    actual_dirs: set[Path] = set()
+    for fold in shards_root.iterdir():
+        _reject_symlink(fold, label="TCA fold directory")
+        if not fold.is_dir():
+            raise ValueError("Inherited TCA shard root contains a non-directory member.")
+        for day in fold.iterdir():
+            _reject_symlink(day, label="TCA day directory")
+            if not day.is_dir():
+                raise ValueError("Inherited TCA fold contains a non-directory member.")
+            actual_dirs.add(day.resolve())
+            shard_inventory = _artifact_files(
+                root,
+                day,
+                schema="paper-tca-date-shard-v3",
+                expected_names={"main.parquet", "sensitivity.parquet"},
+                expected_identity={
+                    "source_commit": source["commit"],
+                    "source_tree": source["tree"],
+                    "paper_config_hash": config.config_hash,
+                    "parameter_freeze_sha256": identity["parameter_freeze_sha256"],
+                    "fold_id": fold.name,
+                    "session_date": day.name,
+                },
+            )
+            for member, digest in shard_inventory.items():
+                if member.endswith("/main.parquet"):
+                    expected = main_sources.get(member)
+                elif member.endswith("/sensitivity.parquet"):
+                    expected = sensitivity_sources.get(member)
+                else:
+                    # The shard manifest is not a merge input, but it is part
+                    # of the complete inherited byte inventory below.
+                    expected = None
+                if expected is not None and expected != digest:
+                    raise ValueError(f"Inherited TCA shard inventory checksum mismatch: {member}")
+                inventory[member] = digest
+    if actual_dirs != expected_date_dirs:
+        raise ValueError(
+            "Inherited TCA shard directory inventory is incomplete or contains extras."
+        )
+    inventory[_relative(root, aggregate)] = file_sha256(aggregate)
+    return inventory
+
+
+def _normalize_expected_tca_dates(config: Any, expected: object) -> dict[str, list[str]]:
+    """Validate the independently qualified fold/date TCA inventory."""
+    folds = tuple(_folds(config))
+    if not isinstance(expected, Mapping) or set(expected) != set(folds):
+        raise ValueError(
+            "Report-only inheritance requires an expected TCA date list for every fold."
+        )
+    normalized: dict[str, list[str]] = {}
+    for fold_id in folds:
+        values = expected.get(fold_id)
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError("Report-only expected TCA dates are empty or malformed.")
+        dates: list[str] = []
+        for value in values:
+            if not isinstance(value, str) or not _nonempty(value):
+                raise ValueError("Report-only expected TCA date is incomplete.")
+            try:
+                parsed = datetime.fromisoformat(value).date()
+            except ValueError as exc:
+                raise ValueError("Report-only expected TCA date is not ISO-8601.") from exc
+            if parsed.isoformat() != value:
+                raise ValueError("Report-only expected TCA date is not canonical.")
+            dates.append(value)
+        if dates != sorted(set(dates)):
+            raise ValueError("Report-only expected TCA dates must be sorted and unique.")
+        normalized[fold_id] = dates
+    return normalized
+
+
+def _validate_receipt_creation(payload: Mapping[str, Any]) -> None:
+    """Require a reason and timezone-aware creation clock for every generation."""
+    created_at = payload.get("created_at_utc")
+    if not _nonempty(payload.get("reason")) or not _nonempty(created_at):
+        raise ValueError("Stage inheritance receipt reason or creation time is incomplete.")
+    try:
+        timestamp = datetime.fromisoformat(str(created_at))
+    except ValueError as exc:
+        raise ValueError("Stage inheritance receipt creation time is malformed.") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("Stage inheritance receipt creation time must be timezone-aware.")
+
+
+def _validate_receipt_sources(
+    payload: Mapping[str, Any],
+    predecessor: Mapping[str, Any],
+    replacement_source: dict[str, str] | None,
+    expected_predecessor: tuple[str, str] | None,
+) -> dict[str, str]:
+    """Bind original and replacement sources without conflating their roles."""
+    source = _source(payload.get("superseded_evaluation_source"), label="Superseded")
+    if source != _source(predecessor.get("evaluation_source"), label="Predecessor"):
+        raise ValueError("Stage inheritance predecessor source identity mismatch.")
+    replacement = _source(payload.get("replacement_evaluation_source"), label="Replacement")
+    if replacement_source is not None and replacement != replacement_source:
+        raise ValueError("Stage inheritance replacement evaluator identity mismatch.")
+    actual_predecessor = (
+        payload.get("superseded_execution_namespace"),
+        str(payload.get("superseded_execution_receipt_sha256")),
+    )
+    if expected_predecessor is not None and actual_predecessor != expected_predecessor:
+        raise ValueError("Stage inheritance predecessor does not match supersession receipt.")
+    return source
+
+
+def _validate_report_receipt(
+    config: Any,
+    receipt_path: Path,
+    payload: Mapping[str, Any],
+    *,
+    replacement_source: dict[str, str] | None = None,
+    expected_predecessor: tuple[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[Path, tuple[int, int, int, int]]]:
+    """Validate the report-only v3 chain and return its complete byte states."""
+    root = _artifact_root(config)
+    _validate_receipt_creation(payload)
+    freeze_sha, opened_sha, root_source, config_hash = _current_metadata(config)
+    if (
+        payload.get("protocol_id") != "sparse-jepa-v2"
+        or payload.get("paper_config_hash") != config_hash
+        or payload.get("parameter_freeze_sha256") != freeze_sha
+        or payload.get("locked_test_open_receipt_sha256") != opened_sha
+        or payload.get("root_evaluation_source") != root_source
+        or payload.get("root_evaluation_open_receipt_sha256", opened_sha) != opened_sha
+        or payload.get("invalidation_frontier") != REPORT_FRONTIER
+        or tuple(payload.get("inherited_stages", ())) != REPORT_INHERITED_STAGES
+    ):
+        raise ValueError("Report-only stage inheritance protocol/frontier identity mismatch.")
+
+    predecessor_ns = payload.get("superseded_execution_namespace")
+    predecessor_sha = payload.get("superseded_execution_receipt_sha256")
+    if not isinstance(predecessor_ns, str) or not _nonempty(predecessor_sha):
+        raise ValueError("Stage inheritance receipt is missing its predecessor identity.")
+    predecessor_receipt = _safe_relative(root, f"{predecessor_ns}/execution.json")
+    predecessor, namespace_path, _base_inventory, states = _validate_predecessor(
+        config, predecessor_receipt, str(predecessor_sha)
+    )
+    if _relative(root, namespace_path) != predecessor_ns:
+        raise ValueError("Stage inheritance predecessor namespace is not canonical.")
+    if predecessor.get("schema_version") != "paper-evaluation-execution-v4":
+        raise ValueError("Report-only inheritance requires a v4 TCA-complete predecessor.")
+    if (
+        predecessor.get("inherited_stages") != list(INHERITED_STAGES)
+        or predecessor.get("invalidation_frontier") != FRONTIER
+    ):
+        raise ValueError("Report-only predecessor does not have the TCA-restart contract.")
+
+    source = _validate_receipt_sources(
+        payload, predecessor, replacement_source, expected_predecessor
+    )
+
+    inventories = payload.get("stage_inventory")
+    if not isinstance(inventories, Mapping) or set(inventories) != set(REPORT_INHERITED_STAGES):
+        raise ValueError("Report-only stage inventory is incomplete or contains extra stages.")
+
+    # A v4 predecessor already verified its v1/v2 receipt.  Re-validate and
+    # bind that exact receipt here so the v3 chain cannot silently replace the
+    # original forecast/representation producers.
+    predecessor_stage = _execution_stage_receipt(
+        config,
+        predecessor_receipt,
+        predecessor,
+        source=source,
+    )
+    if predecessor_stage is None:
+        raise ValueError("Report-only predecessor is missing its typed stage receipt.")
+    ancestor_payload, ancestor_path, ancestor_sha = predecessor_stage
+    if ancestor_payload.get("schema_version") not in {SCHEMA, SCHEMA_V2}:
+        raise ValueError("Report-only predecessor stage receipt is not v1/v2.")
+    if (
+        tuple(ancestor_payload.get("inherited_stages", ())) != INHERITED_STAGES
+        or ancestor_payload.get("invalidation_frontier") != FRONTIER
+    ):
+        raise ValueError("Report-only predecessor stage receipt has incompatible frontier.")
+    states[ancestor_path] = _state(ancestor_path)
+    ancestor_cached = _CACHE.get(_cache_key(config, ancestor_path))
+    if ancestor_cached is not None:
+        states.update(ancestor_cached[1])
+
+    # Require an explicit link to the predecessor's inheritance receipt.  This
+    # mirrors v2's chain contract and keeps d0 in the succession even when the
+    # forecast/representation bytes originated in the earlier execution.
+    link = payload.get("ancestor_stage_inheritance")
+    if not isinstance(link, Mapping):
+        raise ValueError("Report-only stage inheritance is missing its ancestor receipt link.")
+    if (
+        link.get("path") != _relative(root, ancestor_path)
+        or link.get("sha256") != ancestor_sha
+        or link.get("predecessor_namespace") != predecessor.get("superseded_execution_namespace")
+        or link.get("predecessor_receipt_sha256")
+        != predecessor.get("superseded_execution_receipt_sha256")
+    ):
+        raise ValueError("Report-only ancestor receipt link is inconsistent.")
+
+    for stage in INHERITED_STAGES:
+        producer_ns, producer_sha, producer_source = _stage_producer_descriptor(
+            root, ancestor_payload, stage
+        )
+        ancestor_record = ancestor_payload.get("stage_inventory", {}).get(stage)
+        if not isinstance(ancestor_record, Mapping) or not isinstance(
+            ancestor_record.get("files"), Mapping
+        ):
+            raise ValueError(f"Report-only ancestor inventory is incomplete for {stage}.")
+        expected_record = {
+            "producer_execution_namespace": producer_ns,
+            "producer_execution_receipt_sha256": producer_sha,
+            "producer_evaluation_source": producer_source,
+            "files": dict(ancestor_record["files"]),
+        }
+        record = inventories.get(stage)
+        if not isinstance(record, Mapping) or any(
+            record.get(key) != value for key, value in expected_record.items()
+        ):
+            raise ValueError(f"Report-only inherited {stage} producer or inventory changed.")
+    expected_tca_dates = payload.get("expected_tca_dates")
+    tca_files = _validate_tca(root, namespace_path, config, source, expected_tca_dates)
+    run_tca = inventories.get("run-tca")
+    expected_tca_record = {
+        "producer_execution_namespace": predecessor_ns,
+        "producer_execution_receipt_sha256": str(predecessor_sha),
+        "producer_evaluation_source": source,
+        "files": tca_files,
+    }
+    if not isinstance(run_tca, Mapping) or any(
+        run_tca.get(key) != value for key, value in expected_tca_record.items()
+    ):
+        raise ValueError("Report-only inherited TCA producer or inventory changed.")
+
+    for relative in tca_files:
+        path = _safe_relative(root, relative)
+        states[path] = _state(path)
+    states[receipt_path] = _state(receipt_path)
+    states[predecessor_receipt] = _state(predecessor_receipt)
+    return dict(payload), states
+
+
 def _validate_predecessor(
     config: Any, receipt_path: Path, expected_sha: str
 ) -> tuple[dict[str, Any], Path, dict[str, str], dict[Path, tuple[int, int, int, int]]]:
@@ -808,15 +1242,15 @@ def _validate_receipt(
     schema = payload.get("schema_version")
     if schema not in SUPPORTED_SCHEMAS or payload.get("status") != STATUS:
         raise ValueError("Stage inheritance receipt schema/status is incompatible.")
-    created_at = payload.get("created_at_utc")
-    if not _nonempty(payload.get("reason")) or not _nonempty(created_at):
-        raise ValueError("Stage inheritance receipt reason or creation time is incomplete.")
-    try:
-        timestamp = datetime.fromisoformat(str(created_at))
-    except ValueError as exc:
-        raise ValueError("Stage inheritance receipt creation time is malformed.") from exc
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        raise ValueError("Stage inheritance receipt creation time must be timezone-aware.")
+    if schema == SCHEMA_V3:
+        return _validate_report_receipt(
+            config,
+            receipt_path,
+            payload,
+            replacement_source=replacement_source,
+            expected_predecessor=expected_predecessor,
+        )
+    _validate_receipt_creation(payload)
     freeze_sha, opened_sha, root_source, config_hash = _current_metadata(config)
     if (
         payload.get("protocol_id") != "sparse-jepa-v2"
@@ -842,17 +1276,9 @@ def _validate_receipt(
     )
     if _relative(root, namespace_path) != predecessor_ns:
         raise ValueError("Stage inheritance predecessor namespace is not canonical.")
-    source = _source(payload.get("superseded_evaluation_source"), label="Superseded")
-    if source != _source(predecessor.get("evaluation_source"), label="Predecessor"):
-        raise ValueError("Stage inheritance predecessor source identity mismatch.")
-    replacement = _source(payload.get("replacement_evaluation_source"), label="Replacement")
-    if replacement_source is not None and replacement != replacement_source:
-        raise ValueError("Stage inheritance replacement evaluator identity mismatch.")
-    if (
-        expected_predecessor is not None
-        and (predecessor_ns, str(predecessor_sha)) != expected_predecessor
-    ):
-        raise ValueError("Stage inheritance predecessor does not match supersession receipt.")
+    source = _validate_receipt_sources(
+        payload, predecessor, replacement_source, expected_predecessor
+    )
     inventories = payload.get("stage_inventory")
     if not isinstance(inventories, Mapping) or set(inventories) != set(INHERITED_STAGES):
         raise ValueError(
@@ -1008,7 +1434,10 @@ def _current_inheritance(config: Any) -> tuple[dict[str, Any], Path] | None:
     if not execution_path.is_file():
         return None
     execution = read_json(execution_path)
-    if execution.get("schema_version") != "paper-evaluation-execution-v4":
+    if execution.get("schema_version") not in {
+        "paper-evaluation-execution-v4",
+        "paper-evaluation-execution-v5",
+    }:
         return None
     freeze_sha, opened_sha, root_source, config_hash = _current_metadata(config)
     if (
@@ -1035,15 +1464,24 @@ def _current_inheritance(config: Any) -> tuple[dict[str, Any], Path] | None:
     predecessor_sha = execution.get("superseded_execution_receipt_sha256")
     if not isinstance(predecessor_namespace, str) or not isinstance(predecessor_sha, str):
         raise ValueError("Current v4 execution is missing its predecessor identity.")
-    return (
-        verify_stage_inheritance(
-            config,
-            receipt_path,
-            replacement_source=source,
-            expected_predecessor=(predecessor_namespace, predecessor_sha),
-        ),
+    typed = verify_stage_inheritance(
+        config,
         receipt_path,
+        replacement_source=source,
+        expected_predecessor=(predecessor_namespace, predecessor_sha),
     )
+    if (
+        execution.get("schema_version") == "paper-evaluation-execution-v4"
+        and typed.get("schema_version") == SCHEMA_V3
+    ):
+        raise ValueError("Execution v4 cannot resolve report-only inheritance v3.")
+    # Native v5 requires its explicit execution-side stage fields; legacy v4
+    # routing still accepts its original v1/v2 receipt contract only.
+    if execution.get("schema_version") == "paper-evaluation-execution-v5":
+        from execsim.ml.paper.evaluation_execution import _validate_inheritance_generation
+
+        _validate_inheritance_generation(execution, typed)
+    return typed, receipt_path
 
 
 def stage_input_root(config: Any, stage: str) -> Path:
@@ -1051,7 +1489,7 @@ def stage_input_root(config: Any, stage: str) -> Path:
     canonical = _canonical_stage(stage)
     current_root = _evaluation_root(config)
     inherited = _current_inheritance(config)
-    if inherited is None or canonical not in INHERITED_STAGES:
+    if inherited is None or canonical not in tuple(inherited[0].get("inherited_stages", ())):
         return current_root
     receipt, _path = inherited
     namespace, _receipt_sha, _source_identity = _stage_producer_descriptor(
@@ -1071,7 +1509,7 @@ def stage_source(
     supplied = {"commit": source_commit, "tree": source_tree}
     if inherited is not None and supplied != inherited[0]["replacement_evaluation_source"]:
         raise ValueError("Current evaluator identity does not match the v4 execution receipt.")
-    if inherited is not None and canonical in INHERITED_STAGES:
+    if inherited is not None and canonical in tuple(inherited[0].get("inherited_stages", ())):
         _namespace, _receipt_sha, producer_source = _stage_producer_descriptor(
             _artifact_root(config), inherited[0], canonical
         )
@@ -1091,7 +1529,8 @@ def stage_provenance(config: Any, *, source_commit: str, source_tree: str) -> di
     current_root = _evaluation_root(config)
     current_namespace = _relative(_artifact_root(config), current_root)
     stage_sources = {}
-    for stage in INHERITED_STAGES:
+    inherited_stages = tuple(payload.get("inherited_stages", ()))
+    for stage in inherited_stages:
         namespace, _receipt_sha, source = _stage_producer_descriptor(
             _artifact_root(config), payload, stage
         )
@@ -1101,7 +1540,7 @@ def stage_provenance(config: Any, *, source_commit: str, source_tree: str) -> di
             **source,
             "inherited": True,
         }
-        if payload.get("schema_version") == SCHEMA_V2:
+        if payload.get("schema_version") in {SCHEMA_V2, SCHEMA_V3}:
             immediate_source = payload["superseded_evaluation_source"]
             immediate_namespace = str(payload["superseded_execution_namespace"])
             stage_sources[stage].update(
@@ -1111,6 +1550,8 @@ def stage_provenance(config: Any, *, source_commit: str, source_tree: str) -> di
                 }
             )
     for stage in ("run-tca", "report", "final-result-freeze"):
+        if stage in inherited_stages:
+            continue
         stage_sources[stage] = {
             "execution": current_namespace,
             "execution_namespace": current_namespace,
@@ -1144,6 +1585,10 @@ def _stage_inventory(
     inherited = _execution_stage_receipt(config, execution_path, predecessor, source=source)
     if inherited is not None:
         inherited_payload, _ancestor_path, _ancestor_sha = inherited
+        if inherited_payload.get("schema_version") == SCHEMA_V3:
+            raise ValueError(
+                "Report-only stage inheritance cannot be used with the run-tca frontier."
+            )
         inventories: dict[str, Any] = {}
         for stage in INHERITED_STAGES:
             producer_ns, producer_sha, producer_source = _stage_producer_descriptor(
@@ -1185,8 +1630,29 @@ def write_stage_inheritance_receipt(
     replacement_source_commit: str,
     replacement_source_tree: str,
     reason: str,
+    invalidation_frontier: str = FRONTIER,
+    expected_tca_dates: Mapping[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    """Write an immutable typed receipt for forecast/representation inheritance."""
+    """Write an immutable typed stage receipt.
+
+    The default ``run-tca`` path is the original v1/v2 writer.  Passing the
+    explicit ``report`` frontier selects the separately typed v3 report-only
+    contract; it never changes the meaning or bytes of an existing v1/v2
+    receipt.
+    """
+    frontier = _canonical_stage(invalidation_frontier)
+    if frontier == REPORT_FRONTIER:
+        return _write_report_stage_inheritance_receipt(
+            config,
+            superseded_execution=superseded_execution,
+            output=output,
+            replacement_source_commit=replacement_source_commit,
+            replacement_source_tree=replacement_source_tree,
+            reason=reason,
+            expected_tca_dates=expected_tca_dates,
+        )
+    if frontier != FRONTIER:
+        raise ValueError("Stage inheritance supports only run-tca or explicit report frontier.")
     root = _artifact_root(config)
     if not output.resolve().is_relative_to(root):
         raise ValueError("Stage inheritance receipt must remain inside the artifact root.")
@@ -1264,6 +1730,153 @@ def write_stage_inheritance_receipt(
         return {**existing, "path": str(output), "sha256": file_sha256(output)}
     write_json_atomic(output, payload)
     return {**payload, "path": str(output), "sha256": file_sha256(output)}
+
+
+def _write_report_stage_inheritance_receipt(
+    config: Any,
+    *,
+    superseded_execution: Path,
+    output: Path,
+    replacement_source_commit: str,
+    replacement_source_tree: str,
+    reason: str,
+    expected_tca_dates: Mapping[str, list[str]] | None,
+) -> dict[str, Any]:
+    """Write the explicit v3 receipt for a report-only recovery."""
+    root = _artifact_root(config)
+    output = Path(output)
+    if not output.resolve().is_relative_to(root):
+        raise ValueError("Stage inheritance receipt must remain inside the artifact root.")
+    if not _nonempty(replacement_source_commit) or not _nonempty(replacement_source_tree):
+        raise ValueError("Replacement evaluator identity is incomplete.")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("Stage inheritance requires a non-empty reason.")
+    execution_path = (
+        Path(superseded_execution) / "execution.json"
+        if Path(superseded_execution).name != "execution.json"
+        else Path(superseded_execution)
+    )
+    if not execution_path.resolve().is_relative_to((root / "evaluation-executions").resolve()):
+        raise ValueError("Stage inheritance predecessor must be below evaluation-executions.")
+    if output.resolve().is_relative_to(execution_path.parent.resolve()):
+        raise ValueError("Stage inheritance receipt cannot overwrite its predecessor namespace.")
+    if output.is_symlink():
+        raise ValueError("Stage inheritance receipt must be a regular file.")
+    if execution_path.is_symlink() or not execution_path.is_file():
+        raise ValueError("Stage inheritance predecessor execution receipt is unavailable.")
+    predecessor = read_json(execution_path)
+    if (
+        predecessor.get("status") != "EVALUATION_RESEALED"
+        or predecessor.get("schema_version") != "paper-evaluation-execution-v4"
+        or not isinstance(predecessor.get("upstream_files"), Mapping)
+        or not predecessor["upstream_files"]
+        or predecessor.get("inherited_stages") != list(INHERITED_STAGES)
+        or predecessor.get("invalidation_frontier") != FRONTIER
+    ):
+        raise ValueError("Report-only inheritance requires a complete v4 TCA predecessor.")
+    freeze_sha, opened_sha, root_source, config_hash = _current_metadata(config)
+    if (
+        predecessor.get("paper_config_hash") != config_hash
+        or predecessor.get("parameter_freeze_sha256") != freeze_sha
+    ):
+        raise ValueError("Stage inheritance predecessor configuration/freeze mismatch.")
+    predecessor_sha = file_sha256(execution_path)
+    _validate_predecessor(config, execution_path, predecessor_sha)
+    source = _source(predecessor.get("evaluation_source"), label="Predecessor")
+    predecessor_stage = _execution_stage_receipt(config, execution_path, predecessor, source=source)
+    if predecessor_stage is None:
+        raise ValueError("Report-only predecessor is missing its typed stage receipt.")
+    ancestor_payload, ancestor_path, ancestor_sha = predecessor_stage
+    if ancestor_payload.get("schema_version") not in {SCHEMA, SCHEMA_V2}:
+        raise ValueError("Report-only predecessor stage receipt is not v1/v2.")
+    inventories: dict[str, Any] = {}
+    for stage in INHERITED_STAGES:
+        producer_ns, producer_receipt_sha, producer_source = _stage_producer_descriptor(
+            root, ancestor_payload, stage
+        )
+        record = ancestor_payload.get("stage_inventory", {}).get(stage)
+        if not isinstance(record, Mapping) or not isinstance(record.get("files"), Mapping):
+            raise ValueError(f"Report-only predecessor inventory is incomplete for {stage}.")
+        inventories[stage] = {
+            "producer_execution_namespace": producer_ns,
+            "producer_execution_receipt_sha256": producer_receipt_sha,
+            "producer_evaluation_source": producer_source,
+            "files": dict(record["files"]),
+        }
+    normalized_tca_dates = _normalize_expected_tca_dates(config, expected_tca_dates)
+    tca_files = _validate_tca(
+        root,
+        execution_path.parent.resolve(),
+        config,
+        source,
+        normalized_tca_dates,
+    )
+    inventories["run-tca"] = {
+        "producer_execution_namespace": _relative(root, execution_path.parent.resolve()),
+        "producer_execution_receipt_sha256": predecessor_sha,
+        "producer_evaluation_source": source,
+        "files": tca_files,
+    }
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_V3,
+        "status": STATUS,
+        "protocol_id": "sparse-jepa-v2",
+        "paper_config_hash": config_hash,
+        "parameter_freeze_sha256": freeze_sha,
+        "locked_test_open_receipt_sha256": opened_sha,
+        "root_evaluation_open_receipt_sha256": opened_sha,
+        "root_evaluation_source": root_source,
+        "superseded_execution_namespace": _relative(root, execution_path.parent.resolve()),
+        "superseded_execution_receipt_sha256": predecessor_sha,
+        "superseded_evaluation_source": source,
+        "replacement_evaluation_source": {
+            "commit": replacement_source_commit,
+            "tree": replacement_source_tree,
+        },
+        "inherited_stages": list(REPORT_INHERITED_STAGES),
+        "invalidation_frontier": REPORT_FRONTIER,
+        "expected_tca_dates": normalized_tca_dates,
+        "stage_inventory": inventories,
+        "ancestor_stage_inheritance": {
+            "path": _relative(root, ancestor_path),
+            "sha256": ancestor_sha,
+            "predecessor_namespace": predecessor.get("superseded_execution_namespace"),
+            "predecessor_receipt_sha256": predecessor.get("superseded_execution_receipt_sha256"),
+        },
+        "reason": reason,
+        "created_at_utc": datetime.now(UTC).isoformat(),
+    }
+    if output.exists():
+        existing = read_json(output)
+        if {key: value for key, value in existing.items() if key != "created_at_utc"} != {
+            key: value for key, value in payload.items() if key != "created_at_utc"
+        }:
+            raise ValueError("Existing stage inheritance receipt is incompatible.")
+        return {**existing, "path": str(output), "sha256": file_sha256(output)}
+    write_json_atomic(output, payload)
+    return {**payload, "path": str(output), "sha256": file_sha256(output)}
+
+
+def write_report_stage_inheritance_receipt(
+    config: Any,
+    *,
+    superseded_execution: Path,
+    output: Path,
+    replacement_source_commit: str,
+    replacement_source_tree: str,
+    reason: str,
+    expected_tca_dates: Mapping[str, list[str]] | None,
+) -> dict[str, Any]:
+    """Write a v3 receipt with the report-only frontier explicitly selected."""
+    return _write_report_stage_inheritance_receipt(
+        config,
+        superseded_execution=superseded_execution,
+        output=output,
+        replacement_source_commit=replacement_source_commit,
+        replacement_source_tree=replacement_source_tree,
+        reason=reason,
+        expected_tca_dates=expected_tca_dates,
+    )
 
 
 verify_stage_inheritance_receipt = verify_stage_inheritance

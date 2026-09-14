@@ -44,6 +44,16 @@ HISTORICAL_FIGURE_NAMES = (
 HISTORICAL_EMPTY_TABLE_NAMES = frozenset({"forecast_performance", "forecast_by_asof"})
 
 
+def _to_latex(frame: pd.DataFrame) -> str:
+    """Serialize a complete table without leaking pandas' render limit."""
+    current_limit = int(pd.get_option("styler.render.max_elements"))
+    with pd.option_context("styler.render.max_elements", max(current_limit, frame.size + 1)):
+        latex = frame.to_latex(index=False)
+    if latex is None:  # pragma: no cover - ``buf`` is omitted above
+        raise RuntimeError("DataFrame.to_latex did not return serialized output.")
+    return latex
+
+
 def write_paper_bundle(
     output_root: Path,
     *,
@@ -70,7 +80,7 @@ def write_paper_bundle(
         (table_dir / f"{name}.md").write_text(
             frame.to_markdown(index=False) + "\n", encoding="utf-8"
         )
-        (table_dir / f"{name}.tex").write_text(frame.to_latex(index=False), encoding="utf-8")
+        (table_dir / f"{name}.tex").write_text(_to_latex(frame), encoding="utf-8")
     _render_bundle_figures(figure_dir, tables)
     from execsim.ml.paper.provenance import build_run_provenance
 
@@ -288,7 +298,7 @@ def write_historical_paper_bundle(
         (table_dir / f"{name}.md").write_text(
             frame.to_markdown(index=False) + "\n", encoding="utf-8"
         )
-        (table_dir / f"{name}.tex").write_text(frame.to_latex(index=False), encoding="utf-8")
+        (table_dir / f"{name}.tex").write_text(_to_latex(frame), encoding="utf-8")
     _render_historical_figures(
         figure_dir, tables, fixture_label="synthetic fixture" if historical_schema_fixture else None
     )

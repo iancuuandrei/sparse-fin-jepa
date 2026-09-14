@@ -3,6 +3,44 @@
 The numerical recovery and mixed-source boundary evidence are recorded in
 [TCA recovery qualification](TCA_RECOVERY_QUALIFICATION.md).
 
+## Report-only recovery
+
+ADR 0038 extends the explicit recovery boundary with stage inheritance v3 and
+execution v5. These versions require exactly `evaluate-forecast`,
+`evaluate-representation`, and `run-tca` as inherited stages, with frontier
+`report`. Earlier inheritance v1/v2 and execution v4 retain the TCA-restart
+contract described below.
+
+Each stage retains its original producer namespace, execution receipt hash,
+commit/tree, and complete file inventory. TCA inheritance verifies both merged
+outputs, their merge receipts and source shards, the aggregate TCA manifest,
+and every completed date-shard manifest/member. The expected inventory must be
+complete; changed or missing shards cannot be hidden behind a valid merged file.
+The immediate predecessor remains separate from the original stage producers.
+
+Report input resolution and final-freeze validation use the declared TCA producer
+just as they resolve forecast and representation producers. The new evaluator
+publishes only its report and final freeze. No old output is copied or relabeled.
+The report-only supervisor rejects a different frontier before spawning a child.
+
+Select this contract with `prepare-evaluation-stage-inheritance`,
+`--invalidation-frontier report`, and `--expected-tca-inventory <audited-dates.json>`,
+then pass the typed receipt to
+`reseal-evaluation`. The default inheritance frontier remains `run-tca` for
+existing callers. Run the recovery supervisor with `--report-only`; it must
+reject an execution-v4 seal instead of falling back to TCA replay.
+The audited JSON maps each fold ID to its exact sorted session-date list. The
+writer requires this independent recovery inventory, persists it in v3, and
+checks its membership against input dates, shards, and merge receipts. Never
+substitute sequence-session dates for the authoritative TCA population.
+
+Historical and synthetic table exports share a complete LaTeX serializer. It
+temporarily raises the Styler element limit above the table cell count and
+restores the caller's option, including after an error. Parquet, JSON, Markdown,
+LaTeX, rows, values, and report estimands are unchanged. Qualification includes
+all real historical table formats and a production-sized, visibly
+non-authoritative shadow report before the official replacement is sealed.
+
 ## Explicit completed-stage recovery
 
 ADR 0035 narrowly replaces the blanket no-inheritance rule for the explicitly

@@ -14,6 +14,8 @@ from execsim.ml.paper.configs import PaperRunConfig
 SCHEMA = "paper-evaluation-execution-v2"
 CHAINED_SCHEMA = "paper-evaluation-execution-v3"
 STAGE_INHERITED_SCHEMA = "paper-evaluation-execution-v4"
+REPORT_INHERITED_SCHEMA = "paper-evaluation-execution-v5"
+INHERITED_EXECUTION_SCHEMAS = {STAGE_INHERITED_SCHEMA, REPORT_INHERITED_SCHEMA}
 SUPERSESSION_SCHEMA = "paper-evaluation-supersession-v1"
 SUPERSESSION_STATUS = "SUPERSEDED_RESEALED_EVALUATION"
 SCIENTIFIC_PRESERVATION = [
@@ -119,6 +121,7 @@ def _validate_prior_execution(
         SCHEMA,
         CHAINED_SCHEMA,
         STAGE_INHERITED_SCHEMA,
+        REPORT_INHERITED_SCHEMA,
     }:
         raise ValueError("Superseded receipt is not a resealed evaluation execution.")
     freeze_path = config.artifact_root / "selection" / "parameter-freeze-v1.json"
@@ -156,7 +159,7 @@ def _validate_prior_execution(
             raise ValueError("Superseded execution immutable inventory checksum mismatch.")
         if verified_paths is not None:
             verified_paths.add(upstream_path)
-    if prior.get("schema_version") in {CHAINED_SCHEMA, STAGE_INHERITED_SCHEMA}:
+    if prior.get("schema_version") in {CHAINED_SCHEMA, *INHERITED_EXECUTION_SCHEMAS}:
         prior_supersession = prior.get("supersession_path")
         if not isinstance(prior_supersession, str):
             raise ValueError("Superseded chained execution is missing its supersession receipt.")
@@ -171,7 +174,7 @@ def _validate_prior_execution(
             replacement_source=prior.get("evaluation_source"),
             verified_paths=verified_paths,
         )
-    if prior.get("schema_version") == STAGE_INHERITED_SCHEMA:
+    if prior.get("schema_version") in INHERITED_EXECUTION_SCHEMAS:
         inheritance_name = prior.get("stage_inheritance_path")
         inheritance_path = (
             _safe_child(config.artifact_root, inheritance_name)
@@ -196,15 +199,39 @@ def _validate_prior_execution(
         if not isinstance(predecessor_namespace, str) or not isinstance(predecessor_sha, str):
             raise ValueError("Superseded v4 execution is missing its predecessor identity.")
 
-        verify_stage_inheritance(
+        inherited = verify_stage_inheritance(
             config,
             inheritance_path,
             replacement_source=prior["evaluation_source"],
             expected_predecessor=(predecessor_namespace, predecessor_sha),
         )
+        _validate_inheritance_generation(prior, inherited)
         if verified_paths is not None:
             verified_paths.update(stage_inheritance_paths(config, inheritance_path))
     return prior
+
+
+def _validate_inheritance_generation(
+    execution: dict[str, Any], inheritance: dict[str, Any]
+) -> None:
+    """Keep the TCA-restart and report-only durable contracts distinct."""
+    report_only = execution.get("schema_version") == REPORT_INHERITED_SCHEMA
+    expected_schemas = (
+        {"paper-evaluation-stage-inheritance-v3"}
+        if report_only
+        else {"paper-evaluation-stage-inheritance-v1", "paper-evaluation-stage-inheritance-v2"}
+    )
+    expected_stages = ["evaluate-forecast", "evaluate-representation"]
+    if report_only:
+        expected_stages.append("run-tca")
+    if (
+        inheritance.get("schema_version") not in expected_schemas
+        or inheritance.get("inherited_stages") != expected_stages
+        or inheritance.get("invalidation_frontier") != ("report" if report_only else "run-tca")
+        or execution.get("inherited_stages") != expected_stages
+        or execution.get("invalidation_frontier") != inheritance.get("invalidation_frontier")
+    ):
+        raise ValueError("Execution and stage-inheritance schema/frontier mismatch.")
 
 
 def _validate_chained_supersession(
@@ -536,10 +563,15 @@ def seal_evaluation_execution(
     inventory = frozen_inventory(config)
     freeze = read_json(freeze_path)
     opened = read_json(config.artifact_root / "selection/locked-test-opened-v1.json")
+    schema = CHAINED_SCHEMA if chained else SCHEMA
+    if stage_receipt is not None:
+        schema = (
+            REPORT_INHERITED_SCHEMA
+            if stage_receipt.get("schema_version") == "paper-evaluation-stage-inheritance-v3"
+            else STAGE_INHERITED_SCHEMA
+        )
     identity = {
-        "schema_version": STAGE_INHERITED_SCHEMA
-        if stage_receipt is not None
-        else (CHAINED_SCHEMA if chained else SCHEMA),
+        "schema_version": schema,
         "status": "EVALUATION_RESEALED",
         "protocol_id": "sparse-jepa-v2",
         "paper_config_hash": config.config_hash,
@@ -587,6 +619,7 @@ def seal_evaluation_execution(
                 "invalidation_frontier": stage_receipt["invalidation_frontier"],
             }
         )
+        _validate_inheritance_generation(identity, stage_receipt)
     receipt = directory / "execution.json"
     if receipt.exists():
         existing = read_json(receipt)
@@ -648,7 +681,7 @@ def verify_evaluation_execution(
             "tree": opened["evaluation_git_tree"],
         }
         extra_paths: list[Path] = []
-    elif payload.get("schema_version") in {CHAINED_SCHEMA, STAGE_INHERITED_SCHEMA}:
+    elif payload.get("schema_version") in {CHAINED_SCHEMA, *INHERITED_EXECUTION_SCHEMAS}:
         supersession_name = payload.get("supersession_path")
         if not isinstance(supersession_name, str):
             # The path is derived from the immutable receipt hash and remains
@@ -682,7 +715,7 @@ def verify_evaluation_execution(
                 valid = False
         else:
             valid = False
-        if valid and payload.get("schema_version") == STAGE_INHERITED_SCHEMA:
+        if valid and payload.get("schema_version") in INHERITED_EXECUTION_SCHEMAS:
             try:
                 from execsim.ml.paper.stage_inheritance import (
                     stage_inheritance_paths,
@@ -717,6 +750,7 @@ def verify_evaluation_execution(
                     replacement_source={"commit": source_commit, "tree": source_tree},
                     expected_predecessor=expected_predecessor,
                 )
+                _validate_inheritance_generation(payload, typed)
                 valid = (
                     valid
                     and payload.get("inherited_stages") == typed.get("inherited_stages")

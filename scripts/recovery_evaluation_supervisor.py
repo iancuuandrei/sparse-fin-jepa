@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Run the narrow v4 evaluation-recovery frontier.
+"""Run the narrow evaluation-recovery frontiers.
 
 The supervisor validates a typed forecast/representation inheritance receipt
-before starting any worker.  It then runs exactly ``run-tca``, ``report``, and
-``final-result-freeze`` as isolated child processes.  It is intentionally an
-operational wrapper: it does not acquire data, train models, create approvals,
-reseal an execution, or infer a workflow from partial artifacts.
+before starting any worker.  The legacy v4/v1-v2 contract runs exactly
+``run-tca``, ``report``, and ``final-result-freeze``.  The explicit v5/v3
+report-only contract runs only ``report`` and ``final-result-freeze`` after
+validating that forecast, representation, and TCA are inherited.  It is
+intentionally an operational wrapper: it does not acquire data, train models,
+create approvals, reseal an execution, or infer a workflow from partial
+artifacts.
 
 Run this program in the foreground.  Operators can keep it detached with a
 process supervisor such as tmux or systemd; this module does not provision
@@ -41,6 +44,18 @@ INHERITANCE_SCHEMAS = {
     "paper-evaluation-stage-inheritance-v1",
     "paper-evaluation-stage-inheritance-v2",
 }
+# Keep the v4 constants above stable for callers and receipts that predate the
+# report-only recovery.  A report-only recovery is a distinct contract, not a
+# relaxed interpretation of v4.
+REPORT_ONLY_STAGES = ("report", "final-result-freeze")
+REPORT_ONLY_INHERITED_STAGES = (
+    "evaluate-forecast",
+    "evaluate-representation",
+    "run-tca",
+)
+REPORT_ONLY_INVALIDATION_FRONTIER = "report"
+REPORT_ONLY_EXECUTION_SCHEMA = "paper-evaluation-execution-v5"
+REPORT_ONLY_INHERITANCE_SCHEMAS = {"paper-evaluation-stage-inheritance-v3"}
 INHERITANCE_STATUS = "STAGE_INHERITANCE_VALIDATED"
 DEFAULT_STATUS_NAME = "recovery-evaluation-supervisor-status.json"
 DEFAULT_WORKERS = 16
@@ -88,8 +103,7 @@ def _utc_now() -> str:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate v4 forecast/representation inheritance, then run only "
-            "run-tca, report, and final-result-freeze."
+            "Validate a typed recovery receipt, then run only its permitted downstream stages."
         )
     )
     parser.add_argument(
@@ -98,6 +112,14 @@ def _parser() -> argparse.ArgumentParser:
         choices=("run", "status", "stop"),
         default="run",
         help="run in the foreground, or inspect/stop an existing run (default: run).",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "Use only the explicit v5/v3 report-only recovery (report and "
+            "final-result-freeze); reject v4/TCA-restart receipts."
+        ),
     )
     parser.add_argument("--source", type=Path, default=None, help="Exact clean source checkout.")
     parser.add_argument("--commit", default=None, help="Expected source Git commit.")
@@ -317,8 +339,124 @@ def _require_v4_inheritance(
     return typed
 
 
+def _validate_report_only_lineage(
+    provenance: object,
+    *,
+    replacement_source: dict[str, str],
+    inheritance_sha256: str,
+) -> dict[str, Any]:
+    """Require the native resolver to expose all inherited and fresh stages."""
+    if not isinstance(provenance, dict):
+        raise ValueError("Report-only recovery did not return native stage provenance.")
+    stage_sources = provenance.get("stage_sources")
+    if not isinstance(stage_sources, dict):
+        raise ValueError("Report-only recovery provenance is missing stage sources.")
+
+    for stage in REPORT_ONLY_INHERITED_STAGES:
+        record = stage_sources.get(stage)
+        if (
+            not isinstance(record, dict)
+            or record.get("inherited") is not True
+            or any(
+                not isinstance(record.get(field), str) or not record[field].strip()
+                for field in ("execution_namespace", "commit", "tree")
+            )
+        ):
+            raise ValueError(f"Report-only recovery lineage is incomplete for {stage}.")
+
+    for stage in ("report", "final-result-freeze"):
+        record = stage_sources.get(stage)
+        if not isinstance(record, dict) or record.get("inherited") is not False:
+            raise ValueError(f"Report-only recovery must produce {stage} here.")
+        if {
+            "commit": record.get("commit"),
+            "tree": record.get("tree"),
+        } != replacement_source:
+            raise ValueError(f"Report-only recovery {stage} lineage is not source-bound.")
+
+    receipt_digests = {
+        provenance.get(name)
+        for name in ("stage_inheritance_receipt_sha256", "stage_inheritance_sha256")
+        if provenance.get(name) is not None
+    }
+    if receipt_digests != {inheritance_sha256}:
+        raise ValueError("Report-only recovery provenance receipt checksum mismatch.")
+    return provenance
+
+
+def _validate_v5_report_only_inheritance(
+    config: Any,
+    execution: dict[str, Any],
+    execution_path: Path,
+    *,
+    source_commit: str,
+    source_tree: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the explicit v5/v3 report-only recovery contract."""
+    if execution.get("schema_version") != REPORT_ONLY_EXECUTION_SCHEMA:
+        raise ValueError("Report-only recovery requires paper-evaluation-execution-v5.")
+    if execution.get("initial_completed_stages") != 0:
+        raise ValueError("v5 report-only recovery must start with zero newly completed stages.")
+    replacement_source = {"commit": source_commit, "tree": source_tree}
+    if execution.get("evaluation_source") != replacement_source:
+        raise ValueError("v5 execution source identity does not match the requested source.")
+    if execution.get("inherited_stages") != list(REPORT_ONLY_INHERITED_STAGES):
+        raise ValueError("v5 report-only execution must inherit forecast, representation, and TCA.")
+    if execution.get("invalidation_frontier") != REPORT_ONLY_INVALIDATION_FRONTIER:
+        raise ValueError("v5 report-only execution frontier must be report.")
+
+    root = config.artifact_root.resolve(strict=True)
+    inheritance_path = _safe_receipt_path(
+        root, execution.get("stage_inheritance_path"), "stage-inheritance receipt"
+    )
+    from execsim.data.paper.manifests import file_sha256
+
+    inheritance_sha = file_sha256(inheritance_path)
+    if (
+        execution.get("stage_inheritance_sha256") != inheritance_sha
+        or execution.get("stage_inheritance_receipt_sha256", inheritance_sha) != inheritance_sha
+    ):
+        raise ValueError("v5 stage-inheritance receipt checksum mismatch.")
+
+    from execsim.ml.paper.stage_inheritance import stage_provenance, verify_stage_inheritance
+
+    expected_predecessor = (
+        execution.get("superseded_execution_namespace"),
+        execution.get("superseded_execution_receipt_sha256"),
+    )
+    typed = verify_stage_inheritance(
+        config,
+        inheritance_path,
+        replacement_source=replacement_source,
+        expected_predecessor=expected_predecessor,
+    )
+    if (
+        typed.get("schema_version") not in REPORT_ONLY_INHERITANCE_SCHEMAS
+        or typed.get("status") != INHERITANCE_STATUS
+        or typed.get("inherited_stages") != list(REPORT_ONLY_INHERITED_STAGES)
+        or typed.get("invalidation_frontier") != REPORT_ONLY_INVALIDATION_FRONTIER
+        or typed.get("replacement_evaluation_source") != replacement_source
+    ):
+        raise ValueError(
+            "Typed stage inheritance receipt is not the permitted v5 report-only contract."
+        )
+    if execution_path.resolve() == inheritance_path.resolve():
+        raise ValueError("Execution and stage-inheritance receipts must be distinct files.")
+
+    provenance = _validate_report_only_lineage(
+        stage_provenance(
+            config,
+            source_commit=source_commit,
+            source_tree=source_tree,
+        ),
+        replacement_source=replacement_source,
+        inheritance_sha256=inheritance_sha,
+    )
+    return typed, provenance
+
+
 def _preflight_execution(args: argparse.Namespace) -> dict[str, Any]:
-    """Import only from the requested checkout and verify v4 before launch."""
+    """Import only from the requested checkout and verify recovery before launch."""
     source_src = args.source / "src"
     package_init = source_src / "execsim" / "__init__.py"
     if not package_init.is_file():
@@ -360,18 +498,42 @@ def _preflight_execution(args: argparse.Namespace) -> dict[str, Any]:
 
     execution_path = args.evaluation_root / "execution.json"
     if execution_path.is_symlink() or not execution_path.is_file():
-        raise ValueError("v4 execution receipt must be a regular file in evaluation-root.")
-    # This verifier binds the execution v4 receipt, supersession, parameter
-    # freeze, typed inheritance receipt, and every inherited manifest member.
+        raise ValueError("Recovery execution receipt must be a regular file in evaluation-root.")
+    # This verifier binds the execution receipt, supersession, parameter freeze,
+    # typed inheritance receipt, and every inherited manifest member.
     execution = verify_evaluation_execution(
         config, source_commit=args.commit, source_tree=args.tree
     )
-    typed = _require_v4_inheritance(
-        config,
-        execution,
-        execution_path,
-        source_commit=args.commit,
-        source_tree=args.tree,
+    report_only_requested = bool(getattr(args, "report_only", False))
+    if report_only_requested:
+        if execution.get("schema_version") != REPORT_ONLY_EXECUTION_SCHEMA:
+            raise ValueError("Report-only mode requires a compatible execution-v5 receipt.")
+        typed, provenance = _validate_v5_report_only_inheritance(
+            config,
+            execution,
+            execution_path,
+            source_commit=args.commit,
+            source_tree=args.tree,
+        )
+        stages: tuple[str, ...] = REPORT_ONLY_STAGES
+        frontier = REPORT_ONLY_INVALIDATION_FRONTIER
+    else:
+        if execution.get("schema_version") != EXECUTION_SCHEMA:
+            raise ValueError("Legacy mode requires a compatible execution-v4 receipt.")
+        typed = _require_v4_inheritance(
+            config,
+            execution,
+            execution_path,
+            source_commit=args.commit,
+            source_tree=args.tree,
+        )
+        provenance = None
+        stages = STAGES
+        frontier = INVALIDATION_FRONTIER
+    inheritance_path = _safe_receipt_path(
+        args.artifact_root.resolve(strict=True),
+        execution["stage_inheritance_path"],
+        "stage-inheritance receipt",
     )
     return {
         "execution_schema": execution["schema_version"],
@@ -380,22 +542,14 @@ def _preflight_execution(args: argparse.Namespace) -> dict[str, Any]:
         "approval_id": approval.approval_id,
         "approval_path": str(args.approval),
         "approval_sha256": file_sha256(args.approval),
-        "stage_inheritance_receipt": str(
-            _safe_receipt_path(
-                args.artifact_root.resolve(strict=True),
-                execution["stage_inheritance_path"],
-                "stage-inheritance receipt",
-            )
-        ),
-        "stage_inheritance_sha256": file_sha256(
-            _safe_receipt_path(
-                args.artifact_root.resolve(strict=True),
-                execution["stage_inheritance_path"],
-                "stage-inheritance receipt",
-            )
-        ),
+        "stage_inheritance_receipt": str(inheritance_path),
+        "stage_inheritance_sha256": file_sha256(inheritance_path),
         "inherited_validated": list(typed["inherited_stages"]),
-        "invalidation_frontier": typed["invalidation_frontier"],
+        "invalidation_frontier": frontier,
+        "recovery_stages": list(stages),
+        "report_only": report_only_requested,
+        "lineage_validated": provenance is not None,
+        **({"stage_provenance": provenance} if provenance is not None else {}),
         "source_import": str(imported_from),
     }
 
@@ -558,6 +712,10 @@ class StageSupervisor:
         self._signal_forward_error: str | None = None
         self._old_handlers: dict[int, Any] = {}
         self._workers = DEFAULT_WORKERS
+        # Selected only by the verified execution identity in preflight.  The
+        # default preserves the original v4/v1-v2 run-tca frontier for tests
+        # and callers that inject the legacy preflight seam.
+        self._stages: tuple[str, ...] = STAGES
 
     def _write_status(self) -> None:
         assert self.status_path is not None
@@ -648,6 +806,10 @@ class StageSupervisor:
                 "sha256": None,
             },
             "execution": None,
+            "recovery_stages": list(STAGES),
+            "invalidation_frontier": INVALIDATION_FRONTIER,
+            "lineage_validated": False,
+            "report_only": bool(getattr(args, "report_only", False)),
             "logs": {},
             "supervisor_sha256": wrapper_digest,
             "started_at_utc": _utc_now(),
@@ -656,11 +818,49 @@ class StageSupervisor:
         self._write_status()
 
     def _apply_preflight_identity(self, identity: dict[str, Any]) -> None:
-        inherited = identity.get("inherited_validated", list(INHERITED_STAGES))
-        if inherited != list(INHERITED_STAGES):
-            raise ValueError("Preflight did not validate the required inherited stages.")
-        if identity.get("invalidation_frontier", INVALIDATION_FRONTIER) != INVALIDATION_FRONTIER:
-            raise ValueError("Preflight did not validate the run-tca frontier.")
+        if not isinstance(identity, dict):
+            raise ValueError("Preflight identity must be a JSON object.")
+        execution_schema = identity.get("execution_schema", EXECUTION_SCHEMA)
+        report_only_requested = bool(getattr(self.args, "report_only", False))
+        expected_schema = (
+            REPORT_ONLY_EXECUTION_SCHEMA if report_only_requested else EXECUTION_SCHEMA
+        )
+        if execution_schema != expected_schema:
+            mode = "report-only" if report_only_requested else "legacy"
+            raise ValueError(
+                f"Preflight receipt does not match the explicitly requested {mode} mode."
+            )
+        if report_only_requested:
+            required = (
+                "inherited_validated",
+                "invalidation_frontier",
+                "recovery_stages",
+                "lineage_validated",
+            )
+            missing = [field for field in required if field not in identity]
+            if missing:
+                raise ValueError(
+                    "Report-only preflight identity is missing required fields: "
+                    + ", ".join(missing)
+                )
+        expected_inherited = list(
+            REPORT_ONLY_INHERITED_STAGES if report_only_requested else INHERITED_STAGES
+        )
+        expected_frontier = (
+            REPORT_ONLY_INVALIDATION_FRONTIER if report_only_requested else INVALIDATION_FRONTIER
+        )
+        expected_stages: tuple[str, ...] = REPORT_ONLY_STAGES if report_only_requested else STAGES
+        inherited = identity.get("inherited_validated", expected_inherited)
+        if inherited != expected_inherited:
+            raise ValueError("Preflight did not validate the permitted inherited stages.")
+        if identity.get("invalidation_frontier", expected_frontier) != expected_frontier:
+            raise ValueError("Preflight did not validate the execution frontier.")
+        requested_stages = identity.get("recovery_stages", list(expected_stages))
+        if requested_stages != list(expected_stages):
+            raise ValueError("Preflight returned an unsupported recovery stage plan.")
+        if report_only_requested and identity.get("lineage_validated") is not True:
+            raise ValueError("Preflight did not validate report-only stage lineage.")
+        self._stages = tuple(expected_stages)
         self.status["execution"] = identity
         self.status["execution_sha256"] = identity.get("execution_sha256") or identity.get(
             "execution_receipt_sha256"
@@ -673,8 +873,14 @@ class StageSupervisor:
             "sha256": identity.get("approval_sha256"),
         }
         self.status["inherited_validated"] = list(inherited)
+        self.status["recovery_stages"] = list(self._stages)
+        self.status["invalidation_frontier"] = expected_frontier
+        self.status["lineage_validated"] = bool(identity.get("lineage_validated", False))
+        self.status["report_only"] = report_only_requested
 
     def _stage_command(self, stage: str) -> list[str]:
+        if stage not in self._stages:
+            raise ValueError(f"Stage {stage!r} is not permitted by this recovery plan.")
         args = self.args
         return [
             sys.executable,
@@ -747,7 +953,7 @@ class StageSupervisor:
                     if self.termination_signal is not None:
                         raise SupervisorStop(self.termination_signal)
 
-                    for stage in STAGES:
+                    for stage in self._stages:
                         if self.termination_signal is not None:
                             raise SupervisorStop(self.termination_signal)
                         self.source_verifier(self.args)

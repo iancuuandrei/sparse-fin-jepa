@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, time
 from typing import Literal
 
@@ -27,6 +28,102 @@ PAPER_METHODS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class TCAFailureContext:
+    """Immutable identity and decision-boundary context for a failed TCA case."""
+
+    instrument_id: str
+    symbol: str
+    session_date: date
+    method: str
+    seed: int | None
+    encoded_method: str
+    order_fraction_adv20: float
+    parent_quantity: int
+    fold_id: str | None = None
+    decision_timestamp: pd.Timestamp | None = None
+    remaining_inventory: int | None = None
+    horizon: int | None = None
+
+    @property
+    def instrument(self) -> str:
+        """Return the stable instrument identity."""
+        return self.instrument_id
+
+    @property
+    def date(self) -> date:
+        """Return the TCA session date."""
+        return self.session_date
+
+    @property
+    def order_fraction(self) -> float:
+        """Return the ADV20 order fraction."""
+        return self.order_fraction_adv20
+
+    def at_policy_boundary(
+        self,
+        *,
+        decision_timestamp: pd.Timestamp,
+        remaining_inventory: int,
+        horizon: int,
+    ) -> TCAFailureContext:
+        """Return a new context with the immutable policy-boundary snapshot."""
+        return replace(
+            self,
+            decision_timestamp=pd.Timestamp(decision_timestamp),
+            remaining_inventory=int(remaining_inventory),
+            horizon=int(horizon),
+        )
+
+
+class TCAExecutionFailure(RuntimeError):
+    """A numerical TCA replay failure with its original exception as ``__cause__``."""
+
+    def __init__(self, context: TCAFailureContext) -> None:
+        self.context = context
+        super().__init__(
+            "Historical TCA optimization failed for "
+            f"{context.encoded_method} {context.instrument_id}/{context.session_date} "
+            f"at decision {context.decision_timestamp} "
+            f"(order_fraction_adv20={context.order_fraction_adv20}, "
+            f"parent_quantity={context.parent_quantity}, "
+            f"remaining_inventory={context.remaining_inventory}, "
+            f"horizon={context.horizon}, fold_id={context.fold_id})."
+        )
+
+    def __reduce__(self) -> tuple[object, tuple[TCAFailureContext]]:
+        """Preserve constructor arguments across the spawned TCA process boundary."""
+        return type(self), (self.context,)
+
+    @property
+    def case_context(self) -> TCAFailureContext:
+        """Alias for callers that distinguish case identity from decision context."""
+        return self.context
+
+    @property
+    def decision_timestamp(self) -> pd.Timestamp | None:
+        return self.context.decision_timestamp
+
+    @property
+    def remaining_inventory(self) -> int | None:
+        return self.context.remaining_inventory
+
+    @property
+    def horizon(self) -> int | None:
+        return self.context.horizon
+
+
+_SEEDED_METHOD = re.compile(r"^(?P<method>.+)_seed_(?P<seed>[0-9]+)$")
+
+
+def _decode_method_identity(encoded_method: str) -> tuple[str, int | None]:
+    """Split the paper method label into its base method and optional seed."""
+    match = _SEEDED_METHOD.fullmatch(encoded_method)
+    if match is None:
+        return encoded_method, None
+    return match.group("method"), int(match.group("seed"))
+
+
 @dataclass(slots=True)
 class SegmentCommittedMPCPolicy:
     """Solve every 15 minutes and commit the next minute-level allocation segment."""
@@ -38,6 +135,7 @@ class SegmentCommittedMPCPolicy:
     segment_minutes: int = 15
     volatility: float = 0.01
     policy_name: str = "paper-segment-committed-mpc"
+    case_context: TCAFailureContext | None = field(default=None, repr=False)
     _segment: list[int] = field(default_factory=list, init=False, repr=False)
     _decision_number: int = field(default=0, init=False, repr=False)
     solve_count: int = field(default=0, init=False)
@@ -66,7 +164,18 @@ class SegmentCommittedMPCPolicy:
                 tracking_penalty=self.tracking_penalty,
                 forecast_weights=np.asarray(context.forecast.normalized_shares, dtype=float),
             )
-            result = OptimalExecutionWorkspace(n, validation_level="structural").solve(problem)
+            try:
+                result = OptimalExecutionWorkspace(n, validation_level="structural").solve(problem)
+            except (FloatingPointError, np.linalg.LinAlgError, RuntimeError, ValueError) as exc:
+                if self.case_context is None:
+                    raise
+                raise TCAExecutionFailure(
+                    self.case_context.at_policy_boundary(
+                        decision_timestamp=context.current_timestamp,
+                        remaining_inventory=context.remaining_inventory,
+                        horizon=context.remaining_buckets,
+                    )
+                ) from exc
             self._segment = [
                 int(value) for value in result.integer_quantities[: self.segment_minutes]
             ]
@@ -267,6 +376,7 @@ def run_historical_tca(
     tracking_penalty: float = 0.0,
     half_spread_arrival_fraction: float = 5e-5,
     temporary_impact_arrival_fraction: float = 1e-3,
+    fold_id: str | None = None,
 ) -> pd.DataFrame:
     """Run matched 10:30-15:30 deterministic MPC cases with only provider variation."""
     from execsim.costs import CostParameter, LinearTemporaryImpactModel
@@ -368,12 +478,14 @@ def run_historical_tca(
 
             def paper_policy(
                 arrival_price: float = arrival,
+                case_context: TCAFailureContext | None = None,
             ) -> SegmentCommittedMPCPolicy:
                 return SegmentCommittedMPCPolicy(
                     half_spread=arrival_price * half_spread_arrival_fraction,
                     temporary_impact=arrival_price * temporary_impact_arrival_fraction,
                     risk_aversion=risk_aversion,
                     tracking_penalty=tracking_penalty,
+                    case_context=case_context,
                 )
 
             constraints = ExecutionConstraints(planned_participation, hard_participation)
@@ -389,12 +501,24 @@ def run_historical_tca(
             )
             for method in required_methods:
                 factory = providers[method]
+                method_identity = _decode_method_identity(method)
+                case_context = TCAFailureContext(
+                    instrument_id=instrument_id,
+                    symbol=symbol,
+                    session_date=session_date,
+                    method=method_identity[0],
+                    seed=method_identity[1],
+                    encoded_method=method,
+                    order_fraction_adv20=float(order_fraction),
+                    parent_quantity=quantity,
+                    fold_id=fold_id,
+                )
                 unavailable_reason = ""
                 try:
                     result = simulate_policy(
                         parent_order=parent_order,
                         bars=instrument_bars,
-                        policy=paper_policy(),
+                        policy=paper_policy(case_context=case_context),
                         constraints=constraints,
                         cost_model=cost_model,
                         forecast_provider=factory(instrument_id, session_date),

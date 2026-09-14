@@ -2,6 +2,10 @@
 
 - Status: Accepted
 - Date: 2026-09-12
+- Extension: [ADR 0035](0035-inherit-completed-evaluation-stages-explicitly.md)
+  adds typed two-stage inheritance and execution v4. The original chain contract
+  and immutable v2/v3 evidence remain valid; only the blanket result-isolation
+  rule is narrowly superseded for explicitly authorized forecast/representation.
 - Complements: [ADR 0022](0022-index-history-and-reseal-evaluation.md), [ADR 0025](0025-fail-closed-evaluation-input-identities.md), [ADR 0026](0026-cross-link-resealed-evaluation-artifacts.md)
 
 ## Context

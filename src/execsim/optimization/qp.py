@@ -12,6 +12,7 @@ from scipy import sparse
 from execsim.optimization.integer import project_to_integer_capacities
 
 ValidationLevel = Literal["full", "structural"]
+INTEGER_ROUNDING_EPSILON = 1e-5
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,14 @@ class OptimalExecutionProblem:
             raise ValueError("delta_t must be finite and positive.")
         if not math.isfinite(self.epsilon_volume) or self.epsilon_volume <= 0:
             raise ValueError("epsilon_volume must be finite and positive.")
+        if (
+            any(
+                not math.isfinite(value) or value < 0
+                for value in (self.absolute_tolerance, self.relative_tolerance)
+            )
+            or self.absolute_tolerance + self.relative_tolerance == 0
+        ):
+            raise ValueError("Solver tolerances must be finite, non-negative, and not both zero.")
         if self.forecast_weights is not None:
             weights = np.asarray(self.forecast_weights, dtype=float)
             if (
@@ -226,6 +235,13 @@ class OptimalExecutionWorkspace:
         matrix_elapsed = perf_counter() - matrix_started
         if data.feasible == 0:
             return self._no_capacity_result(problem, data, matrix_elapsed)
+        if data.feasible == int(data.capacities.sum()) or horizon == 1:
+            quantities = (
+                data.capacities.copy()
+                if data.feasible == int(data.capacities.sum())
+                else np.array([data.feasible], dtype=np.int64)
+            )
+            return self._unique_feasible_result(problem, data, quantities, matrix_elapsed)
 
         lower_bounds = np.concatenate([np.zeros(horizon), [float(data.feasible)]])
         upper_bounds = np.concatenate([data.capacities.astype(float), [float(data.feasible)]])
@@ -262,16 +278,22 @@ class OptimalExecutionWorkspace:
                 f"dual_residual={info.dual_res}"
             )
         continuous = np.asarray(solution.x, dtype=float)
-        if not np.isclose(
-            continuous.sum(),
-            data.feasible,
-            atol=max(1e-5, problem.absolute_tolerance * 10),
-        ):
-            raise RuntimeError("Optimal execution solution violates the completion constraint.")
         projection_started = perf_counter()
-        integer = project_to_integer_capacities(
-            continuous, data.capacities, data.feasible, tolerance=1e-5
-        )
+        try:
+            sanitized = _sanitize_solver_quantities(
+                continuous, data.capacities, data.feasible, problem
+            )
+            integer = project_to_integer_capacities(
+                sanitized, data.capacities, data.feasible, tolerance=INTEGER_ROUNDING_EPSILON
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(
+                "Optimal execution numerical acceptance failed: "
+                f"horizon={horizon}, quantity={problem.quantity}, feasible={data.feasible}, "
+                f"status={info.status}, iterations={info.iter}, "
+                f"primal_residual={info.prim_res}, dual_residual={info.dual_res}, "
+                f"eps_abs={problem.absolute_tolerance}, eps_rel={problem.relative_tolerance}."
+            ) from exc
         projection_elapsed = perf_counter() - projection_started
         diagnostics = SolverDiagnostics(
             status=status,
@@ -402,6 +424,88 @@ class OptimalExecutionWorkspace:
             problem.quantity,
             diagnostics,
         )
+
+    def _unique_feasible_result(
+        self,
+        problem: OptimalExecutionProblem,
+        data: _QpData,
+        quantities: NDArray[np.int64],
+        matrix_elapsed: float,
+    ) -> OptimizationResult:
+        """Return the sole feasible point without introducing numerical box violations."""
+        continuous = quantities.astype(float)
+        diagnostics = SolverDiagnostics(
+            status="unique_feasible",
+            status_value=0,
+            iterations=0,
+            primal_residual=0.0,
+            dual_residual=0.0,
+            solve_time_seconds=0.0,
+            objective_value=float(
+                0.5 * continuous @ data.matrix @ continuous + data.linear @ continuous
+            ),
+            minimum_eigenvalue=data.minimum_eigenvalue,
+            warm_started=False,
+            absolute_tolerance=problem.absolute_tolerance,
+            relative_tolerance=problem.relative_tolerance,
+            matrix_construction_time_seconds=matrix_elapsed,
+            eigenvalue_validation_time_seconds=data.eigenvalue_validation_time_seconds,
+            validation_level=self.validation_level,
+        )
+        return OptimizationResult(
+            continuous,
+            quantities,
+            data.capacities,
+            data.feasible,
+            problem.quantity - data.feasible,
+            diagnostics,
+        )
+
+
+def _sanitize_solver_quantities(
+    continuous: NDArray[np.float64],
+    capacities: NDArray[np.int64],
+    feasible: int,
+    problem: OptimalExecutionProblem,
+) -> NDArray[np.float64]:
+    """Check raw share-unit constraints before clipping only admissible box residuals.
+
+    For A=[I; 1^T], use max(||Ax||_inf, Q_f) as the original-unit constraint
+    scale. This is an explicit application-side check, not reliance on OSQP's
+    internal z or scaling. No NumPy-default relative tolerance or integer-rounding
+    epsilon participates in acceptance.
+    Scaled OSQP termination alone does not replace this unscaled boundary.
+    """
+    if continuous.shape != capacities.shape or not np.all(np.isfinite(continuous)):
+        raise RuntimeError("Optimal execution solver returned malformed or non-finite quantities.")
+    total = float(continuous.sum())
+    scale = max(abs(total), float(np.max(np.abs(continuous))), float(feasible))
+    tolerance = problem.absolute_tolerance + problem.relative_tolerance * scale
+    if not np.isclose(total, feasible, atol=tolerance, rtol=0.0):
+        raise RuntimeError(
+            f"Optimal execution solution violates completion: residual={total - feasible}, "
+            f"share_tolerance={tolerance}."
+        )
+    if np.any(continuous < -tolerance) or np.any(continuous > capacities + tolerance):
+        raise RuntimeError(
+            "Optimal execution solution violates capacity bounds beyond numerical acceptance: "
+            f"lower={max(0.0, -float(continuous.min()))}, "
+            f"upper={max(0.0, float((continuous - capacities).max()))}, "
+            f"share_tolerance={tolerance}."
+        )
+    clipped = np.clip(continuous, 0.0, capacities.astype(float))
+    if int(np.floor(clipped).sum()) > feasible:
+        # Many accepted lower-bound residuals can accumulate after clipping.
+        # Repair only this otherwise-failing branch. The closest nonnegative
+        # vector with the target sum only decreases entries, so upper capacities
+        # stay satisfied. All previously successful rounding paths are untouched.
+        ordered = np.sort(clipped)[::-1]
+        counts = np.arange(1, len(ordered) + 1)
+        thresholds = (np.cumsum(ordered) - feasible) / counts
+        active = np.flatnonzero(ordered > thresholds)
+        threshold = thresholds[active[-1]]
+        clipped = np.maximum(clipped - threshold, 0.0)
+    return clipped
 
 
 def _feasible_warm_start(

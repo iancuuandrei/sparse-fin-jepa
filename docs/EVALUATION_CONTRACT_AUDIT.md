@@ -1,5 +1,10 @@
 # Historical evaluation production-contract audit
 
+The later 6402e40 recovery is governed by ADRs 0034 and 0035: explicit numerical
+acceptance and typed inheritance of completed forecast/representation only.
+The a9-era no-reuse statements below record that earlier restart's scope; they
+do not permit arbitrary reuse or override the newer explicit recovery contract.
+
 Baseline: `a9e97ba9de314e1f0ff82ff30e6a6427dec833b3`, tree
 `09afcff2eacb26e40c7a00bc91eceb0e60b327f3`.
 

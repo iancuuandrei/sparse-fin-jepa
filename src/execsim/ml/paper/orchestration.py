@@ -41,6 +41,11 @@ from execsim.ml.paper.evaluation_execution import (
     representation_root,
     verify_evaluation_execution,
 )
+from execsim.ml.paper.stage_inheritance import (
+    stage_input_root,
+    stage_provenance,
+    stage_source,
+)
 from execsim.ml.sequences.corpus import (
     build_fold_sequence_corpus,
     build_fold_sequence_corpus_from_root,
@@ -1333,9 +1338,13 @@ def _learned_ledger_identity(
     fold_id: str,
     method: str,
     seed: int | None,
+    *,
+    forecast_root: Path | None = None,
+    producer_source: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Bind reused predictions to the same immutable inputs as their original call."""
     root = config.artifact_root
+    producer = producer_source or {"commit": _git_head(), "tree": _git_tree()}
     embedding = (
         (
             root
@@ -1355,14 +1364,18 @@ def _learned_ledger_identity(
         "method": method,
         "seed": seed,
         "paper_config_hash": config.config_hash,
-        "source_commit": _git_head(),
-        "source_tree": _git_tree(),
+        "source_commit": producer["commit"],
+        "source_tree": producer["tree"],
         "parameter_freeze_sha256": file_sha256(root / "selection" / "parameter-freeze-v1.json"),
         "model_manifest_sha256": file_sha256(
             root / "lightgbm" / fold_id / method / str(seed or "shared") / "manifest.json"
         ),
         "base_manifest_sha256": file_sha256(
-            evaluation_root(config) / "evaluation-v2" / "bases" / fold_id / "manifest.json"
+            (forecast_root or evaluation_root(config))
+            / "evaluation-v2"
+            / "bases"
+            / fold_id
+            / "manifest.json"
         ),
         "embedding_sha256": file_sha256(embedding) if embedding is not None else None,
     }
@@ -1382,6 +1395,8 @@ def evaluate_forecasts_stage(
     )
     _require_parameter_freeze(config)
     _require_locked_test_opened(config)
+    if stage_input_root(config, "forecast") != evaluation_root(config):
+        return {"status": "INHERITED_VALIDATED", "stage": "forecast"}
     from execsim.ml.models.lightgbm_adapter import LightGBMVolumeModel
     from execsim.ml.paper.evaluation_artifacts import (
         evaluation_base,
@@ -1617,6 +1632,8 @@ def _evaluate_representations_stage(
     )
     _require_parameter_freeze(config)
     _require_locked_test_opened(config)
+    if stage_input_root(config, "representation") != evaluation_root(config):
+        return {"status": "INHERITED_VALIDATED", "stage": "representation"}
     import json
 
     import torch
@@ -1905,10 +1922,19 @@ def run_tca_stage(
             config.artifact_root / "selection" / "parameter-freeze-v1.json"
         ),
     }
-    profile_root = evaluation_root(config) / "evaluation-v2" / "profile-corpus"
+    forecast_root = stage_input_root(config, "forecast")
+    forecast_source = stage_source(
+        config, "forecast", source_commit=_git_head(), source_tree=_git_tree()
+    )
+    forecast_identity = {
+        **execution,
+        "source_commit": forecast_source["commit"],
+        "source_tree": forecast_source["tree"],
+    }
+    profile_root = forecast_root / "evaluation-v2" / "profile-corpus"
     profile_receipt = read_json(profile_root / "manifest.json")
     profile_identity = profile_receipt["identity"]
-    if any(profile_identity.get(key) != value for key, value in execution.items()):
+    if any(profile_identity.get(key) != value for key, value in forecast_identity.items()):
         raise ValueError("TCA profile corpus belongs to another evaluation execution.")
     verify_artifact(profile_root, identity=profile_identity, names=tuple(profile_receipt["files"]))
     market_profiles = {
@@ -1932,29 +1958,36 @@ def run_tca_stage(
             (
                 method,
                 seed,
-                evaluation_root(config)
+                forecast_root
                 / "evaluation-v2"
                 / "forecasts"
                 / fold_id
                 / method
                 / str(seed or "shared"),
-                _learned_ledger_identity(config, fold_id, method, seed),
+                _learned_ledger_identity(
+                    config,
+                    fold_id,
+                    method,
+                    seed,
+                    forecast_root=forecast_root,
+                    producer_source=forecast_source,
+                ),
             )
             for method, seed in variants
         )
         ewma_records = {}
         for instrument in sorted(instruments):
             work = EWMAWork(
-                evaluation_root(config) / "evaluation-v2" / "bases" / fold_id,
+                forecast_root / "evaluation-v2" / "bases" / fold_id,
                 market_profiles[instrument],
-                evaluation_root(config)
+                forecast_root
                 / "evaluation-v2"
                 / "forecasts"
                 / fold_id
                 / "ewma"
                 / instrument_key(instrument),
                 instrument,
-                {**execution, "fold_id": fold_id},
+                {**forecast_identity, "fold_id": fold_id},
             )
             ewma_records[instrument] = (work.output_directory, ewma_ledger_identity(work))
         return {
@@ -2134,6 +2167,25 @@ def run_tca_stage(
     return {"status": "SOFTWARE READY", **paths}
 
 
+def _report_input_stage(name: str) -> str:
+    """Map only the declared numerical report inputs to their producing stage."""
+    if name in {"evaluation/forecast-results.parquet", "evaluation/forecast-unavailable.parquet"}:
+        return "forecast"
+    if name in {
+        "evaluation/representation-accessibility.parquet",
+        "evaluation/representation-date-metrics.parquet",
+        "evaluation/support-regimes.parquet",
+    }:
+        return "representation"
+    if name in {"tca/main.parquet", "tca/sensitivity.parquet"}:
+        return "tca"
+    raise ValueError(f"Undeclared report numerical input: {name}")
+
+
+def _report_input_path(config: PaperRunConfig, name: str) -> Path:
+    return stage_input_root(config, _report_input_stage(name)) / name
+
+
 def _report_input_names(config: PaperRunConfig) -> tuple[str, ...]:
     """Name the exact numerical dependencies shared by reporting and final freeze."""
     names: tuple[str, ...] = (
@@ -2144,7 +2196,7 @@ def _report_input_names(config: PaperRunConfig) -> tuple[str, ...]:
         "tca/main.parquet",
         "tca/sensitivity.parquet",
     )
-    if (evaluation_root(config) / "evaluation/forecast-unavailable.parquet").is_file():
+    if _report_input_path(config, "evaluation/forecast-unavailable.parquet").is_file():
         names += ("evaluation/forecast-unavailable.parquet",)
     return names
 
@@ -2152,11 +2204,17 @@ def _report_input_names(config: PaperRunConfig) -> tuple[str, ...]:
 def _verify_report_input_receipt(config: PaperRunConfig, path: Path, digest: str) -> None:
     """Bind a merged numerical input to its producing evaluator at consumption."""
     receipt = read_json(path.with_suffix(".manifest.json"))
+    name = f"{path.parent.name}/{path.name}"
+    if path.resolve() != _report_input_path(config, name).resolve():
+        raise ValueError("Report input does not belong to its declared producing stage.")
+    producer = stage_source(
+        config, _report_input_stage(name), source_commit=_git_head(), source_tree=_git_tree()
+    )
     if (
         receipt.get("parquet_sha256") != digest
         or receipt.get("paper_config_hash") != config.config_hash
-        or receipt.get("merge_identity", {}).get("source_commit") != _git_head()
-        or receipt.get("merge_identity", {}).get("source_tree") != _git_tree()
+        or receipt.get("merge_identity", {}).get("source_commit") != producer["commit"]
+        or receipt.get("merge_identity", {}).get("source_tree") != producer["tree"]
         or receipt.get("merge_identity", {}).get("paper_config_hash") != config.config_hash
         or receipt.get("merge_identity", {}).get("parameter_freeze_sha256")
         != file_sha256(config.artifact_root / "selection/parameter-freeze-v1.json")
@@ -2169,6 +2227,7 @@ def report_stage(
     *,
     full_run_cli_enabled: bool,
     runtime_approval: PaperRuntimeApproval | None,
+    historical_schema_fixture: bool = False,
 ) -> dict[str, object]:
     """Publish the full report atomically and verify all output bytes on resume."""
     config.authorize(
@@ -2178,10 +2237,9 @@ def report_stage(
     _require_locked_test_opened(config)
     from execsim.ml.paper.evaluation_artifacts import publish_bundle
 
-    root = evaluation_root(config)
     inputs = {}
     for name in _report_input_names(config):
-        path = root / name
+        path = _report_input_path(config, name)
         digest = file_sha256(path)
         _verify_report_input_receipt(config, path, digest)
         inputs[name] = digest
@@ -2193,11 +2251,17 @@ def report_stage(
             config.artifact_root / "selection/parameter-freeze-v1.json"
         ),
         "input_sha256": inputs,
+        **stage_provenance(config, source_commit=_git_head(), source_tree=_git_tree()),
     }
     destination = evaluation_report_root(config) / config.paper_run_id
+    if historical_schema_fixture:
+        identity["data_classification"] = "synthetic_fixture"
 
     def build(staging: Path) -> None:
-        _build_report_stage(config, output_root=staging)
+        if historical_schema_fixture:
+            _build_report_stage(config, output_root=staging, historical_schema_fixture=True)
+        else:
+            _build_report_stage(config, output_root=staging)
         built = staging / config.paper_run_id
         for path in list(built.iterdir()):
             os.replace(path, staging / path.name)
@@ -2226,16 +2290,16 @@ def _build_report_stage(
     )
 
     report_inputs = {
-        "forecast": evaluation_root(config) / "evaluation" / "forecast-results.parquet",
-        "tca": evaluation_root(config) / "tca" / "main.parquet",
-        "accessibility": evaluation_root(config)
-        / "evaluation"
-        / "representation-accessibility.parquet",
-        "representation_dates": evaluation_root(config)
-        / "evaluation"
-        / "representation-date-metrics.parquet",
-        "support": evaluation_root(config) / "evaluation" / "support-regimes.parquet",
-        "tca_sensitivity": evaluation_root(config) / "tca" / "sensitivity.parquet",
+        "forecast": _report_input_path(config, "evaluation/forecast-results.parquet"),
+        "tca": _report_input_path(config, "tca/main.parquet"),
+        "accessibility": _report_input_path(
+            config, "evaluation/representation-accessibility.parquet"
+        ),
+        "representation_dates": _report_input_path(
+            config, "evaluation/representation-date-metrics.parquet"
+        ),
+        "support": _report_input_path(config, "evaluation/support-regimes.parquet"),
+        "tca_sensitivity": _report_input_path(config, "tca/sensitivity.parquet"),
     }
     if missing := [name for name, path in report_inputs.items() if not path.is_file()]:
         raise RuntimeError(f"BLOCKED: historical report inputs are missing: {missing}")
@@ -2502,6 +2566,7 @@ def _build_report_stage(
             if historical_schema_fixture
             else "completed before this reporting stage",
             "empirical_claim": "not automatically generated",
+            **stage_provenance(config, source_commit=_git_head(), source_tree=_git_tree()),
         },
         historical_schema_fixture=historical_schema_fixture,
     )
@@ -2527,7 +2592,7 @@ def _build_report_stage(
                 appendix / f"tca-{name}-unavailable.parquet",
                 index=False,
             )
-    missing_path = evaluation_root(config) / "evaluation" / "forecast-unavailable.parquet"
+    missing_path = _report_input_path(config, "evaluation/forecast-unavailable.parquet")
     if missing_path.is_file():
         import shutil
 
@@ -3605,7 +3670,10 @@ def _write_or_verify_timestamped_receipt(
 def _verify_final_stage_manifests(config: PaperRunConfig) -> None:
     """Cross-check aggregate stage receipts against their canonical merged outputs."""
     root = evaluation_root(config)
-    representation = read_json(root / "evaluation/representation-evaluation-manifest.json")
+    representation_input_root = stage_input_root(config, "representation")
+    representation = read_json(
+        representation_input_root / "evaluation/representation-evaluation-manifest.json"
+    )
     if (
         representation.get("schema_version") != "paper-representation-evaluation-v2"
         or representation.get("paper_config_hash") != config.config_hash
@@ -3616,7 +3684,9 @@ def _verify_final_stage_manifests(config: PaperRunConfig) -> None:
         ("date_metrics", "representation-date-metrics"),
         ("support_regimes", "support-regimes"),
     ):
-        if representation.get(f"{key}_sha256") != file_sha256(root / f"evaluation/{name}.parquet"):
+        if representation.get(f"{key}_sha256") != file_sha256(
+            representation_input_root / f"evaluation/{name}.parquet"
+        ):
             raise ValueError("Final representation manifest output checksum mismatch.")
     expected_identity = {
         "source_commit": _git_head(),
@@ -3647,10 +3717,10 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
     _require_locked_test_opened(config)
     required = {
         "parameter_freeze": config.artifact_root / "selection" / "parameter-freeze-v1.json",
-        "representation_evaluation": evaluation_root(config)
+        "representation_evaluation": stage_input_root(config, "representation")
         / "evaluation"
         / "representation-evaluation-manifest.json",
-        "forecast_evaluation": evaluation_root(config)
+        "forecast_evaluation": stage_input_root(config, "forecast")
         / "evaluation"
         / "forecast-results.manifest.json",
         "tca": evaluation_root(config) / "tca" / "manifest.json",
@@ -3681,11 +3751,17 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
     input_hashes = identity.get("input_sha256")
     if not isinstance(input_hashes, dict) or set(input_hashes) != set(_report_input_names(config)):
         raise ValueError("Final report numerical input inventory mismatch.")
+    expected_stage_provenance = stage_provenance(
+        config, source_commit=_git_head(), source_tree=_git_tree()
+    )
+    if any(identity.get(key) != value for key, value in expected_stage_provenance.items()):
+        raise ValueError("Final report stage inheritance provenance mismatch.")
     publish_bundle(result_root, identity=identity, build=lambda _: None)
     for name, digest in input_hashes.items():
-        if file_sha256(evaluation_root(config) / name) != digest:
+        input_path = _report_input_path(config, name)
+        if file_sha256(input_path) != digest:
             raise ValueError("Final report numerical input checksum mismatch.")
-        _verify_report_input_receipt(config, evaluation_root(config) / name, digest)
+        _verify_report_input_receipt(config, input_path, digest)
     _verify_final_stage_manifests(config)
     result_files = sorted(
         path
@@ -3720,6 +3796,7 @@ def write_final_result_freeze(config: PaperRunConfig) -> dict[str, object]:
         "representation_source_commit": representation_source_commit,
         "downstream_evaluation_commit": _git_head(),
         "downstream_evaluation_tree": _git_tree(),
+        **expected_stage_provenance,
         "paper_config_hash": config.config_hash,
         "selected_rdm_lambda": 10.0,
         "locked_test_open_receipt_sha256": file_sha256(opened_path),

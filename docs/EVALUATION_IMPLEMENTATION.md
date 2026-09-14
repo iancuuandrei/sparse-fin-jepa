@@ -1,5 +1,43 @@
 # Optimized evaluation implementation
 
+The numerical recovery and mixed-source boundary evidence are recorded in
+[TCA recovery qualification](TCA_RECOVERY_QUALIFICATION.md).
+
+## Explicit completed-stage recovery
+
+ADR 0035 narrowly replaces the blanket no-inheritance rule for the explicitly
+authorized recovery from 6402e40. A `paper-evaluation-stage-inheritance-v1`
+receipt validates exactly forecast and representation completion, including all
+their manifest-derived file inventories, against the immutable prior execution.
+Execution v4 binds this receipt and keeps `initial_completed_stages=0`:
+inherited validation is distinct from computation by the new evaluator.
+
+`stage_inheritance.stage_input_root` resolves only declared stage inputs.
+Forecast profile corpus, bases, learned and EWMA ledgers, merged forecast
+results, and optional unavailable rows retain their original source and path.
+Representation coordinates and merged outputs also retain their original source.
+TCA market/history/date inputs, shards, merged results, report bundles, and final
+freeze remain fresh. No old TCA shard is inherited, even when its bytes verify.
+
+The report's logical input names remain stable, but each input is verified against
+its producing stage's source. Report completion/provenance and final-result freeze
+bind stage sources and the inheritance receipt hash. Existing numerical input,
+schema, model, aggregate, and recursive authorization checks still apply.
+An explicitly labeled synthetic report fixture uses the same builder and freeze
+path; it is not a historical evaluation or an approval.
+
+Prepare the inheritance receipt with `prepare-evaluation-stage-inheritance`,
+`--superseded-execution`, `--inheritance-output`, and `--reason`. Pass its path as
+`--stage-inheritance-receipt` together with the typed supersession receipt to
+`reseal-evaluation`. Both receipts must name the same immediate predecessor and
+replacement source. The detached recovery frontier is `run-tca`, followed by
+`report` and `final-result-freeze`; inherited stages are verified, not rerun.
+These command interfaces require final local/host qualification before launch.
+
+ADR 0034 specifies the corrected solver-to-integer numerical boundary. TCA errors
+carry immutable case identity, decision time, remaining inventory, and horizon,
+with the original numerical cause preserved across the worker process boundary.
+
 The [production contract audit](EVALUATION_CONTRACT_AUDIT.md) records the concrete
 producer-to-consumer invariants and regression coverage. ADR 0032 explains why
 canonical metadata and report completion are enforced independently of legacy

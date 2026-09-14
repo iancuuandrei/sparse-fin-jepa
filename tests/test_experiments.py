@@ -99,4 +99,9 @@ def test_experiment_reuses_mpc_workspaces_across_compatible_units(tmp_path: Path
     first_day = output.decision_trace["trade_date"] == "2026-03-13"
     second_day = output.decision_trace["trade_date"] == "2026-03-16"
     assert not output.decision_trace.loc[first_day, "solver_workspace_reused"].any()
-    assert output.decision_trace.loc[second_day, "solver_workspace_reused"].all()
+    unique = output.decision_trace["solver_status"] == "unique_feasible"
+    assert (second_day & ~unique).any()
+    assert output.decision_trace.loc[second_day & ~unique, "solver_workspace_reused"].all()
+    assert unique.sum() == 2  # The last one-bucket decision on each date is exact.
+    assert output.decision_trace.loc[unique, "solver_iterations"].eq(0).all()
+    assert not output.decision_trace.loc[unique, "solver_workspace_reused"].any()

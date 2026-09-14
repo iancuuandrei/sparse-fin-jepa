@@ -11,8 +11,14 @@ def project_to_integer_capacities(
     *,
     tolerance: float = 1e-7,
 ) -> NDArray[np.int64]:
-    """Largest-remainder projection preserving capacities and the exact target."""
+    """Reconcile sanitized quantities with deterministic integer capacities.
 
+    Solver feasibility must be checked before calling this boundary. ``tolerance``
+    is the independent integer epsilon, never a solver-relative error budget.
+    """
+
+    if not np.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("Integer tolerance must be finite and non-negative.")
     values = np.asarray(continuous, dtype=float)
     caps_float = np.asarray(capacities, dtype=float)
     if values.ndim != 1 or caps_float.ndim != 1 or values.shape != caps_float.shape:
@@ -34,7 +40,20 @@ def project_to_integer_capacities(
     result = np.minimum(result, caps)
     remaining = target_quantity - int(result.sum())
     if remaining < 0:
-        raise ValueError("Floored continuous solution exceeds target quantity.")
+        # Undo only epsilon-induced upward rounding first. Large excess is not
+        # a rounding artefact and remains an error, rather than silently changing
+        # an infeasible input. Ordinary successful allocations are unchanged.
+        floor = np.floor(clipped).astype(np.int64)
+        if int(floor.sum()) > target_quantity:
+            raise ValueError("Floored continuous solution exceeds target quantity.")
+        promoted = result > floor
+        order = np.lexsort((np.arange(len(values)), clipped - floor))
+        for index in order:
+            if remaining == 0:
+                break
+            if promoted[index]:
+                result[index] -= 1
+                remaining += 1
 
     fractions = clipped - np.floor(clipped)
     order = np.lexsort((np.arange(len(values)), -fractions))
@@ -54,6 +73,11 @@ def project_to_integer_capacities(
             if remaining == 0:
                 break
 
-    if remaining or int(result.sum()) != target_quantity or np.any(result > caps):
+    if (
+        remaining
+        or int(result.sum()) != target_quantity
+        or np.any(result > caps)
+        or np.any(result < 0)
+    ):
         raise RuntimeError("Integer projection failed to preserve feasibility.")
     return result

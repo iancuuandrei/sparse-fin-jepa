@@ -12,6 +12,16 @@ their manifest-derived file inventories, against the immutable prior execution.
 Execution v4 binds this receipt and keeps `initial_completed_stages=0`:
 inherited validation is distinct from computation by the new evaluator.
 
+When that predecessor itself inherited the stages, a
+`paper-evaluation-stage-inheritance-v2` receipt explicitly names each original
+producer namespace, execution receipt SHA, and commit/tree. It separately names
+the immediate predecessor and binds that predecessor's inheritance receipt.
+Native verification requires equality with the ancestor's verified stage
+inventories; the resolver never substitutes the immediate predecessor's empty
+result directory. Existing v1 receipts remain unchanged and supported. Cache
+validation includes the complete receipt ancestry and inherited members. See
+ADR 0037. The same execution v4 seal binds either supported typed receipt.
+
 `stage_inheritance.stage_input_root` resolves only declared stage inputs.
 Forecast profile corpus, bases, learned and EWMA ledgers, merged forecast
 results, and optional unavailable rows retain their original source and path.

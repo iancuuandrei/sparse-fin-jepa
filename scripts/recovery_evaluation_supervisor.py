@@ -37,7 +37,10 @@ STAGES = ("run-tca", "report", "final-result-freeze")
 INHERITED_STAGES = ("evaluate-forecast", "evaluate-representation")
 INVALIDATION_FRONTIER = "run-tca"
 EXECUTION_SCHEMA = "paper-evaluation-execution-v4"
-INHERITANCE_SCHEMA = "paper-evaluation-stage-inheritance-v1"
+INHERITANCE_SCHEMAS = {
+    "paper-evaluation-stage-inheritance-v1",
+    "paper-evaluation-stage-inheritance-v2",
+}
 INHERITANCE_STATUS = "STAGE_INHERITANCE_VALIDATED"
 DEFAULT_STATUS_NAME = "recovery-evaluation-supervisor-status.json"
 DEFAULT_WORKERS = 16
@@ -292,7 +295,7 @@ def _require_v4_inheritance(
         expected_predecessor=expected_predecessor,
     )
     if (
-        typed.get("schema_version") != INHERITANCE_SCHEMA
+        typed.get("schema_version") not in INHERITANCE_SCHEMAS
         or typed.get("status") != INHERITANCE_STATUS
         or typed.get("inherited_stages") != list(INHERITED_STAGES)
         or typed.get("invalidation_frontier") != INVALIDATION_FRONTIER

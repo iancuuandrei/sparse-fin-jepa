@@ -735,6 +735,40 @@ def test_real_inherited_report_and_freeze_preserve_mixed_stage_sources(
     )
     from execsim.ml.paper.stage_inheritance import write_stage_inheritance_receipt
 
+    # Preserve an intervening failed recovery that inherited these same A bytes.
+    # The final B evaluator must supersede M, not pretend A was its predecessor.
+    source_middle = tmp_path / "evaluation-executions/source-middle"
+    config.runtime_evaluation_root = source_middle
+    middle_source = {"commit": "middle-commit", "tree": "middle-tree"}
+    middle_inheritance = tmp_path / "middle-inheritance.json"
+    middle_supersession = tmp_path / "middle-supersession.json"
+    write_stage_inheritance_receipt(
+        config,
+        superseded_execution=predecessor,
+        output=middle_inheritance,
+        replacement_source_commit=middle_source["commit"],
+        replacement_source_tree=middle_source["tree"],
+        reason="fixture first recovery",
+    )
+    write_evaluation_supersession_receipt(
+        config,
+        superseded_execution=predecessor,
+        output=middle_supersession,
+        replacement_source_commit=middle_source["commit"],
+        replacement_source_tree=middle_source["tree"],
+        reason="fixture first recovery",
+    )
+    seal_evaluation_execution(
+        config,
+        source_commit=middle_source["commit"],
+        source_tree=middle_source["tree"],
+        supersession=middle_supersession,
+        inheritance=middle_inheritance,
+    )
+    predecessor = source_middle / "execution.json"
+    middle_bytes = predecessor.read_bytes()
+    config.runtime_evaluation_root = source_b
+
     inheritance = tmp_path / "stage-inheritance.json"
     write_stage_inheritance_receipt(
         config,
@@ -772,6 +806,7 @@ def test_real_inherited_report_and_freeze_preserve_mixed_stage_sources(
         inheritance=inheritance,
     )
     assert sealed["initial_completed_stages"] == 0
+    assert sealed["previous_evaluation_source"] == middle_source
     assert read_json(source_b / "execution.json")["schema_version"] == STAGE_INHERITED_SCHEMA
 
     tca_main = report_fixture._publish_tca_results(config, "main", tca_outputs["main"])
@@ -872,3 +907,4 @@ def test_real_inherited_report_and_freeze_preserve_mixed_stage_sources(
     assert freeze["stage_sources"]["run-tca"]["inherited"] is False
     assert freeze["stage_sources"]["evaluate-forecast"]["inherited"] is True
     assert tca_sensitivity.is_relative_to(source_b)
+    assert predecessor.read_bytes() == middle_bytes

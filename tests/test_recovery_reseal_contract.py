@@ -18,6 +18,14 @@ from execsim.ml.paper.evaluation_execution import (
     verify_evaluation_execution,
     write_evaluation_supersession_receipt,
 )
+from execsim.ml.paper.stage_inheritance import (
+    SCHEMA_V2,
+    stage_input_root,
+    stage_provenance,
+    stage_source,
+    verify_stage_inheritance,
+    write_stage_inheritance_receipt,
+)
 
 
 def _load_inheritance_fixture_module() -> ModuleType:
@@ -95,6 +103,98 @@ def test_real_seal_and_verify_v4_preserve_root_prior_and_inherited_sources(inher
     inherited_member.write_bytes(inherited_member.read_bytes() + b"changed")
     with pytest.raises(ValueError, match=r"checksum|changed"):
         verify_evaluation_execution(config, source_commit="new-commit", source_tree="new-tree")
+
+
+def test_real_second_seal_keeps_immediate_predecessor_and_original_producer(inherited_run):
+    """A v4 predecessor yields a v2 receipt without copying its stage outputs."""
+    config, old, inheritance_a, _opened_sha = inherited_run
+    supersession_b = _prepare_chain(config, old, inheritance_a)
+    seal_evaluation_execution(
+        config,
+        source_commit="new-commit",
+        source_tree="new-tree",
+        supersession=supersession_b,
+        inheritance=inheritance_a,
+    )
+    middle = config.runtime_evaluation_root
+
+    final = config.artifact_root / "evaluation-executions" / "final"
+    config.runtime_evaluation_root = final
+    inheritance_c = config.artifact_root / "stage-inheritance-final.json"
+    supersession_c = config.artifact_root / "superseded-final.json"
+    write_evaluation_supersession_receipt(
+        config,
+        superseded_execution=middle,
+        output=supersession_c,
+        replacement_source_commit="final-commit",
+        replacement_source_tree="final-tree",
+        reason="recover the next TCA frontier",
+    )
+    write_stage_inheritance_receipt(
+        config,
+        superseded_execution=middle,
+        output=inheritance_c,
+        replacement_source_commit="final-commit",
+        replacement_source_tree="final-tree",
+        reason="recover the next TCA frontier",
+    )
+    payload = verify_stage_inheritance(config, inheritance_c)
+    assert payload["schema_version"] == SCHEMA_V2
+    assert (
+        payload["superseded_execution_namespace"]
+        == middle.relative_to(config.artifact_root).as_posix()
+    )
+    assert payload["superseded_evaluation_source"] == {
+        "commit": "new-commit",
+        "tree": "new-tree",
+    }
+    assert payload["ancestor_stage_inheritance"]["path"] == "stage-inheritance.json"
+    for record in payload["stage_inventory"].values():
+        assert record["producer_execution_namespace"] == "evaluation-executions/old"
+        assert record["producer_evaluation_source"] == {
+            "commit": "old-commit",
+            "tree": "old-tree",
+        }
+
+    _clear_destination(config)
+    receipt = seal_evaluation_execution(
+        config,
+        source_commit="final-commit",
+        source_tree="final-tree",
+        supersession=supersession_c,
+        inheritance=inheritance_c,
+    )
+    assert receipt["previous_evaluation_source"] == {
+        "commit": "new-commit",
+        "tree": "new-tree",
+    }
+    assert (
+        verify_evaluation_execution(config, source_commit="final-commit", source_tree="final-tree")
+        == receipt
+    )
+    assert stage_input_root(config, "forecast") == old.resolve()
+    assert stage_source(
+        config,
+        "forecast",
+        source_commit="final-commit",
+        source_tree="final-tree",
+    ) == {"commit": "old-commit", "tree": "old-tree"}
+    provenance = stage_provenance(config, source_commit="final-commit", source_tree="final-tree")
+    assert provenance["stage_sources"]["evaluate-forecast"]["execution"] == (
+        "evaluation-executions/old"
+    )
+    assert provenance["stage_sources"]["evaluate-forecast"]["immediate_predecessor"] == (
+        "evaluation-executions/new"
+    )
+    assert provenance["stage_sources"]["evaluate-forecast"]["immediate_predecessor_source"] == {
+        "commit": "new-commit",
+        "tree": "new-tree",
+    }
+
+    inherited_member = old / "evaluation-v2/representations/fold-1/dense/13/accessibility.parquet"
+    inherited_member.write_bytes(inherited_member.read_bytes() + b"ancestor-mutation")
+    with pytest.raises(ValueError, match=r"checksum|changed|mismatch|inventory"):
+        verify_stage_inheritance(config, inheritance_c)
 
 
 @pytest.mark.parametrize("fault", ["populated", "wrong-predecessor", "wrong-source", "wrong-root"])
